@@ -2,6 +2,10 @@
 #
 # 把 docs/wiki/ 同步到 GitHub Wiki。
 #
+# 注意：深度文档现在通过 GitHub Pages 发布（docs/ 目录），访问地址
+#   https://geek-xin.github.io/code-association/
+# 本脚本仅在你也想同步到 GitHub Wiki 时使用。
+#
 #   ./scripts/sync-wiki.sh
 #
 # 前置条件：Wiki 仓库必须已经存在。GitHub 不允许通过 API 初始化 Wiki，
