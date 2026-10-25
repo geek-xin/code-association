@@ -3,9 +3,9 @@
 # release.sh — 构建、打包并发布 code-association 到 GitHub Release
 #
 # 用法:
-#   ./release.sh                  # 发布默认版本 0.1.0
-#   ./release.sh 0.2.0            # 发布指定版本
-#   VERSION=0.2.0 ./release.sh    # 同上（环境变量方式）
+#   ./release.sh                  # 发布默认版本 0.2.0
+#   ./release.sh 0.3.0            # 发布指定版本
+#   VERSION=0.3.0 ./release.sh    # 同上（环境变量方式）
 #
 # 产物:
 #   build/release/code-association-<version>/            # 干净的发布目录
@@ -23,13 +23,20 @@
 #   同一版本可重复执行：本地产物被覆盖；远端资产用 gh release upload --clobber 覆盖；
 #   Release 已存在时改为更新标题与说明，不会报错。
 #
+# 安全性说明:
+#   本脚本绝不启动/停止服务，只做构建、打包、发布。
+#   写入文档的 heredoc 一律使用**带引号的定界符**（<<'EOF'），
+#   文档里的 @@APP@@ / @@VERSION@@ 占位符由 render() 用纯字符串替换填充。
+#   —— 绝不能改成不带引号的 heredoc：那样 bash 会执行文档中反引号/$( ) 里的内容
+#      （曾经因此误执行过 ./start.sh 与 ./stop.sh）。
+#
 # 依赖: bash、mvn、tar、zip、unzip、gh（已登录）
 set -euo pipefail
 
 cd "$(dirname "$0")"
 
 APP="code-association"
-VERSION="${1:-${VERSION:-0.1.0}}"
+VERSION="${1:-${VERSION:-0.2.0}}"
 TAG="v${VERSION}"
 RELEASE_ROOT="build/release"
 STAGE="${RELEASE_ROOT}/${APP}-${VERSION}"
@@ -39,6 +46,15 @@ NOTES="${RELEASE_ROOT}/release-notes-${TAG}.md"
 
 die() { echo "错误: $*" >&2; exit 1; }
 log() { echo "==> $*"; }
+
+# 纯字符串替换渲染模板：不做任何命令求值
+render() {
+  local file="$1" content
+  content="$(cat "$file")"
+  content="${content//@@APP@@/$APP}"
+  content="${content//@@VERSION@@/$VERSION}"
+  printf '%s\n' "$content" > "$file"
+}
 
 # ---------- 0. 参数与工具检查 ----------
 [[ "$VERSION" =~ ^[0-9A-Za-z][0-9A-Za-z._-]*$ ]] || die "版本号不合法: '$VERSION'（只允许字母数字 . _ -）"
@@ -78,10 +94,11 @@ cp "$JAR" "${STAGE}/target/${APP}.jar"
 cp start.sh stop.sh README.md "$STAGE/"
 # 示例配置：与 jar 内置默认配置同源，用户可修改后通过 --spring.config.location 覆盖
 cp src/main/resources/application.yml "${STAGE}/application.yml"
-[ -d docs ] && cp -R docs "${STAGE}/docs"
+if [ -d docs ]; then cp -R docs "${STAGE}/docs"; fi
 
-cat > "${STAGE}/INSTALL.md" <<EOF
-# ${APP} ${VERSION} 安装与运行说明
+# 注意：定界符带引号，模板内的反引号 / $(...) 都是纯文本，不会被执行
+cat > "${STAGE}/INSTALL.md" <<'INSTALL_TEMPLATE'
+# @@APP@@ @@VERSION@@ 安装与运行说明
 
 ## 环境要求
 
@@ -91,8 +108,8 @@ cat > "${STAGE}/INSTALL.md" <<EOF
 ## 目录说明
 
 ```
-${APP}-${VERSION}/
-├── target/${APP}.jar     # Spring Boot 可执行 jar（start.sh 默认加载此路径）
+@@APP@@-@@VERSION@@/
+├── target/@@APP@@.jar     # Spring Boot 可执行 jar（start.sh 默认加载此路径）
 ├── start.sh               # 启动脚本（后台运行 + 健康检查）
 ├── stop.sh                # 停止脚本（优雅停止并等待端口释放）
 ├── application.yml        # 示例配置（可修改后通过启动参数覆盖）
@@ -106,8 +123,8 @@ ${APP}-${VERSION}/
 ## 快速开始
 
 ```bash
-tar -xzf ${APP}-${VERSION}.tar.gz      # 或 unzip ${APP}-${VERSION}.zip
-cd ${APP}-${VERSION}
+tar -xzf @@APP@@-@@VERSION@@.tar.gz      # 或 unzip @@APP@@-@@VERSION@@.zip
+cd @@APP@@-@@VERSION@@
 chmod +x start.sh stop.sh
 ./start.sh                # 默认 9996 端口
 curl http://127.0.0.1:9996/api/health
@@ -120,19 +137,55 @@ curl http://127.0.0.1:9996/api/health
 - `code-association.log`：运行日志（可用 `LOG_FILE=/path/log ./start.sh` 修改）
 - `.code-association.pid`：进程号文件，start.sh 写入、stop.sh 清理
 
+## 每日自动扫描（schedule）
+
+服务内置每日自动扫描：每天 **02:30** 检查所有程序，只分析「自上次分析以来有新提交」的那些，
+无需人工点按钮。相关参数全部由 `code-association.schedule.*` 控制：
+
+| 配置项 | 默认值 | 说明 |
+| --- | --- | --- |
+| `code-association.schedule.enabled` | `true` | 是否启用每日扫描 |
+| `code-association.schedule.cron` | `0 30 2 * * *` | Spring cron（秒 分 时 日 月 周），默认每天 02:30 |
+| `code-association.schedule.run-on-startup` | `false` | 启动后是否立刻补跑一次 |
+| `code-association.schedule.max-programs-per-run` | `20` | 单次扫描最多分析多少个程序 |
+| `code-association.schedule.directory-rescan-minutes` | `1440` | 普通目录（无提交可比较）的重新扫描间隔（分钟） |
+
+### 查看与手动触发
+
+```bash
+# 查看调度状态：下次执行时间、是否正在运行、上次结果
+curl http://127.0.0.1:9996/api/schedule
+
+# 立即手动触发一次扫描（异步执行，结果通过上面的接口轮询）
+curl -X POST http://127.0.0.1:9996/api/schedule/run
+```
+
+修改扫描时间：
+
+```bash
+# 改成每天 03:00，并关闭启动时补跑
+java -jar target/@@APP@@.jar \
+  --code-association.schedule.cron="0 0 3 * * *" \
+  --code-association.schedule.run-on-startup=false
+```
+
 ## 自定义配置
 
 ```bash
 # 方式一：命令行参数
-java -jar target/${APP}.jar --server.port=8080 --code-association.data-dir=/data/ca
+java -jar target/@@APP@@.jar --server.port=8080 --code-association.data-dir=/data/ca
 
 # 方式二：外部配置文件
-java -jar target/${APP}.jar --spring.config.location=file:./application.yml
+java -jar target/@@APP@@.jar --spring.config.location=file:./application.yml
 ```
-EOF
+INSTALL_TEMPLATE
+render "${STAGE}/INSTALL.md"
 
+# 统一包内权限：源文件权限可能是 600/711，直接打包会让别人无法读取
+find "$STAGE" -type d -exec chmod 755 {} +
+find "$STAGE" -type f -exec chmod 644 {} +
 # 包内脚本必须可执行
-chmod +x "${STAGE}/start.sh" "${STAGE}/stop.sh"
+chmod 755 "${STAGE}/start.sh" "${STAGE}/stop.sh"
 
 # ---------- 3. 生成压缩包 ----------
 mkdir -p "$RELEASE_ROOT"
@@ -164,35 +217,53 @@ for archive in "$TARBALL" "$ZIPBALL"; do
   echo "    OK  $(basename "$archive")：start.sh / stop.sh / target/${APP}.jar 均在 ${APP}-${VERSION}/ 下"
 done
 
+# 配置必须带上每日扫描（schedule）配置块，否则打包出来的示例配置是旧的
+grep -q 'schedule:' "${STAGE}/application.yml" \
+  || die "包内 application.yml 缺少 schedule 配置块（应来自 src/main/resources/application.yml）"
+grep -q 'cron: "0 30 2 \* \* \*"' "${STAGE}/application.yml" \
+  || die "包内 application.yml 的 schedule.cron 不是预期的每日 02:30"
+echo "    OK  包内 application.yml 含 schedule 配置块（默认 02:30）"
+
 # ---------- 5. 发布到 GitHub Release ----------
-cat > "$NOTES" <<EOF
-## ${APP} ${VERSION}
+cat > "$NOTES" <<'NOTES_TEMPLATE'
+## @@APP@@ @@VERSION@@
 
 跨程序变更影响扫描工具（Java / Maven 多模块仓库）：分析一次提交改动了哪些类、方法、SQL、MQ 消息结构，
 并推导出对其他模块 / 服务的连带影响与风险等级。
+
+### 本次更新
+
+- **每日自动扫描**：每天 **02:30** 自动检查所有程序，只分析有新提交的那些，无需人工触发。
+  由 `code-association.schedule.*` 控制（`enabled` / `cron` / `run-on-startup` /
+  `max-programs-per-run` / `directory-rescan-minutes`）。
+- 手动触发一次扫描：`curl -X POST http://127.0.0.1:9996/api/schedule/run`；
+  查看调度状态（下次执行时间、是否运行中、上次结果）：`curl http://127.0.0.1:9996/api/schedule`。
+- 影响范围收敛为**仅跨程序（peer-only）**，不再把本地自身影响计入结果。
+- 启动时清理上次异常退出残留的未完成分析，列表查询不再加载报告正文，界面更快。
 
 ### 下载
 
 | 文件 | 说明 |
 | --- | --- |
-| `${APP}-${VERSION}.tar.gz` | Linux / macOS 推荐 |
-| `${APP}-${VERSION}.zip` | 通用格式（Windows / 通用） |
+| `@@APP@@-@@VERSION@@.tar.gz` | Linux / macOS 推荐 |
+| `@@APP@@-@@VERSION@@.zip` | 通用格式（Windows / 通用） |
 
-两个包内容一致，均包含：可执行 jar（`target/${APP}.jar`）、`start.sh`、`stop.sh`、
+两个包内容一致，均包含：可执行 jar（`target/@@APP@@.jar`）、`start.sh`、`stop.sh`、
 `application.yml` 示例配置、`README.md`、`docs/` 与 `INSTALL.md`。
 
 ### 运行
 
 ```bash
-tar -xzf ${APP}-${VERSION}.tar.gz   # 或 unzip ${APP}-${VERSION}.zip
-cd ${APP}-${VERSION}
+tar -xzf @@APP@@-@@VERSION@@.tar.gz   # 或 unzip @@APP@@-@@VERSION@@.zip
+cd @@APP@@-@@VERSION@@
 chmod +x start.sh stop.sh
 ./start.sh                          # 默认 http://127.0.0.1:9996
 ./stop.sh
 ```
 
 需要 JDK 21+。详见包内 `INSTALL.md`。
-EOF
+NOTES_TEMPLATE
+render "$NOTES"
 
 log "发布 GitHub Release: $TAG"
 if gh release view "$TAG" >/dev/null 2>&1; then
@@ -208,12 +279,13 @@ else
 fi
 
 # ---------- 6. 汇总 ----------
-RELEASE_URL="$(gh release view "$TAG" --json url -q .url)"
+# 到这里发布已经成功；下面只是展示信息，读取失败不应让脚本以非 0 退出
+RELEASE_URL="$(gh release view "$TAG" --json url -q .url 2>/dev/null || echo "https://github.com/${REPO}/releases/tag/${TAG}")"
 echo
 echo "发布完成"
 echo "  仓库:    https://github.com/${REPO}"
 echo "  Release: ${RELEASE_URL}"
 echo "  资产:"
-gh release view "$TAG" --json assets -q '.assets[] | "    - " + .name + "  (" + (.size|tostring) + " bytes)"'
+gh release view "$TAG" --json assets -q '.assets[] | "    - " + .name + "  (" + (.size|tostring) + " bytes)"' 2>/dev/null || echo "    （无法读取资产列表，请用 gh release view $TAG 查看）"
 echo "  本地包:"
-ls -lh "$TARBALL" "$ZIPBALL" | awk '{print "    " $9 "  " $5}'
+ls -lh "$TARBALL" "$ZIPBALL" | awk '{print "    "$9 "  "$5}'

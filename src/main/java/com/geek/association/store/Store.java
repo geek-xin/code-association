@@ -223,7 +223,11 @@ public class Store {
         init();
         List<Analysis> out = new ArrayList<>();
         try (Connection c = connection(); PreparedStatement ps = c.prepareStatement(
-                "SELECT * FROM analysis WHERE source_id=? ORDER BY id DESC")) {
+                "SELECT id, source_id, source_name, source_type, mode, base_ref, target_ref, "
+                        + "base_commit, head_commit, status, message, created_at, finished_at, duration_ms, "
+                        + "progress_stage, progress_percent, progress_label, progress_detail, "
+                        + "progress_completed, progress_skipped, summary_json "
+                        + "FROM analysis WHERE source_id=? ORDER BY id DESC")) {
             ps.setLong(1, sourceId);
             try (ResultSet rs = ps.executeQuery()) {
                 while (rs.next()) {
@@ -386,8 +390,14 @@ public class Store {
     public List<Analysis> analyses(int limit) {
         init();
         List<Analysis> out = new ArrayList<>();
+        // Explicit columns: report_json can be megabytes, and SELECT * would stream every blob
+        // even though the list view never reads it.
         try (Connection c = connection(); PreparedStatement ps = c.prepareStatement(
-                "SELECT * FROM analysis ORDER BY id DESC LIMIT ?")) {
+                "SELECT id, source_id, source_name, source_type, mode, base_ref, target_ref, "
+                        + "base_commit, head_commit, status, message, created_at, finished_at, duration_ms, "
+                        + "progress_stage, progress_percent, progress_label, progress_detail, "
+                        + "progress_completed, progress_skipped, summary_json "
+                        + "FROM analysis ORDER BY id DESC LIMIT ?")) {
             ps.setInt(1, limit);
             try (ResultSet rs = ps.executeQuery()) {
                 while (rs.next()) {
@@ -398,6 +408,34 @@ public class Store {
             throw new IllegalStateException("list analyses failed", e);
         }
         return out;
+    }
+
+    /**
+     * Marks analyses that never finished as failed.
+     *
+     * A run lives only in a worker thread. If the process is killed mid-run (or a stage hangs
+     * forever), the row stays RUNNING and the scheduler keeps treating that program as busy,
+     * blocking every future scan. Startup recovery is what makes the schedule self-healing.
+     *
+     * @param olderThanMinutes only touch rows older than this, so a live run is never disturbed
+     * @return how many rows were recovered
+     */
+    public int recoverStaleAnalyses(int olderThanMinutes) {
+        init();
+        String cutoff = Instant.now().minusSeconds(Math.max(1, olderThanMinutes) * 60L).toString();
+        try (Connection c = connection(); PreparedStatement ps = c.prepareStatement(
+                "UPDATE analysis SET status=?, message=?, finished_at=? "
+                        + "WHERE status IN (?,?) AND (created_at IS NULL OR created_at < ?)")) {
+            ps.setString(1, Analysis.FAILED);
+            ps.setString(2, "分析进程在完成前中断（服务重启或超时），已标记为失败");
+            ps.setString(3, Instant.now().toString());
+            ps.setString(4, Analysis.RUNNING);
+            ps.setString(5, Analysis.PENDING);
+            ps.setString(6, cutoff);
+            return ps.executeUpdate();
+        } catch (SQLException e) {
+            throw new IllegalStateException("recover stale analyses failed", e);
+        }
     }
 
     public Analysis analysis(long id) {

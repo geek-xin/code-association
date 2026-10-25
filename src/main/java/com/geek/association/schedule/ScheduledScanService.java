@@ -57,6 +57,36 @@ public class ScheduledScanService {
     }
 
     /**
+     * Optional catch-up run after startup.
+     *
+     * A freshly deployed instance may have missed several ticks; scanning once at boot closes
+     * that gap without waiting for the next cron boundary. Off by default because a restart loop
+     * would otherwise trigger repeated scans.
+     */
+    @org.springframework.context.event.EventListener(org.springframework.boot.context.event.ApplicationReadyEvent.class)
+    public void onStartup() {
+        // Runs that were in flight when the process died stay RUNNING forever, which would make
+        // every later scan skip that program as "busy". Recover them before anything else.
+        try {
+            // Zero grace: this process just started, so no run can still be alive. The threshold
+            // exists for callers that cannot know that; here it would only delay recovery.
+            int recovered = store.recoverStaleAnalyses(0);
+            if (recovered > 0) {
+                log.warn("recovered {} analysis run(s) left RUNNING by a previous process", recovered);
+            }
+        } catch (RuntimeException e) {
+            log.warn("could not recover stale analyses", e);
+        }
+        if (!properties.getSchedule().isEnabled() || !properties.getSchedule().isRunOnStartup()) {
+            return;
+        }
+        // Run off the startup thread so a slow scan never delays the web server becoming ready.
+        Thread thread = new Thread(() -> runOnce("startup"), "scheduled-scan-startup");
+        thread.setDaemon(true);
+        thread.start();
+    }
+
+    /**
      * Runs on the configured cron (default 02:30 every day).
      *
      * A failure here must never take the service down: a scheduled method that throws is logged and
@@ -71,6 +101,30 @@ public class ScheduledScanService {
     }
 
     /**
+     * Starts a scan in the background and returns immediately.
+     *
+     * A full scan fetches remotes and indexes every changed program, which easily exceeds an HTTP
+     * timeout. The trigger endpoint therefore returns the accepted state and the caller polls
+     * {@code GET /api/schedule} for the outcome.
+     */
+    public ScanResult runAsync(String trigger) {
+        if (!running.compareAndSet(false, true)) {
+            return ScanResult.skipped(trigger, "上一次扫描仍在进行中");
+        }
+        // The flag is already taken; hand it to the worker, which owns it from here on.
+        ScanResult accepted = new ScanResult();
+        accepted.trigger = trigger;
+        accepted.status = "RUNNING";
+        accepted.startedAt = Instant.now().toString();
+        accepted.message = "扫描已开始，稍后通过 GET /api/schedule 查看结果";
+        lastResult = accepted;
+        Thread thread = new Thread(() -> execute(trigger), "scheduled-scan-" + trigger);
+        thread.setDaemon(true);
+        thread.start();
+        return accepted;
+    }
+
+    /**
      * Scans now and returns what happened.
      *
      * @param trigger how this run was started, recorded for the status endpoint
@@ -82,6 +136,14 @@ public class ScheduledScanService {
             log.info("scheduled scan skipped: a previous run is still in progress");
             return skipped;
         }
+        return execute(trigger);
+    }
+
+    /**
+     * The scan body, shared by the synchronous and background entry points. The caller already
+     * holds the run guard; this method releases it when done.
+     */
+    private ScanResult execute(String trigger) {
         long startedAt = System.currentTimeMillis();
         ScanResult result = new ScanResult();
         result.trigger = trigger;

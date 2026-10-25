@@ -83,7 +83,7 @@ class AnalysisProgressTest {
                 "src/main/java/com/example/StockService.java", List.of("PREPARE", "DIFF", "INDEX_HEAD"),
                 List.of("PEERS"));
 
-        ApiController controller = new ApiController(store, null, null, properties, null);
+        ApiController controller = new ApiController(store, null, null, properties, null, null);
         Map<String, Object> row = controller.analysis(analysis.id, false).getBody();
         assertNotNull(row);
         assertEquals("INDEX_BASE", row.get("progressStage"));

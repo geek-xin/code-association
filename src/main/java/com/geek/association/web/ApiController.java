@@ -4,6 +4,7 @@ import com.geek.association.config.AppProperties;
 import com.geek.association.model.Analysis;
 import com.geek.association.model.RepoSource;
 import com.geek.association.report.ImpactReport;
+import com.geek.association.schedule.ScheduledScanService;
 import com.geek.association.service.AnalysisService;
 import com.geek.association.source.PathBrowser;
 import com.geek.association.source.RepositoryPreparer;
@@ -36,14 +37,17 @@ public class ApiController {
     private final RepositoryPreparer preparer;
     private final AppProperties properties;
     private final PathBrowser pathBrowser;
+    private final ScheduledScanService scheduledScan;
 
     public ApiController(Store store, AnalysisService analysisService, RepositoryPreparer preparer,
-                         AppProperties properties, PathBrowser pathBrowser) {
+                         AppProperties properties, PathBrowser pathBrowser,
+                         ScheduledScanService scheduledScan) {
         this.store = store;
         this.analysisService = analysisService;
         this.preparer = preparer;
         this.properties = properties;
         this.pathBrowser = pathBrowser;
+        this.scheduledScan = scheduledScan;
     }
 
     @GetMapping("/health")
@@ -55,6 +59,38 @@ public class ApiController {
         out.put("maxFiles", properties.getMaxFiles());
         out.put("aiEnabled", properties.getAi().isEnabled());
         return out;
+    }
+
+    // --------------------------------------------------------------- schedule
+
+    /**
+     * Status of the daily proactive scan: when it last ran, what it decided per program, and the
+     * cron it will run on next. Lets an operator confirm the schedule is alive without reading logs.
+     */
+    @GetMapping("/schedule")
+    public Map<String, Object> schedule() {
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("enabled", properties.getSchedule().isEnabled());
+        out.put("cron", properties.getSchedule().getCron());
+        out.put("runOnStartup", properties.getSchedule().isRunOnStartup());
+        out.put("maxProgramsPerRun", properties.getSchedule().getMaxProgramsPerRun());
+        out.put("directoryRescanMinutes", properties.getSchedule().getDirectoryRescanMinutes());
+        out.put("running", scheduledScan.isRunning());
+        out.put("last", scheduledScan.lastResult());
+        return out;
+    }
+
+    /**
+     * Runs the scan immediately, with the same rules as the scheduled tick.
+     *
+     * Returns as soon as the run is accepted: a full scan fetches remotes and indexes every changed
+     * program, which outlives any sensible HTTP timeout. The caller polls {@code GET /api/schedule}
+     * for the per-program outcome, which is also what makes the schedule testable without waiting
+     * until 02:30.
+     */
+    @PostMapping("/schedule/run")
+    public ScheduledScanService.ScanResult runScheduleNow() {
+        return scheduledScan.runAsync("manual");
     }
 
     // ------------------------------------------------------------- filesystem

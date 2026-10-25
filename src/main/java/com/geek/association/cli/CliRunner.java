@@ -99,12 +99,21 @@ public class CliRunner implements ApplicationRunner, ExitCodeGenerator {
         for (ChangeRecord c : changes) {
             c.id = seq++;
         }
-        List<PeerImpact> peers = peerImpacts(changes, headIndex, all(args, "peer"));
+        List<String> peerLocations = all(args, "peer");
+        if (peerLocations.isEmpty()) {
+            // The product scans other programs only. Without a peer there is nothing to report, and
+            // silently emitting an empty report would make --fail-on pass on any change.
+            System.err.println("missing --peer <path-or-url>: only impacts on other programs are scanned");
+            System.err.println("  example: --peer /path/to/order-service --peer https://github.com/org/billing.git");
+            exitCode = 2;
+            return;
+        }
+        List<PeerImpact> peers = peerImpacts(changes, headIndex, peerLocations);
         ImpactReport report = new ReportBuilder().build(revisions, headIndex, baseIndex, changes,
                 List.of(), diffs, peers);
         report.peers = peers;
         report.peersNote = peers.isEmpty()
-                ? "未选择 --peer，本次没有扫描任何其他程序；自身影响不在扫描范围内"
+                ? "选中的其他程序都无法读取，本次没有可比对的结果"
                 : null;
 
         String out = first(args, "out");

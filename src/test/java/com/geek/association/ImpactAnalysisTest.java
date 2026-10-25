@@ -124,16 +124,17 @@ class ImpactAnalysisTest {
                 "the changed endpoint must produce an API contract impact");
 
         // ---- report shape ----
+        // The report is peer-scoped by product rule, so a run with no peer selected must contain no
+        // impacts at all - not even the ones the engine found inside this program.
         Map<String, String> diffs = new FileDiffCollector(revisions.base, revisions.head).unifiedDiffs(files, 20, 120);
-        ImpactReport report = new ReportBuilder().build(revisions, headIndex, baseIndex, changes, impacts, diffs);
+        ImpactReport report = new ReportBuilder().build(revisions, headIndex, baseIndex, changes,
+                impacts, diffs, List.of());
         assertEquals(1, report.summary.changedModules, "only user-service was modified");
-        assertEquals(3, report.summary.impactedModules, "order-service, payment-service and user-service are impacted");
-        assertTrue(report.summary.highRisk > 0, "report must contain high risk items");
-        assertFalse(report.moduleImpacts.isEmpty(), "module impact map must not be empty");
-        assertFalse(report.moduleGraph.isEmpty(), "module graph must contain cross module edges");
-        assertTrue(report.moduleGraph.stream().anyMatch(e -> "DEPENDS_ON".equals(e.type)),
-                "maven module dependency must be part of the graph");
-        assertTrue(report.notes.stream().anyMatch(n -> n.contains("跨模块关系")),
-                "report notes must use Chinese analysis conclusions");
+        assertEquals(0, report.summary.impactedModules, "no peer selected means nothing is reported");
+        assertEquals(0, report.summary.impactedSymbols, "local impacts must never leak into the report");
+        assertTrue(report.impacts.isEmpty(), "report.impacts must stay empty without a peer");
+        assertTrue(report.moduleGraph.isEmpty(), "the own module graph must not be exposed");
+        assertTrue(report.blindSpots.isEmpty(), "own blind spots must not be exposed");
+        assertEquals("本次分析没有选择对比程序", report.peersNote);
     }
 }

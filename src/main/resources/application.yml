@@ -22,6 +22,15 @@ code-association:
   data-dir: ./.code-association
   max-files: 20000
   max-depth: 8
+  # Daily proactive scan: analyse programs that received new commits, without anyone pressing a
+  # button. Only programs whose HEAD moved since their last finished analysis are run, and each
+  # run compares that program against every other program.
+  schedule:
+    enabled: true
+    cron: "0 30 2 * * *"   # every day at 02:30
+    run-on-startup: false
+    max-programs-per-run: 20
+    directory-rescan-minutes: 1440
   ai:
     enabled: false
     base-url: ""

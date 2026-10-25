@@ -19,12 +19,6 @@ import java.util.Set;
 /** Assembles the flat analysis results into the report shape the UI renders. */
 public class ReportBuilder {
 
-    public ImpactReport build(RevisionPair revisions, CodeIndex headIndex, CodeIndex baseIndex,
-                              List<ChangeRecord> changes, List<ImpactResult> impacts,
-                              Map<String, String> diffs) {
-        return build(revisions, headIndex, baseIndex, changes, impacts, diffs, List.of());
-    }
-
     /**
      * Builds one report.
      *
@@ -92,7 +86,10 @@ public class ReportBuilder {
 
         report.changes = changes.stream().map(this::toView).toList();
 
-        boolean peerScoped = !peers.isEmpty();
+        // Scope is decided by intent, never by whether the peer list happened to resolve: an empty
+        // result must render as "nothing found", not silently fall back to this program's own
+        // modules, blind spots and notes. The caller passes peerScoped explicitly for that reason.
+        boolean peerScoped = true;
         List<ImpactResult> peerImpacts = new ArrayList<>();
         for (com.geek.association.model.PeerImpact peer : peers) {
             if (peer.note != null) {
@@ -102,7 +99,7 @@ public class ReportBuilder {
             peerImpacts.addAll(peer.impacts);
         }
         report.summary.comparedPrograms = peers.size();
-        List<ImpactResult> scoped = peerScoped ? peerImpacts : impacts;
+        List<ImpactResult> scoped = peerImpacts;
 
         Map<String, List<ImpactResult>> byModule = new LinkedHashMap<>();
         Map<String, String> peerByModule = new LinkedHashMap<>();
@@ -133,13 +130,7 @@ public class ReportBuilder {
         for (ImpactResult impact : scoped) {
             changesWithImpact.add(impact.changeRecordId);
         }
-        if (!peerScoped) {
-            for (ChangeRecord change : changes) {
-                if (!changesWithImpact.contains(change.id)) {
-                    report.summary.changedSymbolsWithoutCallers++;
-                }
-            }
-        }
+
 
         for (Map.Entry<String, List<ImpactResult>> e : byModule.entrySet()) {
             ImpactReport.ModuleImpact mi = new ImpactReport.ModuleImpact();
@@ -183,104 +174,30 @@ public class ReportBuilder {
             report.impacts.add(toView(impact, byId.get(impact.changeRecordId)));
         }
 
-        if (!peerScoped) {
-        for (String[] dep : headIndex.moduleDependencies) {
-            ImpactReport.ModuleEdge me = new ImpactReport.ModuleEdge();
-            me.from = dep[0].isBlank() ? "(root)" : dep[0];
-            me.to = dep[1].isBlank() ? "(root)" : dep[1];
-            me.type = "DEPENDS_ON";
-            me.detail = "pom.xml dependency on " + dep[2];
-            report.moduleGraph.add(me);
-        }
-        for (Edge e : headIndex.outgoing.values().stream().flatMap(List::stream).toList()) {
-            if (!"CALLS_API".equals(e.relation) && !"CALLS".equals(e.relation) && !"EXECUTES_SQL".equals(e.relation)
-                    && !"USES_CONFIG".equals(e.relation) && !"READS_TABLE".equals(e.relation)
-                    && !"WRITES_TABLE".equals(e.relation) && !"REFERENCES_TYPE".equals(e.relation)
-                    && !"IMPLEMENTS".equals(e.relation) && !"EXTENDS".equals(e.relation)
-                    && !"DEPENDS_ON".equals(e.relation) && !"PUBLISHES_TO".equals(e.relation)
-                    && !"SUBSCRIBES_TO".equals(e.relation) && !"USES_MESSAGE_SCHEMA".equals(e.relation)
-                    && !"ROUTES_TO".equals(e.relation)) {
-                continue;
-            }
-            Sym from = headIndex.symbol(e.from);
-            Sym to = headIndex.symbol(e.to);
-            if (from == null || to == null) {
-                continue;
-            }
-            String fromModule = from.modulePath == null ? "" : from.modulePath;
-            String toModule = to.modulePath == null ? "" : to.modulePath;
-            if (fromModule.equals(toModule) && !"CALLS_API".equals(e.relation)
-                    && !"PUBLISHES_TO".equals(e.relation) && !"SUBSCRIBES_TO".equals(e.relation)) {
-                continue;
-            }
-            ImpactReport.ModuleEdge me = new ImpactReport.ModuleEdge();
-            me.from = fromModule.isBlank() ? "(root)" : fromModule;
-            me.to = toModule.isBlank() ? "(root)" : toModule;
-            me.type = e.relation;
-            me.detail = from.display() + " -> " + to.display();
-            report.moduleGraph.add(me);
-        }
-        } else {
-            Set<String> seenEdges = new LinkedHashSet<>();
-            for (com.geek.association.model.PeerImpact peer : peers) {
-                for (ImpactResult impact : peer.impacts) {
-                    String key = peer.peerSourceName + "|" + impact.targetQualifiedName;
-                    if (!seenEdges.add(key)) {
-                        continue;
-                    }
-                    ImpactReport.ModuleEdge me = new ImpactReport.ModuleEdge();
-                    me.from = report.sourceName;
-                    me.to = peer.peerSourceName;
-                    me.type = "CROSS_PROGRAM";
-                    me.detail = impact.targetQualifiedName + " in "
-                            + (impact.peerModule == null ? impact.targetModule : impact.peerModule);
-                    report.moduleGraph.add(me);
+        Set<String> seenEdges = new LinkedHashSet<>();
+        for (com.geek.association.model.PeerImpact peer : peers) {
+            for (ImpactResult impact : peer.impacts) {
+                String key = peer.peerSourceName + "|" + impact.targetQualifiedName;
+                if (!seenEdges.add(key)) {
+                    continue;
                 }
+                ImpactReport.ModuleEdge me = new ImpactReport.ModuleEdge();
+                me.from = report.sourceName;
+                me.to = peer.peerSourceName;
+                me.type = "CROSS_PROGRAM";
+                me.detail = impact.targetQualifiedName + " in "
+                        + (impact.peerModule == null ? impact.targetModule : impact.peerModule);
+                report.moduleGraph.add(me);
             }
         }
-        if (!peerScoped) {
-            report.blindSpots = blindSpots(headIndex);
-            notes(report, headIndex, baseIndex);
-        } else {
-            report.blindSpots = new ArrayList<>();
-            peerNotes(report, headIndex, peers);
-        }
-        return report;
-    }
+        // An empty peer list means "nothing was compared", which the UI must state explicitly
+        // rather than leave looking like a clean run.
+        report.peersNote = peers.isEmpty() ? "本次分析没有选择对比程序" : null;
 
-    private void notes(ImpactReport report, CodeIndex head, CodeIndex base) {
-        Set<String> seen = new LinkedHashSet<>();
-        if (base.types.isEmpty() && !head.types.isEmpty()) {
-            ImpactReport.addNote(report.notes, seen,
-                    "基线快照为空（首次提交或没有父提交），所有符号都会被计为新增，"
-                            + "因此影响清单描述的是初始状态，而不是本次增量。");
-        }
-        if (!head.unresolved.isEmpty()) {
-            ImpactReport.addNote(report.notes, seen,
-                    "静态分析无法解析 " + head.unresolved.size()
-                            + " 个调用点，这些调用之后的影响未纳入报告，请查看分析盲区。");
-        }
-        if (report.summary.changedSymbolsWithoutCallers > 0) {
-            ImpactReport.addNote(report.notes, seen,
-                    report.summary.changedSymbolsWithoutCallers + " 个变化符号在仓库内没有可静态解析的调用方，"
-                            + "通常是 Controller、Listener、定时任务等由 Spring 或容器调用的入口。"
-                            + "它们会出现在变更清单中，但无法生成影响传播路径。");
-        }
-        if (head.types.isEmpty()) {
-            ImpactReport.addNote(report.notes, seen, "没有索引到 Java 源码，请确认代码源根目录是否正确。");
-        }
-        long crossModule = report.moduleGraph.stream()
-                .filter(e -> !e.from.equals(e.to)).count();
-        ImpactReport.addNote(report.notes, seen,
-                "发现 " + crossModule + " 条跨模块关系（调用、类型、接口、SQL、配置和消息），"
-                        + "影响传播在合并后的知识图谱上执行。");
-        ImpactReport.addNote(report.notes, seen,
-                "反射、运行时代理、生成代码、动态 SQL 以及配置中心下发的配置超出静态分析范围；"
-                        + "低置信度条目应作为待确认候选，而不是已证实结论。");
-        if (!base.types.isEmpty() || !head.types.isEmpty()) {
-            ImpactReport.addNote(report.notes, seen,
-                    "风险与置信度相互独立：风险衡量后果严重程度，置信度衡量证据强度。");
-        }
+        // Blind spots come from the peer indexes, never from this program's own unresolved calls.
+        report.blindSpots = new ArrayList<>();
+        peerNotes(report, headIndex, peers);
+        return report;
     }
 
     private void peerNotes(ImpactReport report, CodeIndex ownHead,
@@ -300,28 +217,6 @@ public class ReportBuilder {
         ImpactReport.addNote(report.notes, seen,
                 "跨程序结论来自共享契约（HTTP、数据库、配置、Maven 依赖和消息）；"
                         + "未命中的契约不视为没有影响，请结合接口文档与运行时调用确认。");
-    }
-
-    private List<ImpactReport.BlindSpot> blindSpots(CodeIndex index) {
-        List<ImpactReport.BlindSpot> out = new ArrayList<>();
-        Map<String, Integer> perModule = new LinkedHashMap<>();
-        for (CodeIndex.UnresolvedCall u : index.unresolved) {
-            int count = perModule.merge(u.modulePath == null ? "" : u.modulePath, 1, Integer::sum);
-            if (count > 30) {
-                continue;
-            }
-            ImpactReport.BlindSpot b = new ImpactReport.BlindSpot();
-            b.module = u.modulePath == null || u.modulePath.isBlank() ? "(root)" : u.modulePath;
-            b.file = u.filePath;
-            b.line = u.line;
-            b.expression = u.expression;
-            b.reason = u.reason;
-            out.add(b);
-            if (out.size() >= 200) {
-                break;
-            }
-        }
-        return out;
     }
 
     private ImpactReport.ChangeView toView(ChangeRecord c) {
