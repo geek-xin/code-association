@@ -5,6 +5,7 @@
 [![Build](https://img.shields.io/badge/build-Maven-c71a36.svg)](pom.xml)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Release](https://img.shields.io/github/v/release/geek-xin/code-association)](https://github.com/geek-xin/code-association/releases)
+[![Docs](https://img.shields.io/badge/docs-GitHub%20Pages-blue)](https://geek-xin.github.io/code-association/)
 
 给定一次代码变更（本地未提交改动 / 两次提交 / 分支 / PR·MR），分析它对**其他程序模块**的影响，
 并给出：影响路径、影响原因、代码位置、影响类型、风险等级、分析置信度、建议验证的测试。
@@ -573,7 +574,7 @@ mvn test
 
 - **问题与建议**：[Issues](https://github.com/geek-xin/code-association/issues)
 - **变更记录**：[Releases](https://github.com/geek-xin/code-association/releases)
-- **深度文档**：[docs/wiki](docs/wiki/Home.md) · 同步到 [Wiki](https://github.com/geek-xin/code-association/wiki) 用 `./scripts/sync-wiki.sh`
+- **深度文档**：[geek-xin.github.io/code-association](https://geek-xin.github.io/code-association/)（源码在 `docs/`）
 
 提交代码前请确认：
 
