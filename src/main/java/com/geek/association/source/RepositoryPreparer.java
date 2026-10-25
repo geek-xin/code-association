@@ -502,6 +502,27 @@ public class RepositoryPreparer {
         }
     }
 
+    /**
+     * Whether the source's location can be reached right now.
+     *
+     * Local sources point at a directory that may have been moved or deleted; remote sources are
+     * reachable as long as the URL is well formed, because the clone is created on demand.
+     */
+    public boolean locationExists(RepoSource source) {
+        String type = source.type == null ? "LOCAL_DIR" : source.type.toUpperCase();
+        if (isRemote(type)) {
+            return !Texts.isBlank(source.location);
+        }
+        if (Texts.isBlank(source.location)) {
+            return false;
+        }
+        try {
+            return Files.isDirectory(Path.of(source.location).toAbsolutePath().normalize());
+        } catch (RuntimeException e) {
+            return false;
+        }
+    }
+
     /** True when the source has a git history at all, i.e. a commit can be compared. */
     public boolean isVersioned(RepoSource source) {
         String type = source.type == null ? "LOCAL_DIR" : source.type.toUpperCase();

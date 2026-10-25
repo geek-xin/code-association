@@ -174,7 +174,7 @@ public class AnalysisService {
             summary.put("parsedFiles", report.summary.parsedFiles);
 
             store.finishAnalysis(analysis.id, Analysis.DONE, null, System.currentTimeMillis() - start,
-                    summary, report);
+                    summary, report, analysis.baseCommit, analysis.headCommit);
             source.lastSyncedAt = RepoSource.now();
             source.status = "OK";
             source.message = "analysed at " + RepoSource.now();

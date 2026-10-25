@@ -347,6 +347,18 @@ public class Store {
 
     public void finishAnalysis(long id, String status, String message, long durationMs,
                                Object summary, Object report) {
+        finishAnalysis(id, status, message, durationMs, summary, report, null, null);
+    }
+
+    /**
+     * Finishes a run and stores the commits it actually compared.
+     *
+     * The commits are resolved while the run is in flight; without persisting them the daily scan
+     * cannot tell "already analysed this commit" from "never analysed", and would re-run every
+     * program on every tick.
+     */
+    public void finishAnalysis(long id, String status, String message, long durationMs,
+                               Object summary, Object report, String baseCommit, String headCommit) {
         init();
         Analysis current = analysis(id);
         List<String> completed = current == null ? new ArrayList<>() : current.progressCompleted;
@@ -365,7 +377,8 @@ public class Store {
         try (Connection c = connection(); PreparedStatement ps = c.prepareStatement("""
                 UPDATE analysis SET status=?, message=?, finished_at=?, duration_ms=?, summary_json=?, report_json=?,
                     progress_stage=?, progress_percent=?, progress_label=?, progress_detail=?,
-                    progress_completed=?, progress_skipped=?
+                    progress_completed=?, progress_skipped=?,
+                    base_commit=COALESCE(?, base_commit), head_commit=COALESCE(?, head_commit)
                 WHERE id=?
                 """)) {
             ps.setString(1, status);
@@ -380,7 +393,9 @@ public class Store {
             ps.setString(10, message == null ? "" : message);
             ps.setString(11, Json.write(completed));
             ps.setString(12, Json.write(skipped));
-            ps.setLong(13, id);
+            ps.setString(13, baseCommit);
+            ps.setString(14, headCommit);
+            ps.setLong(15, id);
             ps.executeUpdate();
         } catch (SQLException e) {
             throw new IllegalStateException("finish analysis failed", e);
@@ -422,16 +437,21 @@ public class Store {
      */
     public int recoverStaleAnalyses(int olderThanMinutes) {
         init();
-        String cutoff = Instant.now().minusSeconds(Math.max(1, olderThanMinutes) * 60L).toString();
-        try (Connection c = connection(); PreparedStatement ps = c.prepareStatement(
-                "UPDATE analysis SET status=?, message=?, finished_at=? "
-                        + "WHERE status IN (?,?) AND (created_at IS NULL OR created_at < ?)")) {
+        // A caller that just started knows no run can be alive, and passes 0 to mean "all of
+        // them". Treating 0 as "one minute ago" would silently leave fresh rows behind.
+        boolean useCutoff = olderThanMinutes > 0;
+        String cutoff = useCutoff ? Instant.now().minusSeconds(olderThanMinutes * 60L).toString() : null;
+        String sql = "UPDATE analysis SET status=?, message=?, finished_at=? WHERE status IN (?,?)"
+                + (useCutoff ? " AND (created_at IS NULL OR created_at < ?)" : "");
+        try (Connection c = connection(); PreparedStatement ps = c.prepareStatement(sql)) {
             ps.setString(1, Analysis.FAILED);
             ps.setString(2, "分析进程在完成前中断（服务重启或超时），已标记为失败");
             ps.setString(3, Instant.now().toString());
             ps.setString(4, Analysis.RUNNING);
             ps.setString(5, Analysis.PENDING);
-            ps.setString(6, cutoff);
+            if (useCutoff) {
+                ps.setString(6, cutoff);
+            }
             return ps.executeUpdate();
         } catch (SQLException e) {
             throw new IllegalStateException("recover stale analyses failed", e);

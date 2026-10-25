@@ -3,7 +3,7 @@
 # release.sh — 构建、打包并发布 code-association 到 GitHub Release
 #
 # 用法:
-#   ./release.sh                  # 发布默认版本 0.2.0
+#   ./release.sh                  # 发布默认版本 0.2.1
 #   ./release.sh 0.3.0            # 发布指定版本
 #   VERSION=0.3.0 ./release.sh    # 同上（环境变量方式）
 #
@@ -36,7 +36,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 APP="code-association"
-VERSION="${1:-${VERSION:-0.2.0}}"
+VERSION="${1:-${VERSION:-0.2.1}}"
 TAG="v${VERSION}"
 RELEASE_ROOT="build/release"
 STAGE="${RELEASE_ROOT}/${APP}-${VERSION}"
@@ -231,15 +231,30 @@ cat > "$NOTES" <<'NOTES_TEMPLATE'
 跨程序变更影响扫描工具（Java / Maven 多模块仓库）：分析一次提交改动了哪些类、方法、SQL、MQ 消息结构，
 并推导出对其他模块 / 服务的连带影响与风险等级。
 
-### 本次更新
+### 本次修复（0.2.1）
 
-- **每日自动扫描**：每天 **02:30** 自动检查所有程序，只分析有新提交的那些，无需人工触发。
+0.2.0 的每日扫描有几个实质问题，本次全部修复：
+
+- **提交持久化（关键）**：分析结束时保存 `base_commit` / `head_commit`。此前不保存，
+  扫描无法区分「这个提交已经分析过」和「从未分析过」，导致**每个程序每天都被重新分析一遍**。
+- **零宽限恢复**：`recoverStaleAnalyses(0)` 现在表示「全部」，不再被当成「1 分钟前」，
+  避免刚产生的中断记录一直停留在 RUNNING。
+- **位置缺失保护**：源目录已不存在时跳过并给出原因（「位置不可访问」），不再每个周期重试失败。
+- **列表查询提速**：`analyses()` / `analysesOfSource()` 不再 SELECT 报告正文
+  （单个报告约 7MB，`/api/analyses` 曾超时 >60s，现约 21ms）。
+- 新增 `ScheduledScanTest`（4 个用例）：扫描 / 跳过 / 位置缺失 / 孤儿恢复。
+
+实测：扫描耗时 70s，结果 scanned 0 / skipped 4（3 个「没有新提交」+ 1 个「位置不可访问」）；
+修复前是每次都 scanned 4 / skipped 0。
+
+### 每日自动扫描
+
+- 每天 **02:30** 自动检查所有程序，只分析有新提交的那些，无需人工触发。
   由 `code-association.schedule.*` 控制（`enabled` / `cron` / `run-on-startup` /
   `max-programs-per-run` / `directory-rescan-minutes`）。
 - 手动触发一次扫描：`curl -X POST http://127.0.0.1:9996/api/schedule/run`；
   查看调度状态（下次执行时间、是否运行中、上次结果）：`curl http://127.0.0.1:9996/api/schedule`。
-- 影响范围收敛为**仅跨程序（peer-only）**，不再把本地自身影响计入结果。
-- 启动时清理上次异常退出残留的未完成分析，列表查询不再加载报告正文，界面更快。
+- 影响范围**仅跨程序（peer-only）**，不把本地自身影响计入结果。
 
 ### 下载
 

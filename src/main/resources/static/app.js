@@ -287,6 +287,24 @@ function toast(message, tone) {
 /* -------------------------------------------------------------------- counts */
 
 function impacts() { return (state.report && state.report.impacts) || []; }
+
+/**
+ * The program an impact belongs to.
+ *
+ * Reports produced before cross-program scanning existed have no peerSourceName. Falling back to
+ * their targetModule would label this program's own module as "another program", so such entries
+ * are marked explicitly instead.
+ */
+function impactProgram(impact) {
+  if (!impact) return '—';
+  return impact.peerSourceName || '（历史报告：本程序内部影响）';
+}
+
+/** Same rule for a module-level row. */
+function moduleProgram(row) {
+  if (!row) return '—';
+  return row.peerSourceName || '（历史报告：本程序内部影响）';
+}
 function reviewCounts() {
   var all = impacts();
   var decisions = decisionsFor(state.analysisId);
@@ -661,7 +679,7 @@ function renderOverview() {
           '<div class="row-title">' + esc(shortSymbol(i.targetSymbol)) +
             pill(RISK_LABEL[i.riskLevel] || i.riskLevel, RISK_TONE[i.riskLevel], true) + '</div>' +
           '<div class="row-desc">' + esc(i.reason) + '</div>' +
-          '<div class="row-meta">' + chip(i.peerSourceName || i.targetModule) + chip(TYPE_LABEL[i.impactType] || i.impactType) +
+          '<div class="row-meta">' + chip(impactProgram(i)) + chip(TYPE_LABEL[i.impactType] || i.impactType) +
             chip('置信度 ' + i.confidence) + '</div>' +
         '</div>' +
         '<div class="row-right"><div class="row-arrow">' + icon('i-chevron-right') + '</div></div>' +
@@ -919,7 +937,7 @@ function renderReview() {
         '<div class="row-main">' +
           '<div class="row-title"><span class="sym">' + esc(shortSymbol(i.targetSymbol)) + '</span>' + statusPill + '</div>' +
           '<div class="row-desc">' + esc(i.reason) + '</div>' +
-          '<div class="row-meta">' + chip(i.peerSourceName || i.targetModule) +
+          '<div class="row-meta">' + chip(impactProgram(i)) +
             chip(TYPE_LABEL[i.impactType] || i.impactType) +
             chip('风险 ' + Math.round(i.riskScore || 0)) +
             chip('置信度 ' + i.confidence) + '</div>' +
@@ -949,7 +967,7 @@ function renderReviewEvidence() {
     return;
   }
   if (title) title.textContent = shortSymbol(impact.targetSymbol);
-  if (sub) sub.innerHTML = esc(impact.peerSourceName || impact.targetModule) +
+  if (sub) sub.innerHTML = esc(impactProgram(impact)) +
     (impact.peerModule ? ' / ' + esc(impact.peerModule) : '') +
     ' · ' + esc(TYPE_LABEL[impact.impactType] || impact.impactType) + ' · 风险 ' + Math.round(impact.riskScore || 0);
   if (actions) {
@@ -1005,9 +1023,9 @@ function renderImpact() {
   var setText = function (id, v) { var el = $(id); if (el) el.textContent = v; };
   var setHtml = function (id, v) { var el = $(id); if (el) el.innerHTML = v; };
 
-  setText('im-crumb-module', impact.peerSourceName || impact.targetModule);
+  setText('im-crumb-module', impactProgram(impact));
   setText('im-title', shortSymbol(impact.targetSymbol));
-  setHtml('im-sub', esc(impact.peerSourceName || impact.targetModule) +
+  setHtml('im-sub', esc(impactProgram(impact)) +
     (impact.peerModule ? ' / ' + esc(impact.peerModule) : '') + ' <span class="sep">·</span> ' +
     esc(shortFile(impact.targetFile)) + ':' + (impact.targetLine || 0) +
     ' <span class="sep">·</span> 来源 ' + esc(shortSymbol(impact.changedSymbol)));
@@ -1033,7 +1051,7 @@ function renderImpact() {
         '<div class="flow-note">' + esc((impact.path || []).length) + ' 个中间调用点，' + esc(impact.confidence) + ' 置信度</div></div>' +
       '<div class="flow-card ' + (severe ? 'accent' : 'ok') + '"><div class="flow-label">影响</div>' +
         '<div class="flow-value ' + (severe ? 'danger' : 'success') + '">' + esc(RISK_LABEL[impact.riskLevel] || impact.riskLevel) + '</div>' +
-        '<div class="flow-note">' + esc(impact.peerSourceName || impact.targetModule) + ' 中 ' +
+        '<div class="flow-note">' + esc(impactProgram(impact)) + ' 中 ' +
           esc(TYPE_LABEL[impact.impactType] || impact.impactType) + '</div></div>';
   }
 
@@ -1072,7 +1090,7 @@ function renderImpact() {
     : emptyBlock('未找到覆盖测试', '建议新增针对该符号的测试用例。'));
 
   setHtml('im-details', [
-    kvRow('其他程序', impact.peerSourceName || impact.targetModule),
+    kvRow('其他程序', impactProgram(impact)),
     kvRow('对方模块', impact.peerModule || '—'),
     kvRow('影响符号', shortSymbol(impact.targetSymbol) + (impact.targetSignature || '')),
     kvRow('位置', shortFile(impact.targetFile) + ':' + (impact.targetLine || 0)),
@@ -1160,10 +1178,10 @@ function renderAnalysis() {
   if (modulesHost) {
     modulesHost.innerHTML = modules.length ? modules.map(function (m) {
       var selected = state.selectedModule === m.module;
-      return '<div class="list-row' + (selected ? ' selected' : '') + '" data-module="' + esc(m.peerSourceName || m.module) + '">' +
+      return '<div class="list-row' + (selected ? ' selected' : '') + '" data-module="' + esc(moduleProgram(m)) + '">' +
         '<div class="row-icon ' + (RISK_TONE[m.riskLevel] || 'neutral') + '">' + icon('i-package') + '</div>' +
         '<div class="row-main">' +
-          '<div class="row-title"><span class="sym">' + esc(m.peerSourceName || m.module) + '</span>' +
+          '<div class="row-title"><span class="sym">' + esc(moduleProgram(m)) + '</span>' +
             (m.peerSourceName && m.module ? pill(m.module, 'neutral') : '') +
             pill((RISK_LABEL[m.riskLevel] || m.riskLevel) + ' · ' + m.maxRisk, RISK_TONE[m.riskLevel], true) + '</div>' +
           '<div class="row-meta">' + chip('影响符号 ' + m.impactedSymbols) + chip('高风险 ' + m.highRisk) +
@@ -1295,7 +1313,7 @@ function renderTriage() {
           '<div class="row-title"><span class="sym">' + esc(shortSymbol(i.targetSymbol)) + '</span>' +
             pill(RISK_LABEL[i.riskLevel] || i.riskLevel, RISK_TONE[i.riskLevel], true) + '</div>' +
           '<div class="row-desc">' + esc(i.reason) + '</div>' +
-          '<div class="row-meta">' + chip(i.peerSourceName || i.targetModule) +
+          '<div class="row-meta">' + chip(impactProgram(i)) +
             chip('置信度 ' + i.confidence) + chip('深度 ' + i.depth) + '</div>' +
         '</div>' +
         '<div class="row-right"><div class="row-arrow">' + icon('i-chevron-right') + '</div></div>' +
@@ -1309,7 +1327,7 @@ function renderTriage() {
   if (advice) {
     var highConf = impacts().filter(function (i) { return i.confidence === 'HIGH'; }).length;
     var programCount = {};
-    impacts().forEach(function (i) { programCount[i.peerSourceName || i.targetModule] = 1; });
+    impacts().forEach(function (i) { programCount[impactProgram(i)] = 1; });
     var contractCount = ((state.report && state.report.summary && state.report.summary.matchedContracts) || 0);
     advice.innerHTML = [
       adviceRow('i-target', '优先复核高置信度项', highConf + ' 项置信度为高的其他程序影响最可能真实发生，建议先看。'),
@@ -1386,7 +1404,7 @@ function renderMap(hostId, report, opts) {
   var edges = [];
   var riskByModule = new Map();
   (report.moduleImpacts || []).forEach(function (m) {
-    riskByModule.set(m.peerSourceName || m.module, m);
+    riskByModule.set(moduleProgram(m), m);
   });
 
   function ensure(name, changed) {
@@ -1404,7 +1422,7 @@ function renderMap(hostId, report, opts) {
   }
   ensure(report.sourceName, true);
   (report.moduleImpacts || []).forEach(function (m) {
-    ensure(m.peerSourceName || m.module, m.changed);
+    ensure(moduleProgram(m), m.changed);
   });
 
   var changedSet = new Set();
@@ -1653,9 +1671,9 @@ function openImpactDrawer(impact) {
     '<div class="chips" style="margin-bottom:12px">' +
       pill(RISK_LABEL[impact.riskLevel] || impact.riskLevel, RISK_TONE[impact.riskLevel], true) +
       pill(TYPE_LABEL[impact.impactType] || impact.impactType, 'brand') +
-      pill(impact.peerSourceName || impact.targetModule, 'neutral') + '</div>' +
+      pill(impactProgram(impact), 'neutral') + '</div>' +
     '<div class="kv-list">' +
-      kvRow('其他程序', impact.peerSourceName || impact.targetModule) +
+      kvRow('其他程序', impactProgram(impact)) +
       kvRow('对方模块', impact.peerModule || '—') +
       kvRow('影响符号', shortSymbol(impact.targetSymbol) + (impact.targetSignature || '')) +
       kvRow('位置', shortFile(impact.targetFile) + ':' + (impact.targetLine || 0)) +
@@ -1712,7 +1730,7 @@ function openChangeDrawer(change) {
     (related.length ? '<div class="evidence">' + related.map(function (i) {
       return '<div class="ev-row" style="cursor:pointer" data-impact-id="' + i.id + '">' +
         '<div class="ev-type">' + esc(RISK_LABEL[i.riskLevel] || i.riskLevel) + ' · ' +
-          esc(i.peerSourceName || i.targetModule) + '</div>' +
+          esc(impactProgram(i)) + '</div>' +
         '<div class="ev-main">' + esc(shortSymbol(i.targetSymbol)) + '</div>' +
         '<div class="ev-meta">' + esc(i.reason) + '</div></div>';
     }).join('') + '</div>' : '<div class="empty">未发现跨符号影响。</div>');
@@ -2243,7 +2261,7 @@ function openDecision(kind, impactId) {
   $('md-save').textContent = isConfirm ? '确认影响' : '忽略';
   $('md-save').className = 'btn ' + (isConfirm ? 'btn-primary' : '');
   $('md-note').value = '';
-  $('md-target').textContent = (impact.peerSourceName || impact.targetModule) + ' · ' + shortSymbol(impact.targetSymbol);
+  $('md-target').textContent = (impactProgram(impact)) + ' · ' + shortSymbol(impact.targetSymbol);
   openModal('modal-decision');
 }
 

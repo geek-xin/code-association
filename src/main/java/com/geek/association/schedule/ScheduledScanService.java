@@ -192,6 +192,13 @@ public class ScheduledScanService {
                 result.details.add(entry(source, "SKIPPED", "已有分析在进行中"));
                 return;
             }
+            // A source whose location disappeared must not be retried on every tick: the run would
+            // fail identically each time and drown the real signal. Report it once and move on.
+            if (!preparer.locationExists(source)) {
+                result.skipped++;
+                result.details.add(entry(source, "SKIPPED", "位置不可访问：" + source.location));
+                return;
+            }
             String head = preparer.currentCommit(source);
             boolean versioned = preparer.isVersioned(source);
             Analysis last = lastFinished(source.id);
