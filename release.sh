@@ -79,10 +79,31 @@ TARGET_REF="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)"
 
 log "仓库: $REPO    版本: $VERSION    tag: $TAG"
 
-# ---------- 1. 构建 jar ----------
-log "构建 jar: mvn -q -DskipTests package"
-mvn -q -DskipTests package
-JAR="target/${APP}.jar"
+# ---------- 1. 构建 jar（在干净的临时副本中构建） ----------
+# 为什么不在原地构建：
+#   1) 线上服务可能正打开 target/code-association.jar，原地覆盖会让运行中的 JVM
+#      之后加载类时抛 ClassNotFoundException（曾经因此让服务异常）。
+#   2) 从 git archive 出来的干净树构建，能保证「产物 == 该提交」，不会把未提交的
+#      改动（比如别人正在编辑的源文件）悄悄打进包里。
+# 需要原地构建时可设置 RELEASE_INPLACE=1。
+BUILD_ROOT="${RELEASE_ROOT}/build-tree"
+if [ "${RELEASE_INPLACE:-0}" = "1" ]; then
+  log "构建 jar（原地）: mvn -q -DskipTests package"
+  BUILD_DIR="."
+  mvn -q -DskipTests package
+else
+  log "构建 jar（干净副本）: git archive ${BUILD_REF:-HEAD} -> $BUILD_ROOT"
+  if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
+    echo "    注意：工作区有未提交改动，这些改动不会进入本次发布（构建取自 ${BUILD_REF:-HEAD}）" >&2
+  fi
+  rm -rf "$BUILD_ROOT"
+  mkdir -p "$BUILD_ROOT"
+  git archive "${BUILD_REF:-HEAD}" | tar -x -C "$BUILD_ROOT"
+  BUILD_DIR="$BUILD_ROOT"
+  ( cd "$BUILD_ROOT" && mvn -q -DskipTests package )
+fi
+SRC_DIR="$BUILD_DIR"          # 源码根：干净副本，或原地构建时的 .
+JAR="${BUILD_DIR}/target/${APP}.jar"
 [ -f "$JAR" ] || die "构建完成但找不到 $JAR"
 
 # ---------- 2. 组装发布目录 ----------
@@ -91,10 +112,11 @@ rm -rf "$STAGE"
 mkdir -p "${STAGE}/target"
 
 cp "$JAR" "${STAGE}/target/${APP}.jar"
-cp start.sh stop.sh README.md "$STAGE/"
+# 脚本与文档同样取自构建所用的那棵树，保证「包内所有文件都对应同一个提交」
+cp "${SRC_DIR}/start.sh" "${SRC_DIR}/stop.sh" "${SRC_DIR}/README.md" "$STAGE/"
 # 示例配置：与 jar 内置默认配置同源，用户可修改后通过 --spring.config.location 覆盖
-cp src/main/resources/application.yml "${STAGE}/application.yml"
-if [ -d docs ]; then cp -R docs "${STAGE}/docs"; fi
+cp "${SRC_DIR}/src/main/resources/application.yml" "${STAGE}/application.yml"
+if [ -d "${SRC_DIR}/docs" ]; then cp -R "${SRC_DIR}/docs" "${STAGE}/docs"; fi
 
 # 注意：定界符带引号，模板内的反引号 / $(...) 都是纯文本，不会被执行
 cat > "${STAGE}/INSTALL.md" <<'INSTALL_TEMPLATE'
