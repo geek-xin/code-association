@@ -1,3 +1,8 @@
+---
+layout: default
+title: 命令行与CI
+---
+
 # 命令行与 CI
 
 `analyze` 子命令不启动 Web 服务，适合流水线。**`--peer` 是必填的**：

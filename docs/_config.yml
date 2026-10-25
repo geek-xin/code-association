@@ -1,0 +1,16 @@
+title: code-association
+description: 跨程序变更影响扫描 —— 分析一次代码改动会波及哪些其他程序
+theme: jekyll-theme-cayman
+markdown: kramdown
+plugins:
+  - jekyll-relative-links
+relative_links:
+  enabled: true
+  collections: false
+include:
+  - wiki
+exclude:
+  - screenshots
+
+# 中文文件名保持原样，不做 slug 转换
+permalink: /:path/:basename
