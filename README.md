@@ -108,21 +108,25 @@ java -jar target/code-association.jar --server.port=9996
 
 ## 3. 命令行 / CI 集成
 
+`--peer` 是必填的：扫描范围只有其他程序，没有对比对象就没有可报告的内容。
+
 ```bash
-# 分析最近一次提交，把高风险当作失败（可用于流水线门禁）
+# 分析最近一次提交对其他程序的影响，把高风险当作失败（可用于流水线门禁）
 java -jar code-association.jar analyze \
      --location /path/to/repo --base HEAD~1 --target HEAD \
+     --peer /path/to/order-service --peer https://github.com/org/billing.git \
      --out impact-report.json --fail-on HIGH
 
 # 本地未提交改动
-java -jar code-association.jar analyze --location . --mode WORKTREE_DIFF --out report.json
+java -jar code-association.jar analyze --location . --mode WORKTREE_DIFF \
+     --peer /path/to/other-service --out report.json
 
 # GitHub PR（第 42 号）
 java -jar code-association.jar analyze --location https://github.com/org/repo.git \
-     --type GITHUB --pr 42 --out report.json --fail-on HIGH
+     --type GITHUB --pr 42 --peer /path/to/consumer --out report.json --fail-on HIGH
 ```
 
-退出码：`0` 通过，`1` 命中 `--fail-on` 阈值，`2` 参数或仓库解析失败。
+退出码：`0` 通过，`1` 命中 `--fail-on` 阈值，`2` 参数或仓库解析失败（含缺少 `--peer`）。
 `analyze` 子命令不会启动 Web 服务。
 
 ### 3.1 直接生成 PR 评论
@@ -155,6 +159,7 @@ java -jar code-association.jar analyze --location . --base origin/main --target 
 | 参数 | 说明 |
 |---|---|
 | `--location` | 本地路径或 Git 地址（必填） |
+| `--peer` | 被扫描的其他程序，可重复（必填，至少一个） |
 | `--type` | `LOCAL_DIR` / `LOCAL_GIT` / `GITHUB` / `GITLAB` / `GIT`，省略时按地址推断 |
 | `--mode` | `GIT_DIFF`（默认）/ `WORKTREE_DIFF` / `PULL_REQUEST` |
 | `--base` `--target` | 基线 / 目标引用，`--base` 省略时取目标提交的父提交 |
@@ -171,7 +176,7 @@ impact:
   script:
     - java -jar code-association.jar analyze
         --location "$CI_PROJECT_DIR" --base "$CI_MERGE_REQUEST_TARGET_BRANCH_NAME"
-        --target "$CI_COMMIT_SHA" --out impact.json --fail-on HIGH
+        --target "$CI_COMMIT_SHA" --peer "$PEER_DIR" --out impact.json --fail-on HIGH
   artifacts:
     paths: [impact.json]
     when: always
@@ -369,7 +374,42 @@ C 影响对象重要程度    U 分析不确定性（= 1 - 置信度）
 
 实现上不是把两个仓库的图合并——它们本来就不共享调用图。做法是：先用契约把两边接上，
 再以对方命中的那个节点为起点，在对方自己的图里跑一遍普通的影响传播。
-所以跨程序的影响条目在评分、置信度和解释文案上与本地影响完全一致，没有第二套算法。
+所以跨程序的影响条目在评分、置信度和解释文案上与本地分析完全一致，没有第二套算法。
+
+**扫描范围只有其他程序。** 本程序内部的调用方、模块、测试与传播链不会进入结果：
+引擎不会对自身索引做传播，报告里的模块地图、盲区与计数也全部来自对方程序。
+因此每次分析至少选择一个被扫描的其他程序；命令行同样要求 `--peer`，缺省会直接报错退出，
+而不是产出一份空报告让 `--fail-on` 静默通过。
+
+### 5.5 每日定时扫描
+
+不必等人点按钮：每天定时检查所有已注册的程序，**只对产生了新提交的程序**发起分析。
+
+| 配置项 | 默认值 | 说明 |
+|---|---|---|
+| `code-association.schedule.enabled` | `true` | 总开关 |
+| `code-association.schedule.cron` | `0 30 2 * * *` | 每天 02:30 |
+| `code-association.schedule.run-on-startup` | `false` | 启动后补跑一次，用于补上停机期间错过的扫描 |
+| `code-association.schedule.max-programs-per-run` | `20` | 单次扫描的程序上限 |
+| `code-association.schedule.directory-rescan-minutes` | `1440` | 无提交可比的普通目录，按时间间隔重扫 |
+
+判定逻辑：解析程序当前提交，与该程序**上一次成功分析所记录的提交**比较。
+相同则跳过，不同则分析；每次分析都以**其余所有程序**为对比对象。
+此外还有三种情况会跳过而不是反复重试：已有分析在进行中、位置不可访问、没有其他程序可比较。
+
+运维接口：
+
+```bash
+curl http://127.0.0.1:9996/api/schedule        # 配置、下次时间、上次每个程序的判定结果
+curl -X POST http://127.0.0.1:9996/api/schedule/run   # 立即执行一次（异步，结果回上面查）
+```
+
+两个可靠性细节值得说明：
+
+- **孤儿任务恢复**：进程被杀死时正在运行的分析会永远停在 RUNNING，后续扫描会一直把它当作
+  「忙碌」而跳过。启动时会把这些行标记为失败，让调度自愈。
+- **提交要落库**：分析实际比较的提交在完成时写回数据库。否则调度无法区分「已分析过这个提交」
+  与「从未分析」，每天都会把所有程序重扫一遍。
 
 ---
 
