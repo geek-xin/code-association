@@ -1,0 +1,456 @@
+package com.geek.association.store;
+
+import com.geek.association.config.AppProperties;
+import com.geek.association.model.Analysis;
+import com.geek.association.model.RepoSource;
+import com.geek.association.util.Json;
+import org.springframework.stereotype.Component;
+
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.sql.Statement;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * SQLite persistence for sources and analysis runs.
+ *
+ * The code index itself is not persisted per revision: it is rebuilt from the snapshot when a run
+ * starts, which keeps the schema small and avoids stale indexes. Only the source registry and the
+ * finished reports (plus the raw summary JSON) are stored.
+ */
+@Component
+public class Store {
+
+    private final AppProperties properties;
+    private volatile boolean initialized;
+
+    public Store(AppProperties properties) {
+        this.properties = properties;
+    }
+
+    public Path dataDir() {
+        Path dir = properties.dataPath();
+        try {
+            Files.createDirectories(dir);
+        } catch (IOException e) {
+            throw new IllegalStateException("cannot create data dir " + dir, e);
+        }
+        return dir;
+    }
+
+    private Connection connection() throws SQLException {
+        return DriverManager.getConnection("jdbc:sqlite:" + dataDir().resolve("code-association.db"));
+    }
+
+    public synchronized void init() {
+        if (initialized) {
+            return;
+        }
+        try (Connection c = connection(); Statement st = c.createStatement()) {
+            st.executeUpdate("""
+                    CREATE TABLE IF NOT EXISTS repo_source (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        name TEXT NOT NULL,
+                        type TEXT NOT NULL,
+                        location TEXT NOT NULL,
+                        default_ref TEXT,
+                        credential_env TEXT,
+                        local_path TEXT,
+                        status TEXT,
+                        message TEXT,
+                        created_at TEXT,
+                        last_synced_at TEXT
+                    )
+                    """);
+            st.executeUpdate("""
+                    CREATE TABLE IF NOT EXISTS analysis (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        source_id INTEGER NOT NULL,
+                        source_name TEXT,
+                        source_type TEXT,
+                        mode TEXT,
+                        base_ref TEXT,
+                        target_ref TEXT,
+                        base_commit TEXT,
+                        head_commit TEXT,
+                        status TEXT,
+                        message TEXT,
+                        created_at TEXT,
+                        finished_at TEXT,
+                        duration_ms INTEGER DEFAULT 0,
+                        summary_json TEXT,
+                        report_json TEXT,
+                        progress_stage TEXT,
+                        progress_percent INTEGER DEFAULT 0,
+                        progress_label TEXT,
+                        progress_detail TEXT,
+                        progress_completed TEXT,
+                        progress_skipped TEXT
+                    )
+                    """);
+            migrateAnalysisProgress(st);
+            initialized = true;
+        } catch (SQLException e) {
+            throw new IllegalStateException("sqlite init failed", e);
+        }
+    }
+
+    /**
+     * Existing databases predate progress columns. Adding them on startup keeps upgrades
+     * backward-compatible instead of requiring users to delete their history.
+     */
+    private void migrateAnalysisProgress(Statement st) throws SQLException {
+        List<String> columns = new ArrayList<>();
+        try (ResultSet rs = st.executeQuery("PRAGMA table_info(analysis)")) {
+            while (rs.next()) {
+                columns.add(rs.getString("name"));
+            }
+        }
+        addColumnIfMissing(st, columns, "progress_stage", "TEXT");
+        addColumnIfMissing(st, columns, "progress_percent", "INTEGER DEFAULT 0");
+        addColumnIfMissing(st, columns, "progress_label", "TEXT");
+        addColumnIfMissing(st, columns, "progress_detail", "TEXT");
+        addColumnIfMissing(st, columns, "progress_completed", "TEXT");
+        addColumnIfMissing(st, columns, "progress_skipped", "TEXT");
+    }
+
+    private void addColumnIfMissing(Statement st, List<String> columns, String name, String type)
+            throws SQLException {
+        if (!columns.contains(name)) {
+            st.executeUpdate("ALTER TABLE analysis ADD COLUMN " + name + " " + type);
+        }
+    }
+
+    // ------------------------------------------------------------------ sources
+
+    public RepoSource saveSource(RepoSource source) {
+        init();
+        try (Connection c = connection()) {
+            if (source.id == 0) {
+                source.createdAt = RepoSource.now();
+                try (PreparedStatement ps = c.prepareStatement("""
+                        INSERT INTO repo_source (name, type, location, default_ref, credential_env, local_path,
+                                                 status, message, created_at, last_synced_at)
+                        VALUES (?,?,?,?,?,?,?,?,?,?)
+                        """, Statement.RETURN_GENERATED_KEYS)) {
+                    ps.setString(1, source.name);
+                    ps.setString(2, source.type);
+                    ps.setString(3, source.location);
+                    ps.setString(4, source.defaultRef);
+                    ps.setString(5, source.credentialEnv);
+                    ps.setString(6, source.localPath);
+                    ps.setString(7, source.status);
+                    ps.setString(8, source.message);
+                    ps.setString(9, source.createdAt);
+                    ps.setString(10, source.lastSyncedAt);
+                    ps.executeUpdate();
+                    try (ResultSet keys = ps.getGeneratedKeys()) {
+                        if (keys.next()) {
+                            source.id = keys.getLong(1);
+                        }
+                    }
+                }
+            } else {
+                try (PreparedStatement ps = c.prepareStatement("""
+                        UPDATE repo_source SET name=?, type=?, location=?, default_ref=?, credential_env=?,
+                        local_path=?, status=?, message=?, last_synced_at=? WHERE id=?
+                        """)) {
+                    ps.setString(1, source.name);
+                    ps.setString(2, source.type);
+                    ps.setString(3, source.location);
+                    ps.setString(4, source.defaultRef);
+                    ps.setString(5, source.credentialEnv);
+                    ps.setString(6, source.localPath);
+                    ps.setString(7, source.status);
+                    ps.setString(8, source.message);
+                    ps.setString(9, source.lastSyncedAt);
+                    ps.setLong(10, source.id);
+                    ps.executeUpdate();
+                }
+            }
+            return source;
+        } catch (SQLException e) {
+            throw new IllegalStateException("save source failed", e);
+        }
+    }
+
+    public List<RepoSource> sources() {
+        init();
+        List<RepoSource> out = new ArrayList<>();
+        try (Connection c = connection(); Statement st = c.createStatement();
+             ResultSet rs = st.executeQuery("SELECT * FROM repo_source ORDER BY id DESC")) {
+            while (rs.next()) {
+                out.add(readSource(rs));
+            }
+        } catch (SQLException e) {
+            throw new IllegalStateException("list sources failed", e);
+        }
+        return out;
+    }
+
+    public RepoSource source(long id) {
+        init();
+        try (Connection c = connection(); PreparedStatement ps = c.prepareStatement("SELECT * FROM repo_source WHERE id=?")) {
+            ps.setLong(1, id);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? readSource(rs) : null;
+            }
+        } catch (SQLException e) {
+            throw new IllegalStateException("read source failed", e);
+        }
+    }
+
+    public void deleteSource(long id) {
+        init();
+        try (Connection c = connection(); PreparedStatement ps = c.prepareStatement("DELETE FROM repo_source WHERE id=?")) {
+            ps.setLong(1, id);
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            throw new IllegalStateException("delete source failed", e);
+        }
+    }
+
+    /** Analyses that still belong to a source, newest first. */
+    public List<Analysis> analysesOfSource(long sourceId) {
+        init();
+        List<Analysis> out = new ArrayList<>();
+        try (Connection c = connection(); PreparedStatement ps = c.prepareStatement(
+                "SELECT * FROM analysis WHERE source_id=? ORDER BY id DESC")) {
+            ps.setLong(1, sourceId);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    out.add(readAnalysis(rs, false));
+                }
+            }
+        } catch (SQLException e) {
+            throw new IllegalStateException("list analyses of source failed", e);
+        }
+        return out;
+    }
+
+    /**
+     * Removes every analysis of a source and returns how many rows were deleted.
+     *
+     * Analyses carry a snapshot of the source name, so leaving them behind would keep reporting
+     * on a code base the user has explicitly removed.
+     */
+    public int deleteAnalysesOfSource(long sourceId) {
+        init();
+        try (Connection c = connection(); PreparedStatement ps = c.prepareStatement(
+                "DELETE FROM analysis WHERE source_id=?")) {
+            ps.setLong(1, sourceId);
+            return ps.executeUpdate();
+        } catch (SQLException e) {
+            throw new IllegalStateException("delete analyses of source failed", e);
+        }
+    }
+
+    private RepoSource readSource(ResultSet rs) throws SQLException {
+        RepoSource s = new RepoSource();
+        s.id = rs.getLong("id");
+        s.name = rs.getString("name");
+        s.type = rs.getString("type");
+        s.location = rs.getString("location");
+        s.defaultRef = rs.getString("default_ref");
+        s.credentialEnv = rs.getString("credential_env");
+        s.localPath = rs.getString("local_path");
+        s.status = rs.getString("status");
+        s.message = rs.getString("message");
+        s.createdAt = rs.getString("created_at");
+        s.lastSyncedAt = rs.getString("last_synced_at");
+        return s;
+    }
+
+    // ----------------------------------------------------------------- analyses
+
+    public Analysis createAnalysis(Analysis analysis) {
+        init();
+        analysis.createdAt = Instant.now().toString();
+        analysis.status = Analysis.RUNNING;
+        analysis.progressStage = "PENDING";
+        analysis.progressPercent = 0;
+        analysis.progressLabel = "等待分析";
+        analysis.progressDetail = "任务已创建";
+        try (Connection c = connection(); PreparedStatement ps = c.prepareStatement("""
+                INSERT INTO analysis (source_id, source_name, source_type, mode, base_ref, target_ref,
+                                      base_commit, head_commit, status, message, created_at,
+                                      progress_stage, progress_percent, progress_label, progress_detail,
+                                      progress_completed, progress_skipped)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """, Statement.RETURN_GENERATED_KEYS)) {
+            ps.setLong(1, analysis.sourceId);
+            ps.setString(2, analysis.sourceName);
+            ps.setString(3, analysis.sourceType);
+            ps.setString(4, analysis.mode);
+            ps.setString(5, analysis.baseRef);
+            ps.setString(6, analysis.targetRef);
+            ps.setString(7, analysis.baseCommit);
+            ps.setString(8, analysis.headCommit);
+            ps.setString(9, analysis.status);
+            ps.setString(10, analysis.message);
+            ps.setString(11, analysis.createdAt);
+            ps.setString(12, analysis.progressStage);
+            ps.setInt(13, analysis.progressPercent);
+            ps.setString(14, analysis.progressLabel);
+            ps.setString(15, analysis.progressDetail);
+            ps.setString(16, Json.write(analysis.progressCompleted));
+            ps.setString(17, Json.write(analysis.progressSkipped));
+            ps.executeUpdate();
+            try (ResultSet keys = ps.getGeneratedKeys()) {
+                if (keys.next()) {
+                    analysis.id = keys.getLong(1);
+                }
+            }
+            return analysis;
+        } catch (SQLException e) {
+            throw new IllegalStateException("create analysis failed", e);
+        }
+    }
+
+    /**
+     * Writes only the live progress fields. The report and summary stay untouched, so the status
+     * endpoint can poll this cheaply while the worker is still running.
+     */
+    public void updateProgress(long id, String stage, int percent, String label, String detail,
+                               List<String> completed, List<String> skipped) {
+        init();
+        int clamped = Math.max(0, Math.min(100, percent));
+        try (Connection c = connection(); PreparedStatement ps = c.prepareStatement("""
+                UPDATE analysis SET progress_stage=?, progress_percent=?, progress_label=?,
+                    progress_detail=?, progress_completed=?, progress_skipped=?
+                WHERE id=?
+                """)) {
+            ps.setString(1, stage);
+            ps.setInt(2, clamped);
+            ps.setString(3, label);
+            ps.setString(4, detail);
+            ps.setString(5, Json.write(completed == null ? List.of() : completed));
+            ps.setString(6, Json.write(skipped == null ? List.of() : skipped));
+            ps.setLong(7, id);
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            throw new IllegalStateException("update analysis progress failed", e);
+        }
+    }
+
+    public void finishAnalysis(long id, String status, String message, long durationMs,
+                               Object summary, Object report) {
+        init();
+        Analysis current = analysis(id);
+        List<String> completed = current == null ? new ArrayList<>() : current.progressCompleted;
+        List<String> skipped = current == null ? new ArrayList<>() : current.progressSkipped;
+        if (Analysis.DONE.equals(status)) {
+            for (String stage : List.of("PREPARE", "DIFF", "INDEX_HEAD", "INDEX_BASE",
+                    "DETECT", "IMPACT", "REPORT")) {
+                if (!completed.contains(stage)) {
+                    completed.add(stage);
+                }
+            }
+        }
+        String stage = Analysis.DONE.equals(status) ? "DONE" : Analysis.FAILED;
+        int percent = Analysis.DONE.equals(status) ? 100 : 0;
+        String label = Analysis.DONE.equals(status) ? "分析完成" : "分析失败";
+        try (Connection c = connection(); PreparedStatement ps = c.prepareStatement("""
+                UPDATE analysis SET status=?, message=?, finished_at=?, duration_ms=?, summary_json=?, report_json=?,
+                    progress_stage=?, progress_percent=?, progress_label=?, progress_detail=?,
+                    progress_completed=?, progress_skipped=?
+                WHERE id=?
+                """)) {
+            ps.setString(1, status);
+            ps.setString(2, message);
+            ps.setString(3, Instant.now().toString());
+            ps.setLong(4, durationMs);
+            ps.setString(5, summary == null ? null : Json.write(summary));
+            ps.setString(6, report == null ? null : Json.write(report));
+            ps.setString(7, stage);
+            ps.setInt(8, percent);
+            ps.setString(9, label);
+            ps.setString(10, message == null ? "" : message);
+            ps.setString(11, Json.write(completed));
+            ps.setString(12, Json.write(skipped));
+            ps.setLong(13, id);
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            throw new IllegalStateException("finish analysis failed", e);
+        }
+    }
+
+    public List<Analysis> analyses(int limit) {
+        init();
+        List<Analysis> out = new ArrayList<>();
+        try (Connection c = connection(); PreparedStatement ps = c.prepareStatement(
+                "SELECT * FROM analysis ORDER BY id DESC LIMIT ?")) {
+            ps.setInt(1, limit);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    out.add(readAnalysis(rs, false));
+                }
+            }
+        } catch (SQLException e) {
+            throw new IllegalStateException("list analyses failed", e);
+        }
+        return out;
+    }
+
+    public Analysis analysis(long id) {
+        init();
+        try (Connection c = connection(); PreparedStatement ps = c.prepareStatement("SELECT * FROM analysis WHERE id=?")) {
+            ps.setLong(1, id);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? readAnalysis(rs, true) : null;
+            }
+        } catch (SQLException e) {
+            throw new IllegalStateException("read analysis failed", e);
+        }
+    }
+
+    private Analysis readAnalysis(ResultSet rs, boolean withReport) throws SQLException {
+        Analysis a = new Analysis();
+        a.id = rs.getLong("id");
+        a.sourceId = rs.getLong("source_id");
+        a.sourceName = rs.getString("source_name");
+        a.sourceType = rs.getString("source_type");
+        a.mode = rs.getString("mode");
+        a.baseRef = rs.getString("base_ref");
+        a.targetRef = rs.getString("target_ref");
+        a.baseCommit = rs.getString("base_commit");
+        a.headCommit = rs.getString("head_commit");
+        a.status = rs.getString("status");
+        a.message = rs.getString("message");
+        a.createdAt = rs.getString("created_at");
+        a.finishedAt = rs.getString("finished_at");
+        a.durationMs = rs.getLong("duration_ms");
+        a.progressStage = rs.getString("progress_stage");
+        a.progressPercent = rs.getInt("progress_percent");
+        a.progressLabel = rs.getString("progress_label");
+        a.progressDetail = rs.getString("progress_detail");
+        a.progressCompleted = readStringList(rs.getString("progress_completed"));
+        a.progressSkipped = readStringList(rs.getString("progress_skipped"));
+        a.summaryJson = rs.getString("summary_json");
+        if (withReport) {
+            a.reportJson = rs.getString("report_json");
+        }
+        return a;
+    }
+
+    private List<String> readStringList(String json) {
+        if (json == null || json.isBlank()) {
+            return new ArrayList<>();
+        }
+        try {
+            return Json.read(json, new com.fasterxml.jackson.core.type.TypeReference<List<String>>() {
+            });
+        } catch (Exception e) {
+            return new ArrayList<>();
+        }
+    }
+
+}

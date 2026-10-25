@@ -1,0 +1,1114 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>其他程序影响扫描 · 工作台</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml"/>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;550;600;700&display=swap"/>
+<script>
+    /* Resolve the palette before first paint so a dark session never flashes white. */
+    (function () {
+      var stored = null;
+      try { stored = localStorage.getItem('ca.theme'); } catch (e) { /* private mode */ }
+      var pref = (stored === 'light' || stored === 'dark') ? stored : 'system';
+      var dark = pref === 'dark' || (pref === 'system' &&
+        window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
+      if (dark) document.documentElement.setAttribute('data-theme', 'dark');
+      document.documentElement.setAttribute('data-theme-pref', pref);
+    })();
+  </script>
+  <link rel="stylesheet" href="/style.css"/>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <symbol id="i-home" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="m3 10 9-7 9 7v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="M9 21V12h6v9"/></symbol>
+  <symbol id="i-database" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v14c0 1.7 3.6 3 8 3s8-1.3 8-3V5"/><path d="M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></symbol>
+  <symbol id="i-shield" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10Z"/><path d="m9 12 2 2 4-4"/></symbol>
+  <symbol id="i-gauge" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 21a9 9 0 1 1 9-9"/><path d="M12 12l4.5-4.5"/><circle cx="12" cy="12" r="1.6" fill="currentColor" stroke="none"/></symbol>
+  <symbol id="i-file" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/><path d="M8 13h8M8 17h5"/></symbol>
+  <symbol id="i-network" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="2" width="6" height="6" rx="1.5"/><rect x="2" y="16" width="6" height="6" rx="1.5"/><rect x="16" y="16" width="6" height="6" rx="1.5"/><path d="M12 8v4M5 16v-2h14v2"/></symbol>
+  <symbol id="i-list" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M8 6h13M8 12h13M8 18h13"/><circle cx="3.5" cy="6" r="1.2" fill="currentColor" stroke="none"/><circle cx="3.5" cy="12" r="1.2" fill="currentColor" stroke="none"/><circle cx="3.5" cy="18" r="1.2" fill="currentColor" stroke="none"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.9.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.9 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.9l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.9.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.9-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.9V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1Z"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></symbol>
+  <symbol id="i-chevron-right" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></symbol>
+  <symbol id="i-chevron-down" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></symbol>
+  <symbol id="i-x" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="m20 6-11 11-5-5"/></symbol>
+  <symbol id="i-check-circle" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="m8.5 12 2.5 2.5 4.5-5"/></symbol>
+  <symbol id="i-alert" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M10.3 3.6 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.6a2 2 0 0 0-3.4 0Z"/><path d="M12 9v4M12 17h.01"/></symbol>
+  <symbol id="i-alert-circle" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 8v4M12 16h.01"/></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 8h.01"/></symbol>
+  <symbol id="i-arrow-right" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></symbol>
+  <symbol id="i-refresh" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 0 1 15-6.7L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/><path d="M3 21v-5h5"/></symbol>
+  <symbol id="i-upload" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 9 5-5 5 5"/><path d="M12 4v12"/></symbol>
+  <symbol id="i-git" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="5" r="2.4"/><circle cx="6" cy="19" r="2.4"/><circle cx="18" cy="12" r="2.4"/><path d="M6 7.4v9.2M8.4 5h4.2a3 3 0 0 1 3 3v1.6"/></symbol>
+  <symbol id="i-package" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="m12 2 9 5v10l-9 5-9-5V7z"/><path d="m3 7 9 5 9-5M12 12v10"/></symbol>
+  <symbol id="i-activity" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></symbol>
+  <symbol id="i-zap" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2 3 14h8l-1 8 10-12h-8z"/></symbol>
+  <symbol id="i-sparkles" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="m12 3 1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9z"/><path d="M18.5 16.5 19 18l1.5.5L19 19l-.5 1.5L18 19l-1.5-.5L18 18z"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.9"/><path d="M16 3.1a4 4 0 0 1 0 7.8"/></symbol>
+  <symbol id="i-trash" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/></symbol>
+  <symbol id="i-external" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><path d="M15 3h6v6M10 14 21 3"/></symbol>
+  <symbol id="i-filter" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 3H2l8 9.5V19l4 2v-8.5z"/></symbol>
+  <symbol id="i-layers" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="m12 2 9 5-9 5-9-5z"/><path d="m3 12 9 5 9-5"/><path d="m3 17 9 5 9-5"/></symbol>
+  <symbol id="i-code" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m16 18 6-6-6-6M8 6l-6 6 6 6"/></symbol>
+  <symbol id="i-archive" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="5" rx="1.5"/><path d="M4 9v10a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9"/><path d="M10 13h4"/></symbol>
+  <symbol id="i-play" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m6 3 14 9-14 9z"/></symbol>
+  <symbol id="i-eye-off" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M10.7 5.1A10 10 0 0 1 12 5c7 0 10 7 10 7a17 17 0 0 1-2.2 3.2"/><path d="M6.6 6.6A16.8 16.8 0 0 0 2 12s3 7 10 7a9.7 9.7 0 0 0 4.4-1"/><path d="M2 2l20 20"/></symbol>
+  <symbol id="i-paperclip" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M21.4 11.1 12.2 20.3a5.5 5.5 0 0 1-7.8-7.8l8.5-8.5a3.7 3.7 0 0 1 5.2 5.2l-8.5 8.5a1.8 1.8 0 0 1-2.6-2.6l7.8-7.8"/></symbol>
+  <symbol id="i-target" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5"/><circle cx="12" cy="12" r="1.4" fill="currentColor" stroke="none"/></symbol>
+  <symbol id="i-theme-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M20.5 14.5A8.5 8.5 0 0 1 9.5 3.5a8.5 8.5 0 1 0 11 11Z"/></symbol>
+  <symbol id="i-theme-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4.2"/><path d="M12 2.4v2.2M12 19.4v2.2M2.4 12h2.2M19.4 12h2.2M5.2 5.2l1.6 1.6M17.2 17.2l1.6 1.6M18.8 5.2l-1.6 1.6M6.8 17.2l-1.6 1.6"/></symbol>
+  <symbol id="i-folder" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7.5A2 2 0 0 1 5 5.5h3.6a2 2 0 0 1 1.6.8l1 1.4H19a2 2 0 0 1 2 2v7.8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></symbol>
+  <symbol id="i-arrow-up" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M6 11l6-6 6 6"/></symbol>
+  <symbol id="i-corner-down" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M6 4v10a3 3 0 0 0 3 3h9"/><path d="m14 13 4 4-4 4"/></symbol>
+</defs></svg>
+
+<div class="app">
+
+  <!-- ============================ icon rail ============================ -->
+  <nav class="rail" aria-label="主导航">
+    <div class="rail-logo" title="Code Association">CA</div>
+    <div class="rail-group">
+      <button class="rail-btn active" data-nav="overview" title="总览"><svg><use href="#i-home"/></svg></button>
+      <button class="rail-btn" data-nav="sources" title="代码源"><svg><use href="#i-database"/></svg></button>
+      <button class="rail-btn" data-nav="review" title="影响审核"><svg><use href="#i-shield"/></svg></button>
+      <button class="rail-btn" data-nav="analysis" title="分析详情"><svg><use href="#i-file"/></svg></button>
+      <button class="rail-btn" data-nav="map" title="模块地图"><svg><use href="#i-network"/></svg></button>
+      <button class="rail-btn" data-nav="triage" title="复核队列"><svg><use href="#i-gauge"/></svg><span class="dot" id="rail-alert-dot"></span></button>
+    </div>
+    <div class="rail-spacer"></div>
+    <div class="rail-group">
+      <button class="rail-btn" data-nav="history" title="分析历史"><svg><use href="#i-clock"/></svg></button>
+      <button class="rail-btn" data-nav="settings" title="设置"><svg><use href="#i-settings"/></svg></button>
+      <button class="rail-btn" id="theme-toggle" data-theme-toggle type="button"
+              title="切换深浅色" aria-label="切换深浅色" aria-pressed="false"><svg><use href="#i-theme-moon"/></svg></button>
+      <div class="rail-avatar" title="本地工作区">本地</div>
+    </div>
+  </nav>
+
+  <!-- =========================== text sidenav ========================== -->
+  <aside class="sidenav">
+    <div class="sidenav-head">
+      <div>
+        <div class="eyebrow">工作区</div>
+        <h2 id="nav-title">代码源</h2>
+      </div>
+      <button class="icon-btn" id="nav-add-source" title="添加代码源"><svg><use href="#i-plus"/></svg></button>
+    </div>
+
+    <div class="search">
+      <svg><use href="#i-search"/></svg>
+      <input id="global-search" type="search" placeholder="搜索代码源 / 影响 / 符号" aria-label="搜索"/>
+      <kbd>⌘K</kbd>
+    </div>
+
+    <div class="nav-scroll">
+      <div class="nav-group">
+        <button class="nav-item active" data-nav="overview"><svg><use href="#i-home"/></svg>总览<span class="count" id="nav-count-sources">0</span></button>
+        <button class="nav-item" data-nav="sources"><svg><use href="#i-database"/></svg>代码源<span class="count" id="nav-count-sources2">0</span></button>
+        <button class="nav-item" data-nav="review"><svg><use href="#i-shield"/></svg>影响审核<span class="count alert" id="nav-count-review">0</span></button>
+      </div>
+
+      <div class="nav-group">
+        <div class="nav-group-title"><span>代码源</span><button class="icon-btn" style="width:22px;height:22px;border-radius:6px" id="nav-add-source-2" title="添加"><svg><use href="#i-plus"/></svg></button></div>
+        <div id="nav-sources"><p class="muted" style="font-size:11.5px;padding:4px 8px">加载中…</p></div>
+      </div>
+
+      <div class="nav-group">
+        <div class="nav-group-title"><span>状态</span></div>
+        <button class="nav-item" data-filter="status:DONE"><svg><use href="#i-check-circle"/></svg>已就绪<span class="count" id="nav-status-done">0</span></button>
+        <button class="nav-item" data-filter="status:RUNNING"><svg><use href="#i-activity"/></svg>分析中<span class="count" id="nav-status-running">0</span></button>
+        <button class="nav-item" data-filter="status:FAILED"><svg><use href="#i-alert-circle"/></svg>失败<span class="count" id="nav-status-failed">0</span></button>
+      </div>
+
+      <div class="nav-group">
+        <div class="nav-group-title"><span>最近分析</span></div>
+        <div id="nav-history"><p class="muted" style="font-size:11.5px;padding:4px 8px">暂无记录</p></div>
+      </div>
+
+      <div class="nav-group">
+        <div class="nav-group-title"><span>其他</span></div>
+        <button class="nav-item" data-nav="history"><svg><use href="#i-clock"/></svg>分析历史<span class="count" id="nav-count-history">0</span></button>
+        <button class="nav-item" data-nav="settings"><svg><use href="#i-settings"/></svg>设置</button>
+      </div>
+    </div>
+
+    <div class="sidenav-foot">
+      <button class="nav-item" data-nav="triage"><svg><use href="#i-gauge"/></svg>复核队列<span class="count alert" id="nav-count-triage">0</span></button>
+      <button class="nav-item" data-nav="review"><svg><use href="#i-archive"/></svg>已忽略的发现<span class="count" id="nav-count-dismissed">0</span></button>
+    </div>
+  </aside>
+
+  <!-- ============================ workspace ============================ -->
+  <main class="workspace" id="workspace">
+
+    <!-- ---------------------------------------------------------- overview -->
+    <section class="page" id="page-overview" data-page="overview">
+      <header class="page-head">
+        <div>
+          <div class="breadcrumb"><b>工作区</b><span class="sep">/</span><span>总览</span></div>
+          <div class="title-row">
+            <span class="title-badge"><svg><use href="#i-home"/></svg></span>
+            <h1 class="page-title">其他程序影响总览</h1>
+            <span class="pill neutral" id="ov-mode-pill">—</span>
+          </div>
+          <div class="page-sub" id="ov-sub">正在读取最近一次分析…</div>
+        </div>
+        <div class="head-right">
+          <div class="head-metric">
+            <div class="label">对比程序</div>
+            <div class="value" id="ov-head-programs">—</div>
+          </div>
+          <div class="head-metric">
+            <div class="label">高风险影响</div>
+            <div class="value" id="ov-head-high">—</div>
+          </div>
+          <div class="head-actions">
+            <button class="btn" id="ov-refresh"><svg><use href="#i-refresh"/></svg>刷新</button>
+            <button class="btn btn-primary" data-open-run><svg><use href="#i-play"/></svg>新建分析</button>
+          </div>
+        </div>
+      </header>
+
+      <div class="stats" id="ov-stats"></div>
+
+      <div class="grid grid-2" style="margin-bottom:16px">
+        <div class="card">
+          <div class="card-head">
+            <div>
+              <div class="card-title">其他程序的待处理影响</div>
+              <div class="card-sub">按风险排序，点击进入审核与证据</div>
+            </div>
+            <div class="card-head-actions">
+              <span class="pill danger" id="ov-attn-count">0 项</span>
+              <button class="btn btn-sm" data-nav="review">查看全部<svg><use href="#i-chevron-right"/></svg></button>
+            </div>
+          </div>
+          <div class="list" id="ov-attention"></div>
+        </div>
+
+        <div class="stack">
+          <div class="card">
+            <div class="card-head">
+              <div>
+                <div class="card-title">审核进度</div>
+                <div class="card-sub">本轮分析中已复核的影响</div>
+              </div>
+            </div>
+            <div class="ring-wrap">
+              <div class="ring" id="ov-ring"></div>
+              <div style="flex:1;min-width:0">
+                <div class="kv-list" id="ov-ring-kv"></div>
+              </div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-head">
+              <div>
+                <div class="card-title">跨程序风险分布</div>
+                <div class="card-sub">仅统计其他程序中的影响项</div>
+              </div>
+            </div>
+            <div id="ov-risk-bars" style="display:flex;flex-direction:column;gap:11px"></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card" id="ov-peer-card" style="margin-bottom:16px;display:none">
+        <div class="card-head">
+          <div>
+            <div class="card-title">对其他程序的影响</div>
+            <div class="card-sub">本程序的变更通过接口、数据表、配置与 Maven 依赖传导到其他程序</div>
+          </div>
+          <div class="card-head-actions" id="ov-peer-summary"></div>
+        </div>
+        <div id="ov-peers"></div>
+      </div>
+
+      <div class="card" style="margin-bottom:16px">
+          <div class="card-head">
+            <div>
+              <div class="card-title">近期事件</div>
+              <div class="card-sub">按时间倒序，可跳转到对应分析</div>
+            </div>
+          </div>
+          <div class="timeline" id="ov-timeline"></div>
+      </div>
+
+      <div class="card flush">
+        <div class="card-head" style="padding:18px 18px 0;margin-bottom:10px">
+          <div>
+            <div class="card-title">最近分析</div>
+            <div class="card-sub">本工作区保存的分析记录</div>
+          </div>
+          <div class="card-head-actions">
+            <button class="btn btn-sm" data-nav="history">全部记录<svg><use href="#i-chevron-right"/></svg></button>
+          </div>
+        </div>
+        <div class="table" style="padding:0 8px 10px" id="ov-recent"></div>
+      </div>
+    </section>
+
+    <!-- ----------------------------------------------------------- sources -->
+    <section class="page hidden" id="page-sources" data-page="sources">
+      <header class="page-head">
+        <div>
+          <div class="breadcrumb"><b>工作区</b><span class="sep">/</span><span>代码源</span></div>
+          <div class="title-row">
+            <span class="title-badge"><svg><use href="#i-database"/></svg></span>
+            <h1 class="page-title">添加代码源</h1>
+            <span class="pill brand">导入</span>
+          </div>
+          <div class="page-sub">本地目录、本地 Git 仓库或远程仓库。添加后即可扫描它对其他程序的影响。</div>
+        </div>
+        <div class="head-right">
+          <div class="head-actions">
+            <button class="btn" id="src-refresh"><svg><use href="#i-refresh"/></svg>刷新</button>
+            <button class="btn btn-primary" id="src-add"><svg><use href="#i-plus"/></svg>添加代码源</button>
+          </div>
+        </div>
+      </header>
+
+      <div class="grid grid-2" style="margin-bottom:16px">
+        <div class="card">
+          <div class="card-head">
+            <div>
+              <div class="card-title">导入你的代码源</div>
+              <div class="card-sub">填写位置后保存，导入过程会逐步显示在下方</div>
+            </div>
+          </div>
+
+          <div class="stack" style="gap:12px">
+            <div class="field-row">
+              <div class="field">
+                <label for="src-type">来源类型</label>
+                <select id="src-type">
+                  <option value="LOCAL_DIR">本地目录</option>
+                  <option value="LOCAL_GIT">本地 Git 仓库</option>
+                  <option value="GITHUB">GitHub 仓库</option>
+                  <option value="GITLAB">GitLab 仓库</option>
+                </select>
+              </div>
+              <div class="field">
+                <label for="src-name-preview">名称</label>
+                <input id="src-name-preview" readonly placeholder="按位置自动识别"/>
+              </div>
+            </div>
+            <div class="field">
+              <label for="src-location">位置</label>
+              <div class="path-field">
+                <input id="src-location" placeholder="/path/to/project 或 https://github.com/org/repo.git"/>
+                <button class="btn btn-sm" type="button" data-pick-dir="src-location" title="选择文件夹"><svg><use href="#i-folder"/></svg>浏览…</button>
+              </div>
+              <div class="hint">本地目录可直接点「浏览…」从文件夹树选择；远程仓库会克隆到本地数据目录，私有仓库通过环境变量读取 token，不写入数据库。</div>
+            </div>
+            <div class="field-row">
+              <div class="field">
+                <label for="src-ref">默认分支</label>
+                <select id="src-ref" data-ref-select="src">
+                  <option value="">（自动检测）</option>
+                </select>
+                <div class="hint" id="src-ref-hint">填写位置后自动读取分支</div>
+              </div>
+              <div class="field">
+                <label for="src-token">凭据环境变量</label>
+                <input id="src-token" placeholder="GITHUB_TOKEN（可留空）"/>
+              </div>
+            </div>
+            <div style="display:flex;gap:8px;align-items:center">
+              <button class="btn btn-primary" id="src-save"><svg><use href="#i-upload"/></svg>添加代码源</button>
+              <button class="btn btn-ghost" id="src-reset">清空</button>
+            </div>
+          </div>
+
+          <div class="divider"></div>
+
+          <div class="card-title" style="font-size:13px;margin-bottom:8px">导入进度</div>
+          <div class="stepper" id="src-stepper"></div>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <div>
+              <div class="card-title">工作原理</div>
+              <div class="card-sub">三个步骤，全部在本地完成</div>
+            </div>
+          </div>
+          <div class="stack" style="gap:14px">
+            <div style="display:flex;gap:11px">
+              <div class="row-icon brand"><svg><use href="#i-database"/></svg></div>
+              <div>
+                <div class="row-title" style="font-size:12.5px">读取代码与依赖</div>
+                <div class="row-desc" style="margin-top:2px">解析 Maven 模块、Java 符号、MyBatis / JPA、REST 端点与配置引用。</div>
+              </div>
+            </div>
+            <div style="display:flex;gap:11px">
+              <div class="row-icon brand"><svg><use href="#i-check-circle"/></svg></div>
+              <div>
+                <div class="row-title" style="font-size:12.5px">你确认分析范围</div>
+                <div class="row-desc" style="margin-top:2px">选择提交对比、未提交改动或 PR，指定基线与目标。</div>
+              </div>
+            </div>
+            <div style="display:flex;gap:11px">
+              <div class="row-icon brand"><svg><use href="#i-activity"/></svg></div>
+              <div>
+                <div class="row-title" style="font-size:12.5px">持续跟踪影响</div>
+                <div class="row-desc" style="margin-top:2px">影响路径、风险与置信度、证据与建议测试，随时可回溯。</div>
+              </div>
+            </div>
+          </div>
+          <div class="callout brand" style="margin-top:16px">
+            <svg><use href="#i-info"/></svg>
+            <div>分析在本机执行；只有你显式启用的 AI 解读会把摘要发往配置的模型服务。</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card flush">
+        <div class="card-head" style="padding:18px 18px 0;margin-bottom:10px">
+          <div>
+            <div class="card-title">最近导入</div>
+            <div class="card-sub">已添加的代码源与最近一次分析状态</div>
+          </div>
+          <div class="card-head-actions">
+            <button class="btn btn-sm" data-nav="history">分析历史<svg><use href="#i-chevron-right"/></svg></button>
+          </div>
+        </div>
+        <div class="table" style="padding:0 8px 10px" id="src-recent"></div>
+      </div>
+    </section>
+
+    <!-- ------------------------------------------------------------ review -->
+    <section class="page hidden" id="page-review" data-page="review">
+      <header class="page-head">
+        <div>
+          <div class="breadcrumb"><b>工作区</b><span class="sep">/</span><b id="rv-crumb-source">—</b><span class="sep">/</span><span>影响审核</span></div>
+          <div class="title-row">
+            <span class="title-badge"><svg><use href="#i-shield"/></svg></span>
+            <h1 class="page-title">审核其他程序受到的影响</h1>
+            <span class="pill success" id="rv-state-pill">本地演示状态</span>
+          </div>
+          <div class="page-sub" id="rv-sub">—</div>
+        </div>
+        <div class="head-right">
+          <div class="head-metric">
+            <div class="label">已复核</div>
+            <div class="value" id="rv-reviewed">0 <small>/ 0</small></div>
+          </div>
+          <div class="head-actions">
+            <button class="btn" id="rv-reset">重置本地复核</button>
+            <button class="btn btn-primary" id="rv-finish"><svg><use href="#i-check"/></svg>完成审核</button>
+          </div>
+        </div>
+      </header>
+
+      <div class="stats" id="rv-stats"></div>
+
+      <div class="card" id="rv-peer-card" style="margin-bottom:16px;display:none">
+        <div class="card-head">
+          <div>
+            <div class="card-title">对其他程序的影响</div>
+            <div class="card-sub">审核时同样需要确认：本次改动是否要通知或改动这些程序</div>
+          </div>
+          <div class="card-head-actions" id="rv-peer-summary"></div>
+        </div>
+        <div id="rv-peers"></div>
+      </div>
+
+      <div class="grid" style="grid-template-columns:minmax(0,1fr) minmax(0,1.05fr);align-items:start">
+        <div class="card" style="padding:14px">
+          <div class="card-head" style="padding:4px 4px 0">
+            <div>
+              <div class="card-title">发现列表</div>
+              <div class="card-sub" id="rv-findings-sub">全部发现</div>
+            </div>
+            <div class="card-head-actions">
+              <div class="tabs" id="rv-tabs">
+                <button class="tab active" data-tab="all">全部<span class="n" id="rv-n-all">0</span></button>
+                <button class="tab" data-tab="pending">待审核<span class="n" id="rv-n-pending">0</span></button>
+                <button class="tab" data-tab="confirmed">已确认<span class="n" id="rv-n-confirmed">0</span></button>
+                <button class="tab" data-tab="dismissed">已忽略<span class="n" id="rv-n-dismissed">0</span></button>
+              </div>
+            </div>
+          </div>
+          <div class="list" id="rv-findings" style="margin-top:8px"></div>
+        </div>
+
+        <div class="card" style="padding:14px;position:sticky;top:0">
+          <div class="card-head" style="padding:4px 4px 0">
+            <div style="min-width:0">
+              <div class="card-title" id="rv-ev-title">证据</div>
+              <div class="card-sub" id="rv-ev-sub">选择左侧任一条影响查看证据链</div>
+            </div>
+            <div class="card-head-actions" id="rv-ev-actions"></div>
+          </div>
+          <div id="rv-evidence" style="margin-top:10px"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ------------------------------------------------------------ impact -->
+    <section class="page hidden" id="page-impact" data-page="impact">
+      <header class="page-head">
+        <div>
+          <div class="breadcrumb"><b>工作区</b><span class="sep">/</span><b id="im-crumb-module">—</b><span class="sep">/</span><span>影响详情</span></div>
+          <div class="title-row">
+            <span class="title-badge"><svg><use href="#i-target"/></svg></span>
+            <h1 class="page-title" id="im-title">跨程序影响详情</h1>
+            <span class="pill danger" id="im-risk-pill">—</span>
+            <span class="pill neutral" id="im-type-pill">—</span>
+          </div>
+          <div class="page-sub" id="im-sub">—</div>
+        </div>
+        <div class="head-right">
+          <div class="head-metric">
+            <div class="label">风险分</div>
+            <div class="value" id="im-score">—</div>
+          </div>
+          <div class="head-metric">
+            <div class="label">置信度</div>
+            <div class="value" id="im-confidence">—</div>
+          </div>
+          <div class="head-actions">
+            <button class="btn" id="im-dismiss"><svg><use href="#i-eye-off"/></svg>忽略</button>
+            <button class="btn btn-primary" id="im-confirm"><svg><use href="#i-check"/></svg>确认影响</button>
+          </div>
+        </div>
+      </header>
+
+      <div class="card" style="margin-bottom:16px">
+        <div class="card-head">
+          <div>
+            <div class="card-title"><svg style="width:14px;height:14px;vertical-align:-2px;color:var(--primary);margin-right:5px"><use href="#i-sparkles"/></svg>为什么判定为影响</div>
+            <div class="card-sub">从变更到金额级结论，逐步可追溯</div>
+          </div>
+        </div>
+        <div class="flow" id="im-flow"></div>
+        <div class="callout warning" style="margin-top:14px" id="im-caveat">
+          <svg><use href="#i-alert"/></svg>
+          <div>静态分析边界：反射、动态代理、运行时生成代码与配置中心推送不在可达范围内，置信度为中或低的条目应作为候选而非结论。</div>
+        </div>
+      </div>
+
+      <div class="grid grid-2" style="align-items:start">
+        <div class="stack">
+          <div class="card">
+            <div class="card-head">
+              <div>
+                <div class="card-title">分析结论</div>
+                <div class="card-sub">基于上述变更与调用关系生成，未经人工复核</div>
+              </div>
+            </div>
+            <div id="im-reason" style="font-size:12.5px;line-height:1.75;color:var(--text-body)"></div>
+            <div class="section-label">影响路径</div>
+            <div class="path" id="im-path"></div>
+          </div>
+
+          <div class="card">
+            <div class="card-head">
+              <div>
+                <div class="card-title">证据</div>
+                <div class="card-sub">变更点与传播链上的代码位置</div>
+              </div>
+              <div class="card-head-actions"><span class="pill neutral" id="im-ev-count">0 条</span></div>
+            </div>
+            <div class="evidence" id="im-evidence"></div>
+          </div>
+
+          <div class="card">
+            <div class="card-head">
+              <div>
+                <div class="card-title">建议验证的测试</div>
+                <div class="card-sub">覆盖受影响符号的现有测试</div>
+              </div>
+            </div>
+            <div id="im-tests"></div>
+          </div>
+        </div>
+
+        <div class="stack">
+          <div class="card">
+            <div class="card-head">
+              <div>
+                <div class="card-title">详情</div>
+                <div class="card-sub">影响属性与来源</div>
+              </div>
+            </div>
+            <div class="kv-list" id="im-details"></div>
+          </div>
+
+          <div class="card">
+            <div class="card-head">
+              <div>
+                <div class="card-title">风险构成</div>
+                <div class="card-sub">各因子对总分的贡献</div>
+              </div>
+            </div>
+            <div id="im-factors" style="display:flex;flex-direction:column;gap:10px"></div>
+          </div>
+
+          <div class="card">
+            <div class="card-head">
+              <div>
+                <div class="card-title">变更差异</div>
+                <div class="card-sub">来源变更的文本差异</div>
+              </div>
+            </div>
+            <div id="im-diff"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ---------------------------------------------------------- analysis -->
+    <section class="page hidden" id="page-analysis" data-page="analysis">
+      <header class="page-head">
+        <div>
+          <div class="breadcrumb"><b>工作区</b><span class="sep">/</span><b id="an-crumb-source">—</b><span class="sep">/</span><span>分析详情</span></div>
+          <div class="title-row">
+            <span class="title-badge"><svg><use href="#i-file"/></svg></span>
+            <h1 class="page-title" id="an-title">分析详情</h1>
+            <span class="pill success" id="an-state">已完成</span>
+          </div>
+          <div class="page-sub" id="an-sub">—</div>
+        </div>
+        <div class="head-right">
+          <div class="head-metric">
+            <div class="label">解析文件</div>
+            <div class="value" id="an-files">—</div>
+          </div>
+          <div class="head-metric">
+            <div class="label">耗时</div>
+            <div class="value" id="an-duration">—</div>
+          </div>
+          <div class="head-actions">
+            <button class="btn" data-open-run><svg><use href="#i-refresh"/></svg>重新分析</button>
+            <button class="btn btn-primary" data-nav="review"><svg><use href="#i-shield"/></svg>去审核</button>
+          </div>
+        </div>
+      </header>
+
+      <div class="card" id="an-empty" style="margin-bottom:16px">
+        <div class="empty" style="border:0;background:transparent;padding:34px 18px">
+          <strong>这个代码源还没有分析记录</strong>
+          <div id="an-empty-sub">运行一次扫描后，这里会展示变更清单、其他程序影响与风险构成。</div>
+          <button class="btn btn-primary" data-open-run style="margin-top:14px"><svg><use href="#i-play"/></svg>新建分析</button>
+        </div>
+      </div>
+
+      <div id="an-body">
+      <div class="card hidden" id="an-progress-card" style="margin-bottom:16px">
+        <div class="card-head">
+          <div>
+            <div class="card-title">分析进度</div>
+            <div class="card-sub" id="an-progress-detail">—</div>
+          </div>
+          <div class="card-head-actions">
+            <span class="pill brand" id="an-progress-pill">0%</span>
+            <button class="btn btn-sm" id="an-progress-background" data-background-analysis>后台运行</button>
+          </div>
+        </div>
+        <div class="progress"><span id="an-progress-bar" style="width:0%"></span></div>
+        <div class="stepper" id="an-progress-steps"></div>
+      </div>
+      <div class="stats" id="an-stats"></div>
+
+      <div class="grid grid-2" style="margin-bottom:16px">
+        <div class="card">
+          <div class="card-head">
+            <div>
+              <div class="card-title">跨程序契约地图</div>
+              <div class="card-sub">从本次变更指向受影响的其他程序</div>
+            </div>
+          </div>
+          <div class="map" id="an-map"></div>
+          <div class="map-legend">
+            <span class="legend-item"><span class="legend-dot risk-critical"></span>严重</span>
+            <span class="legend-item"><span class="legend-dot risk-high"></span>高</span>
+            <span class="legend-item"><span class="legend-dot risk-medium"></span>中</span>
+            <span class="legend-item"><span class="legend-dot risk-low"></span>低</span>
+            <span class="legend-item"><span class="legend-dot risk-info"></span>信息</span>
+            <span style="margin-left:auto" id="an-map-hint">—</span>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <div>
+              <div class="card-title">其他程序影响明细</div>
+              <div class="card-sub">按其他程序与最大风险排序</div>
+            </div>
+          </div>
+          <div class="list" id="an-modules"></div>
+        </div>
+      </div>
+
+      <div class="card flush" style="margin-bottom:16px">
+        <div class="card-head" style="padding:18px 18px 0;margin-bottom:10px">
+          <div>
+            <div class="card-title">变更清单</div>
+            <div class="card-sub">AST 语义差异，而非文本比较</div>
+          </div>
+          <div class="card-head-actions"><span class="pill neutral" id="an-change-count">0 项</span></div>
+        </div>
+        <div class="table" style="padding:0 8px 10px" id="an-changes"></div>
+      </div>
+
+      <div class="grid grid-2">
+        <div class="card">
+          <div class="card-head">
+            <div>
+              <div class="card-title">跨程序分析边界</div>
+              <div class="card-sub">未命中的契约与静态分析限制</div>
+            </div>
+          </div>
+          <div id="an-blindspots"></div>
+        </div>
+        <div class="card">
+          <div class="card-head">
+            <div>
+              <div class="card-title">结论说明</div>
+              <div class="card-sub">引擎给出的口径与限制</div>
+            </div>
+          </div>
+          <div id="an-notes"></div>
+        </div>
+      </div>
+      </div><!-- /an-body -->
+    </section>
+
+    <!-- ------------------------------------------------------------ triage -->
+    <section class="page hidden" id="page-triage" data-page="triage">
+      <header class="page-head">
+        <div>
+          <div class="breadcrumb"><b>工作区</b><span class="sep">/</span><span>复核队列</span></div>
+          <div class="title-row">
+            <span class="title-badge"><svg><use href="#i-gauge"/></svg></span>
+            <h1 class="page-title">复核队列</h1>
+            <span class="pill warning">本地状态</span>
+          </div>
+          <div class="page-sub">按风险与证据强度排序的其他程序影响，处理结果保存在本地浏览器。</div>
+        </div>
+        <div class="head-right">
+          <div class="head-metric">
+            <div class="label">待复核</div>
+            <div class="value" id="tr-pending">—</div>
+          </div>
+          <div class="head-metric">
+            <div class="label">已确认</div>
+            <div class="value" id="tr-confirmed">—</div>
+          </div>
+          <div class="head-actions">
+            <button class="btn btn-primary" data-nav="review"><svg><use href="#i-shield"/></svg>开始审核</button>
+          </div>
+        </div>
+      </header>
+
+      <div class="card" style="margin-bottom:16px">
+        <div class="card-head">
+          <div>
+            <div class="card-title">复核流程</div>
+            <div class="card-sub">本轮分析的建议处理顺序</div>
+          </div>
+          <div class="card-head-actions"><span class="pill brand" id="tr-stage-pill">—</span></div>
+        </div>
+        <div class="stepper" id="tr-stepper"></div>
+      </div>
+
+      <div class="grid grid-2" style="align-items:start">
+        <div class="card">
+          <div class="card-head">
+            <div>
+              <div class="card-title">高风险待复核</div>
+              <div class="card-sub">先处理高风险与高置信度的交叉项</div>
+            </div>
+            <div class="card-head-actions"><span class="pill danger" id="tr-high-count">0 项</span></div>
+          </div>
+          <div class="list" id="tr-list"></div>
+        </div>
+
+        <div class="stack">
+          <div class="card">
+            <div class="card-head">
+              <div>
+                <div class="card-title">复核建议</div>
+                <div class="card-sub">来自风险与证据分布</div>
+              </div>
+            </div>
+            <div class="stack" style="gap:12px" id="tr-advice"></div>
+          </div>
+          <div class="card">
+            <div class="card-head">
+              <div>
+                <div class="card-title">处理进度</div>
+                <div class="card-sub">本地复核状态，非服务端数据</div>
+              </div>
+            </div>
+            <div id="tr-progress"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ------------------------------------------------------ history / map -->
+    <section class="page hidden" id="page-history" data-page="history">
+      <header class="page-head">
+        <div>
+          <div class="breadcrumb"><b>工作区</b><span class="sep">/</span><span>分析历史</span></div>
+          <div class="title-row"><span class="title-badge"><svg><use href="#i-clock"/></svg></span><h1 class="page-title">分析历史</h1></div>
+          <div class="page-sub">最近 30 条分析记录，点击任意一条打开报告。</div>
+        </div>
+        <div class="head-actions">
+          <button class="btn" id="hi-refresh"><svg><use href="#i-refresh"/></svg>刷新</button>
+        </div>
+      </header>
+      <div class="card flush">
+        <div class="table" style="padding:10px 8px" id="hi-table"></div>
+      </div>
+    </section>
+
+    <section class="page hidden" id="page-map" data-page="map">
+      <header class="page-head">
+        <div>
+          <div class="breadcrumb"><b>工作区</b><span class="sep">/</span><span>模块地图</span></div>
+          <div class="title-row"><span class="title-badge"><svg><use href="#i-network"/></svg></span><h1 class="page-title">跨程序契约地图</h1><span class="pill neutral" id="map-mode-pill">—</span></div>
+          <div class="page-sub">本次变更与受影响的其他程序之间的契约传导关系。</div>
+        </div>
+        <div class="head-actions">
+          <button class="btn" data-nav="analysis"><svg><use href="#i-file"/></svg>分析详情</button>
+        </div>
+      </header>
+      <div class="grid" style="grid-template-columns:minmax(0,1fr) 320px;align-items:start">
+        <div class="card">
+          <div class="map" id="big-map" style="height:600px"></div>
+          <div class="map-legend">
+            <span class="legend-item"><span class="legend-dot risk-critical"></span>严重</span>
+            <span class="legend-item"><span class="legend-dot risk-high"></span>高</span>
+            <span class="legend-item"><span class="legend-dot risk-medium"></span>中</span>
+            <span class="legend-item"><span class="legend-dot risk-low"></span>低</span>
+            <span class="legend-item"><span class="legend-dot risk-info"></span>信息</span>
+            <span style="margin-left:auto">实线=调用/接口/SQL · 虚线=Maven 依赖</span>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-head">
+            <div>
+              <div class="card-title">关系类型</div>
+              <div class="card-sub" id="map-edge-count">—</div>
+            </div>
+          </div>
+          <div class="kv-list" id="map-relations"></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="page hidden" id="page-settings" data-page="settings">
+      <header class="page-head">
+        <div>
+          <div class="breadcrumb"><b>工作区</b><span class="sep">/</span><span>设置</span></div>
+          <div class="title-row"><span class="title-badge"><svg><use href="#i-settings"/></svg></span><h1 class="page-title">工作区设置</h1></div>
+          <div class="page-sub">本机服务状态与界面偏好。设置项保存在浏览器本地。</div>
+        </div>
+      </header>
+      <div class="grid grid-2" style="align-items:start">
+        <div class="card">
+          <div class="card-head">
+            <div>
+              <div class="card-title">服务状态</div>
+              <div class="card-sub">来自 /api/health</div>
+            </div>
+          </div>
+          <div class="kv-list" id="set-health"></div>
+        </div>
+        <div class="card">
+          <div class="card-head">
+            <div>
+              <div class="card-title">界面偏好</div>
+              <div class="card-sub">仅影响当前浏览器</div>
+            </div>
+          </div>
+          <div class="stack" style="gap:14px">
+            <div class="field">
+              <label for="set-theme">外观主题</label>
+              <select id="set-theme">
+                <option value="system">跟随系统</option>
+                <option value="light">浅色</option>
+                <option value="dark">深色</option>
+              </select>
+              <div class="hint">深色主题同样保留紫色品牌色，切换即时生效并记住选择。</div>
+            </div>
+            <div class="field">
+              <label for="set-density">信息密度</label>
+              <select id="set-density">
+                <option value="comfortable">舒适</option>
+                <option value="compact">紧凑</option>
+              </select>
+            </div>
+            <label class="checkbox"><input type="checkbox" id="set-remember" checked/> 记住上次打开的页面</label>
+            <button class="btn btn-sm" id="set-clear" style="align-self:flex-start">清除本地复核状态</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<!-- ============================== modals ============================== -->
+
+<div class="overlay hidden" id="modal-source">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="ms-title">
+    <div class="modal-head">
+      <div class="modal-icon brand"><svg><use href="#i-database"/></svg></div>
+      <div style="min-width:0">
+        <div class="modal-title" id="ms-title">添加代码源</div>
+        <div class="modal-sub">保存后可扫描该代码源的变更对其他程序的影响。</div>
+      </div>
+      <button class="modal-close" data-close="modal-source" aria-label="关闭"><svg><use href="#i-x"/></svg></button>
+    </div>
+    <div class="modal-body">
+      <div class="field-row">
+        <div class="field">
+          <label for="m-type">来源类型</label>
+          <select id="m-type">
+            <option value="LOCAL_DIR">本地目录</option>
+            <option value="LOCAL_GIT">本地 Git 仓库</option>
+            <option value="GITHUB">GitHub 仓库</option>
+            <option value="GITLAB">GitLab 仓库</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="m-name-preview">名称</label>
+          <input id="m-name-preview" readonly placeholder="按位置自动识别"/>
+        </div>
+      </div>
+      <div class="field">
+        <label for="m-location">位置 <span class="req">*</span></label>
+        <div class="path-field">
+          <input id="m-location" placeholder="/path/to/project 或 https://github.com/org/repo.git"/>
+          <button class="btn btn-sm" type="button" data-pick-dir="m-location" title="选择文件夹"><svg><use href="#i-folder"/></svg>浏览…</button>
+        </div>
+        <div class="hint">本地目录直接读取；远程仓库克隆到数据目录。</div>
+      </div>
+      <div class="field-row">
+        <div class="field">
+          <label for="m-ref">默认分支</label>
+          <select id="m-ref" data-ref-select="m">
+            <option value="">（自动检测）</option>
+          </select>
+          <div class="hint" id="m-ref-hint">填写位置后自动读取分支</div>
+        </div>
+        <div class="field">
+          <label for="m-token">凭据环境变量</label>
+          <input id="m-token" placeholder="GITHUB_TOKEN（可留空）"/>
+        </div>
+      </div>
+      <div class="callout" id="m-error" style="display:none">
+        <svg><use href="#i-alert-circle"/></svg><div></div>
+      </div>
+    </div>
+    <div class="modal-foot">
+      <div class="note">位置必填，名称按位置自动识别</div>
+      <div class="actions">
+        <button class="btn" data-close="modal-source">取消</button>
+        <button class="btn btn-primary" id="m-save">保存代码源</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="overlay hidden" id="modal-run">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="mr-title">
+    <div class="modal-head">
+      <div class="modal-icon brand"><svg><use href="#i-play"/></svg></div>
+      <div style="min-width:0">
+        <div class="modal-title" id="mr-title">扫描其他程序影响</div>
+        <div class="modal-sub" id="mr-sub">选择变更范围与被扫描程序</div>
+      </div>
+      <button class="modal-close" data-close="modal-run" aria-label="关闭"><svg><use href="#i-x"/></svg></button>
+    </div>
+    <div class="modal-body">
+      <div class="field">
+        <label for="mr-source">代码源</label>
+        <select id="mr-source"></select>
+      </div>
+      <div class="field">
+        <label for="mr-mode">分析模式</label>
+        <select id="mr-mode">
+          <option value="GIT_DIFF">提交 / 分支对比</option>
+          <option value="WORKTREE_DIFF">本地未提交改动</option>
+          <option value="PULL_REQUEST">PR / MR</option>
+        </select>
+      </div>
+      <div class="field-row">
+        <div class="field" id="mr-base-wrap">
+          <label for="mr-base">基线</label>
+          <input id="mr-base" list="mr-refs" placeholder="留空 = 目标提交的父提交"/>
+        </div>
+        <div class="field">
+          <label for="mr-target">目标</label>
+          <input id="mr-target" list="mr-refs" placeholder="HEAD"/>
+        </div>
+      </div>
+      <datalist id="mr-refs"></datalist>
+      <div class="field hidden" id="mr-pr-wrap">
+        <label for="mr-pr">PR / MR 编号</label>
+        <input id="mr-pr" type="number" min="1" placeholder="42"/>
+      </div>
+      <div class="divider"></div>
+
+      <div class="field">
+        <label>扫描这些其他程序 <span class="req">*</span></label>
+        <div class="hint" style="margin-bottom:6px">
+          至少选择一个其他程序。系统只检查本次变更通过接口、数据表、配置项、Maven 依赖或消息契约
+          对它们造成的影响，不分析本程序内部影响。
+        </div>
+        <div class="peer-picker" id="mr-peers"></div>
+      </div>
+
+      <div class="callout" id="mr-error" style="display:none">
+        <svg><use href="#i-alert-circle"/></svg><div></div>
+      </div>
+    </div>
+    <div class="modal-foot">
+      <div class="note">分析在本机执行，不会上传代码</div>
+      <div class="actions">
+        <button class="btn" data-close="modal-run">取消</button>
+        <button class="btn btn-primary" id="mr-start"><svg><use href="#i-play"/></svg>开始分析</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="overlay hidden" id="modal-delete-source">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="ds-title" style="width:min(520px,100%)">
+    <div class="modal-head">
+      <div class="modal-icon danger"><svg><use href="#i-trash"/></svg></div>
+      <div style="min-width:0">
+        <div class="modal-title" id="ds-title">删除代码源</div>
+        <div class="modal-sub" id="ds-sub">—</div>
+      </div>
+      <button class="modal-close" data-close="modal-delete-source" aria-label="关闭"><svg><use href="#i-x"/></svg></button>
+    </div>
+    <div class="modal-body">
+      <div class="callout danger">
+        <svg><use href="#i-alert"/></svg>
+        <div id="ds-warning">删除后该代码源及其分析记录将从本机移除，无法撤销。代码本身不会被修改。</div>
+      </div>
+      <div class="kv-list" id="ds-detail"></div>
+      <div class="field">
+        <label for="ds-confirm">输入代码源名称以确认</label>
+        <input id="ds-confirm" placeholder="代码源名称" autocomplete="off"/>
+      </div>
+      <div class="callout danger" id="ds-error" style="display:none">
+        <svg><use href="#i-alert-circle"/></svg><div></div>
+      </div>
+    </div>
+    <div class="modal-foot">
+      <div class="note">此操作不可撤销</div>
+      <div class="actions">
+        <button class="btn" data-close="modal-delete-source">取消</button>
+        <button class="btn btn-danger" id="ds-save" disabled>删除</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="overlay hidden" id="modal-decision">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="md-title" style="width:min(520px,100%)">
+    <div class="modal-head">
+      <div class="modal-icon" id="md-icon"><svg><use href="#i-check"/></svg></div>
+      <div style="min-width:0">
+        <div class="modal-title" id="md-title">确认影响</div>
+        <div class="modal-sub" id="md-sub">—</div>
+      </div>
+      <button class="modal-close" data-close="modal-decision" aria-label="关闭"><svg><use href="#i-x"/></svg></button>
+    </div>
+    <div class="modal-body">
+      <div class="field">
+        <label for="md-note">备注（可选）</label>
+        <input id="md-note" placeholder="例如：已与 order 团队确认，将在下个迭代补测试"/>
+      </div>
+      <div class="field">
+        <label for="md-owner">处理人</label>
+        <select id="md-owner">
+          <option>我（本地）</option>
+          <option>后端负责人</option>
+          <option>测试负责人</option>
+        </select>
+      </div>
+      <div class="callout brand">
+        <svg><use href="#i-info"/></svg>
+        <div>该操作只更新浏览器本地复核状态，不会写入服务端分析结果。</div>
+      </div>
+    </div>
+    <div class="modal-foot">
+      <div class="note" id="md-target"></div>
+      <div class="actions">
+        <button class="btn" data-close="modal-decision">取消</button>
+        <button class="btn btn-primary" id="md-save">确认</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="overlay drawer-overlay hidden" id="drawer">
+  <div class="drawer" role="dialog" aria-modal="true" aria-labelledby="drawer-title">
+    <div class="drawer-head">
+      <div style="min-width:0">
+        <div class="eyebrow" id="drawer-eyebrow">详情</div>
+        <div class="modal-title" id="drawer-title" style="font-size:17px">—</div>
+      </div>
+      <button class="modal-close" data-close="drawer" aria-label="关闭" style="margin-left:auto"><svg><use href="#i-x"/></svg></button>
+    </div>
+    <div class="drawer-body" id="drawer-body"></div>
+  </div>
+</div>
+
+<div class="overlay hidden" id="modal-picker">
+  <div class="modal picker" role="dialog" aria-modal="true" aria-labelledby="pk-title">
+    <div class="modal-head">
+      <div class="modal-icon brand"><svg><use href="#i-folder"/></svg></div>
+      <div style="min-width:0">
+        <div class="modal-title" id="pk-title">选择文件夹</div>
+        <div class="modal-sub" id="pk-sub">选择一个包含代码的目录</div>
+      </div>
+      <button class="modal-close" data-close="modal-picker" aria-label="关闭"><svg><use href="#i-x"/></svg></button>
+    </div>
+    <div class="modal-body" style="gap:10px">
+      <div class="picker-bar">
+        <button class="icon-btn" id="pk-up" title="上一级"><svg><use href="#i-arrow-up"/></svg></button>
+        <input id="pk-path" class="mono" placeholder="/path/to/folder" aria-label="当前路径"/>
+        <button class="btn btn-sm" id="pk-go">前往</button>
+      </div>
+      <div class="picker-roots" id="pk-roots"></div>
+      <div class="picker-list" id="pk-list" role="listbox" aria-label="文件夹列表"></div>
+      <label class="checkbox"><input type="checkbox" id="pk-hidden"/> 显示隐藏文件夹（.git 等）</label>
+      <div class="callout danger" id="pk-error" style="display:none">
+        <svg><use href="#i-alert-circle"/></svg><div></div>
+      </div>
+    </div>
+    <div class="modal-foot">
+      <div class="note" id="pk-selected">未选择</div>
+      <div class="actions">
+        <button class="btn" data-close="modal-picker">取消</button>
+        <button class="btn btn-primary" id="pk-choose">选择当前文件夹</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="toast-root" id="toasts"></div>
+
+<script src="/vendor/cytoscape.min.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>

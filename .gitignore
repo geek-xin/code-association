@@ -1,0 +1,13 @@
+# Build output
+target/
+build/
+
+# Runtime data / logs / pid
+.code-association/
+.code-association.pid
+*.log
+
+# OS / IDE
+.DS_Store
+.idea/
+*.iml

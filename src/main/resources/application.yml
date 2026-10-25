@@ -1,0 +1,35 @@
+server:
+  port: 9996
+  compression:
+    enabled: true
+
+spring:
+  application:
+    name: code-association
+  jackson:
+    default-property-inclusion: non_null
+  web:
+    resources:
+      cache:
+        # The jar is built reproducibly, so every entry carries the same 1980 timestamp and
+        # Last-Modified never changes. Revalidation against it would always answer 304 and the
+        # browser would keep stale CSS/JS after a rebuild, so do not use it as a validator.
+        use-last-modified: false
+        cachecontrol:
+          no-cache: true
+
+code-association:
+  data-dir: ./.code-association
+  max-files: 20000
+  max-depth: 8
+  ai:
+    enabled: false
+    base-url: ""
+    api-key: ""
+    model: ""
+
+logging:
+  level:
+    root: INFO
+    com.geek.association: INFO
+    org.eclipse.jgit: WARN

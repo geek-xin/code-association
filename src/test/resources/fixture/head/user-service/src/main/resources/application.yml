@@ -1,0 +1,5 @@
+user:
+  validation:
+    enabled: false
+  cache:
+    ttl: 60

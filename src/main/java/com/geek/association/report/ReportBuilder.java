@@ -1,0 +1,378 @@
+package com.geek.association.report;
+
+import com.geek.association.model.ChangeRecord;
+import com.geek.association.model.CodeIndex;
+import com.geek.association.model.Edge;
+import com.geek.association.model.ImpactResult;
+import com.geek.association.model.ModuleInfo;
+import com.geek.association.model.Sym;
+import com.geek.association.source.RevisionPair;
+
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
+/** Assembles the flat analysis results into the report shape the UI renders. */
+public class ReportBuilder {
+
+    public ImpactReport build(RevisionPair revisions, CodeIndex headIndex, CodeIndex baseIndex,
+                              List<ChangeRecord> changes, List<ImpactResult> impacts,
+                              Map<String, String> diffs) {
+        return build(revisions, headIndex, baseIndex, changes, impacts, diffs, List.of());
+    }
+
+    /**
+     * Builds one report.
+     *
+     * When peers are supplied, the summary and module sections describe only the impact on those
+     * other programs. Local {@code impacts} never contribute to counts, risk levels or the module
+     * map when any peer result is present.
+     */
+    public ImpactReport build(RevisionPair revisions, CodeIndex headIndex, CodeIndex baseIndex,
+                              List<ChangeRecord> changes, List<ImpactResult> impacts,
+                              Map<String, String> diffs,
+                              List<com.geek.association.model.PeerImpact> peers) {
+        ImpactReport report = new ImpactReport();
+        report.sourceName = revisions.note;
+        report.mode = revisions.mode;
+        report.pullRequest = revisions.pullRequest;
+        report.baseRef = revisions.baseRef;
+        report.targetRef = revisions.headRef;
+        report.baseCommit = revisions.baseCommit;
+        report.headCommit = revisions.headCommit;
+        report.baseLabel = revisions.base == null ? "" : revisions.base.label();
+        report.headLabel = revisions.head == null ? "" : revisions.head.label();
+        report.generatedAt = java.time.Instant.now().toString();
+        report.diffs = diffs;
+        report.summary.parsedFiles = headIndex.parsedFiles;
+        report.summary.indexMillis = headIndex.buildMillis;
+        report.summary.unresolvedCalls = headIndex.unresolved.size();
+
+        Set<String> changedModules = new LinkedHashSet<>();
+        Map<String, ImpactReport.ChangedModule> moduleMap = new LinkedHashMap<>();
+        for (ChangeRecord change : changes) {
+            String module = change.modulePath == null ? "" : change.modulePath;
+            changedModules.add(module);
+            ImpactReport.ChangedModule cm = moduleMap.computeIfAbsent(module, k -> {
+                ImpactReport.ChangedModule m = new ImpactReport.ChangedModule();
+                m.module = k.isBlank() ? "(root)" : k;
+                ModuleInfo info = headIndex.modules.get(k);
+                m.artifactId = info == null ? "" : info.artifactId;
+                return m;
+            });
+            cm.changedSymbols++;
+            if (change.filePath != null && !cm.files.contains(change.filePath)) {
+                cm.files.add(change.filePath);
+            }
+            if ("API_CONTRACT_CHANGED".equals(change.changeType) || "API_REMOVED".equals(change.changeType)
+                    || "API_ADDED".equals(change.changeType)) {
+                report.summary.apiChanges++;
+            }
+            if (change.changeType.startsWith("SQL_") || change.changeType.startsWith("DDL_")) {
+                report.summary.sqlChanges++;
+            }
+            if (change.changeType.startsWith("CONFIG_")) {
+                report.summary.configChanges++;
+            }
+            if (change.changeType.startsWith("TOPIC_") || change.changeType.startsWith("MESSAGE_")) {
+                report.summary.messageChanges++;
+            }
+            if ("BUILD_CHANGED".equals(change.changeType)) {
+                report.summary.buildChanges++;
+            }
+        }
+        report.summary.changedSymbols = changes.size();
+        report.summary.changedModules = changedModules.size();
+        report.changedModules = new ArrayList<>(moduleMap.values());
+        report.changedModules.sort(Comparator.comparing(m -> m.module));
+
+        report.changes = changes.stream().map(this::toView).toList();
+
+        boolean peerScoped = !peers.isEmpty();
+        List<ImpactResult> peerImpacts = new ArrayList<>();
+        for (com.geek.association.model.PeerImpact peer : peers) {
+            if (peer.note != null) {
+                report.summary.unavailablePrograms++;
+            }
+            report.summary.matchedContracts += peer.matches.size();
+            peerImpacts.addAll(peer.impacts);
+        }
+        report.summary.comparedPrograms = peers.size();
+        List<ImpactResult> scoped = peerScoped ? peerImpacts : impacts;
+
+        Map<String, List<ImpactResult>> byModule = new LinkedHashMap<>();
+        Map<String, String> peerByModule = new LinkedHashMap<>();
+        Map<String, String> moduleByKey = new LinkedHashMap<>();
+        for (ImpactResult impact : scoped) {
+            String peerName = impact.peerSourceName;
+            String moduleName = peerScoped
+                    ? (impact.peerModule == null ? "(root)" : impact.peerModule)
+                    : impact.targetModule;
+            String moduleKey = peerScoped
+                    ? (peerName == null ? "其他程序" : peerName) + " / " + moduleName
+                    : moduleName;
+            byModule.computeIfAbsent(moduleKey, k -> new ArrayList<>()).add(impact);
+            if (peerName != null) {
+                peerByModule.put(moduleKey, peerName);
+                moduleByKey.put(moduleKey, moduleName);
+            }
+            switch (impact.riskLevel) {
+                case "CRITICAL", "HIGH" -> report.summary.highRisk++;
+                case "MEDIUM" -> report.summary.mediumRisk++;
+                default -> report.summary.lowRisk++;
+            }
+        }
+        report.summary.impactedSymbols = scoped.size();
+        report.summary.impactedModules = byModule.keySet().size();
+
+        Set<Long> changesWithImpact = new LinkedHashSet<>();
+        for (ImpactResult impact : scoped) {
+            changesWithImpact.add(impact.changeRecordId);
+        }
+        if (!peerScoped) {
+            for (ChangeRecord change : changes) {
+                if (!changesWithImpact.contains(change.id)) {
+                    report.summary.changedSymbolsWithoutCallers++;
+                }
+            }
+        }
+
+        for (Map.Entry<String, List<ImpactResult>> e : byModule.entrySet()) {
+            ImpactReport.ModuleImpact mi = new ImpactReport.ModuleImpact();
+            mi.peerSourceName = peerByModule.get(e.getKey());
+            if (mi.peerSourceName != null) {
+                mi.program = mi.peerSourceName;
+                mi.module = moduleByKey.getOrDefault(e.getKey(), e.getKey());
+                mi.artifactId = "";
+                mi.changed = false;
+            } else {
+                mi.program = e.getKey();
+                mi.module = e.getKey();
+                ModuleInfo info = headIndex.modules.get(e.getKey());
+                mi.artifactId = info == null ? "" : info.artifactId;
+                mi.changed = changedModules.contains(e.getKey());
+            }
+            mi.impactedSymbols = e.getValue().size();
+            mi.maxRisk = (int) Math.round(e.getValue().stream().mapToDouble(i -> i.riskScore).max().orElse(0));
+            mi.riskLevel = com.geek.association.impact.RiskScorer.level(mi.maxRisk);
+            mi.maxDepth = e.getValue().stream().mapToInt(i -> i.depth).max().orElse(1);
+            mi.highRisk = (int) e.getValue().stream().filter(i -> i.riskScore >= 60).count();
+            Set<String> types = new LinkedHashSet<>();
+            Set<String> reasons = new LinkedHashSet<>();
+            for (ImpactResult i : e.getValue()) {
+                types.add(i.impactType);
+                if (reasons.size() < 4) {
+                    reasons.add(i.reason);
+                }
+            }
+            mi.impactTypes = new ArrayList<>(types);
+            mi.reasons = new ArrayList<>(reasons);
+            report.moduleImpacts.add(mi);
+        }
+        report.moduleImpacts.sort(Comparator.comparingInt((ImpactReport.ModuleImpact m) -> -m.maxRisk));
+
+        Map<Long, ChangeRecord> byId = new LinkedHashMap<>();
+        for (ChangeRecord c : changes) {
+            byId.put(c.id, c);
+        }
+        for (ImpactResult impact : scoped) {
+            report.impacts.add(toView(impact, byId.get(impact.changeRecordId)));
+        }
+
+        if (!peerScoped) {
+        for (String[] dep : headIndex.moduleDependencies) {
+            ImpactReport.ModuleEdge me = new ImpactReport.ModuleEdge();
+            me.from = dep[0].isBlank() ? "(root)" : dep[0];
+            me.to = dep[1].isBlank() ? "(root)" : dep[1];
+            me.type = "DEPENDS_ON";
+            me.detail = "pom.xml dependency on " + dep[2];
+            report.moduleGraph.add(me);
+        }
+        for (Edge e : headIndex.outgoing.values().stream().flatMap(List::stream).toList()) {
+            if (!"CALLS_API".equals(e.relation) && !"CALLS".equals(e.relation) && !"EXECUTES_SQL".equals(e.relation)
+                    && !"USES_CONFIG".equals(e.relation) && !"READS_TABLE".equals(e.relation)
+                    && !"WRITES_TABLE".equals(e.relation) && !"REFERENCES_TYPE".equals(e.relation)
+                    && !"IMPLEMENTS".equals(e.relation) && !"EXTENDS".equals(e.relation)
+                    && !"DEPENDS_ON".equals(e.relation) && !"PUBLISHES_TO".equals(e.relation)
+                    && !"SUBSCRIBES_TO".equals(e.relation) && !"USES_MESSAGE_SCHEMA".equals(e.relation)
+                    && !"ROUTES_TO".equals(e.relation)) {
+                continue;
+            }
+            Sym from = headIndex.symbol(e.from);
+            Sym to = headIndex.symbol(e.to);
+            if (from == null || to == null) {
+                continue;
+            }
+            String fromModule = from.modulePath == null ? "" : from.modulePath;
+            String toModule = to.modulePath == null ? "" : to.modulePath;
+            if (fromModule.equals(toModule) && !"CALLS_API".equals(e.relation)
+                    && !"PUBLISHES_TO".equals(e.relation) && !"SUBSCRIBES_TO".equals(e.relation)) {
+                continue;
+            }
+            ImpactReport.ModuleEdge me = new ImpactReport.ModuleEdge();
+            me.from = fromModule.isBlank() ? "(root)" : fromModule;
+            me.to = toModule.isBlank() ? "(root)" : toModule;
+            me.type = e.relation;
+            me.detail = from.display() + " -> " + to.display();
+            report.moduleGraph.add(me);
+        }
+        } else {
+            Set<String> seenEdges = new LinkedHashSet<>();
+            for (com.geek.association.model.PeerImpact peer : peers) {
+                for (ImpactResult impact : peer.impacts) {
+                    String key = peer.peerSourceName + "|" + impact.targetQualifiedName;
+                    if (!seenEdges.add(key)) {
+                        continue;
+                    }
+                    ImpactReport.ModuleEdge me = new ImpactReport.ModuleEdge();
+                    me.from = report.sourceName;
+                    me.to = peer.peerSourceName;
+                    me.type = "CROSS_PROGRAM";
+                    me.detail = impact.targetQualifiedName + " in "
+                            + (impact.peerModule == null ? impact.targetModule : impact.peerModule);
+                    report.moduleGraph.add(me);
+                }
+            }
+        }
+        if (!peerScoped) {
+            report.blindSpots = blindSpots(headIndex);
+            notes(report, headIndex, baseIndex);
+        } else {
+            report.blindSpots = new ArrayList<>();
+            peerNotes(report, headIndex, peers);
+        }
+        return report;
+    }
+
+    private void notes(ImpactReport report, CodeIndex head, CodeIndex base) {
+        Set<String> seen = new LinkedHashSet<>();
+        if (base.types.isEmpty() && !head.types.isEmpty()) {
+            ImpactReport.addNote(report.notes, seen,
+                    "基线快照为空（首次提交或没有父提交），所有符号都会被计为新增，"
+                            + "因此影响清单描述的是初始状态，而不是本次增量。");
+        }
+        if (!head.unresolved.isEmpty()) {
+            ImpactReport.addNote(report.notes, seen,
+                    "静态分析无法解析 " + head.unresolved.size()
+                            + " 个调用点，这些调用之后的影响未纳入报告，请查看分析盲区。");
+        }
+        if (report.summary.changedSymbolsWithoutCallers > 0) {
+            ImpactReport.addNote(report.notes, seen,
+                    report.summary.changedSymbolsWithoutCallers + " 个变化符号在仓库内没有可静态解析的调用方，"
+                            + "通常是 Controller、Listener、定时任务等由 Spring 或容器调用的入口。"
+                            + "它们会出现在变更清单中，但无法生成影响传播路径。");
+        }
+        if (head.types.isEmpty()) {
+            ImpactReport.addNote(report.notes, seen, "没有索引到 Java 源码，请确认代码源根目录是否正确。");
+        }
+        long crossModule = report.moduleGraph.stream()
+                .filter(e -> !e.from.equals(e.to)).count();
+        ImpactReport.addNote(report.notes, seen,
+                "发现 " + crossModule + " 条跨模块关系（调用、类型、接口、SQL、配置和消息），"
+                        + "影响传播在合并后的知识图谱上执行。");
+        ImpactReport.addNote(report.notes, seen,
+                "反射、运行时代理、生成代码、动态 SQL 以及配置中心下发的配置超出静态分析范围；"
+                        + "低置信度条目应作为待确认候选，而不是已证实结论。");
+        if (!base.types.isEmpty() || !head.types.isEmpty()) {
+            ImpactReport.addNote(report.notes, seen,
+                    "风险与置信度相互独立：风险衡量后果严重程度，置信度衡量证据强度。");
+        }
+    }
+
+    private void peerNotes(ImpactReport report, CodeIndex ownHead,
+                           List<com.geek.association.model.PeerImpact> peers) {
+        Set<String> seen = new LinkedHashSet<>();
+        ImpactReport.addNote(report.notes, seen,
+                "本报告只统计对其他程序的影响；本程序内部的调用方、模块和测试覆盖不作为影响项。");
+        if (report.summary.unavailablePrograms > 0) {
+            ImpactReport.addNote(report.notes, seen,
+                    report.summary.unavailablePrograms + " 个对比程序无法读取，已在对应条目中说明原因。");
+        }
+        if (!ownHead.unresolved.isEmpty()) {
+            ImpactReport.addNote(report.notes, seen,
+                    "本程序有 " + ownHead.unresolved.size() + " 个调用点无法静态解析；"
+                            + "它们只影响本程序内部传播，不影响本次跨程序契约匹配。");
+        }
+        ImpactReport.addNote(report.notes, seen,
+                "跨程序结论来自共享契约（HTTP、数据库、配置、Maven 依赖和消息）；"
+                        + "未命中的契约不视为没有影响，请结合接口文档与运行时调用确认。");
+    }
+
+    private List<ImpactReport.BlindSpot> blindSpots(CodeIndex index) {
+        List<ImpactReport.BlindSpot> out = new ArrayList<>();
+        Map<String, Integer> perModule = new LinkedHashMap<>();
+        for (CodeIndex.UnresolvedCall u : index.unresolved) {
+            int count = perModule.merge(u.modulePath == null ? "" : u.modulePath, 1, Integer::sum);
+            if (count > 30) {
+                continue;
+            }
+            ImpactReport.BlindSpot b = new ImpactReport.BlindSpot();
+            b.module = u.modulePath == null || u.modulePath.isBlank() ? "(root)" : u.modulePath;
+            b.file = u.filePath;
+            b.line = u.line;
+            b.expression = u.expression;
+            b.reason = u.reason;
+            out.add(b);
+            if (out.size() >= 200) {
+                break;
+            }
+        }
+        return out;
+    }
+
+    private ImpactReport.ChangeView toView(ChangeRecord c) {
+        ImpactReport.ChangeView v = new ImpactReport.ChangeView();
+        v.id = c.id;
+        v.changeType = c.changeType;
+        v.symbolType = c.symbolType;
+        v.module = c.modulePath == null || c.modulePath.isBlank() ? "(root)" : c.modulePath;
+        v.qualifiedName = c.qualifiedName;
+        v.signature = c.signature;
+        v.file = c.filePath;
+        v.startLine = c.startLine;
+        v.endLine = c.endLine;
+        v.oldValue = c.oldValue;
+        v.newValue = c.newValue;
+        v.summary = c.semanticSummary;
+        v.riskSeed = c.riskSeed;
+        v.tags = c.tags;
+        v.extra = c.extra;
+        return v;
+    }
+
+    private ImpactReport.ImpactView toView(ImpactResult i, ChangeRecord change) {
+        ImpactReport.ImpactView v = new ImpactReport.ImpactView();
+        v.id = i.id;
+        v.changeId = i.changeRecordId;
+        v.peerSourceId = i.peerSourceId;
+        v.peerSourceName = i.peerSourceName;
+        v.peerModule = i.peerModule;
+        v.changeType = change == null ? "" : change.changeType;
+        v.changedSymbol = change == null ? "" : change.qualifiedName + (change.signature == null ? "" : change.signature);
+        v.changedModule = change == null || change.modulePath == null ? "" : change.modulePath;
+        v.changedFile = change == null ? "" : change.filePath;
+        v.changedLine = change == null ? 0 : change.startLine;
+        v.targetModule = i.targetModule;
+        v.targetSymbol = i.targetQualifiedName;
+        v.targetSignature = i.targetSignature;
+        v.targetFile = i.targetFile;
+        v.targetLine = i.targetLine;
+        v.impactType = i.impactType;
+        v.riskLevel = i.riskLevel;
+        v.riskScore = i.riskScore;
+        v.confidence = i.confidence;
+        v.confidenceScore = i.confidenceScore;
+        v.depth = i.depth;
+        v.reason = i.reason;
+        v.path = i.path;
+        v.evidence = i.evidence;
+        v.suggestedTests = i.suggestedTests;
+        v.verificationStatus = i.verificationStatus;
+        v.riskFactors = i.riskFactors;
+        return v;
+    }
+}

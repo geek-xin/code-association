@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mapper namespace="com.example.user.UserMapper">
+  <select id="selectById" resultType="com.example.user.User">
+    SELECT id, name FROM t_user WHERE id = #{id}
+  </select>
+  <update id="updateStatus">
+    UPDATE t_user SET status = #{status} WHERE id = #{id}
+  </update>
+</mapper>
