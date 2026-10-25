@@ -1,9 +1,15 @@
 # code-association · 其他程序变更影响扫描
 
+[![Java](https://img.shields.io/badge/Java-21-orange.svg)](https://openjdk.org/projects/jdk/21/)
+[![Spring Boot](https://img.shields.io/badge/Spring%20Boot-3.5-brightgreen.svg)](https://spring.io/projects/spring-boot)
+[![Build](https://img.shields.io/badge/build-Maven-c71a36.svg)](pom.xml)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/geek-xin/code-association)](https://github.com/geek-xin/code-association/releases)
+
 给定一次代码变更（本地未提交改动 / 两次提交 / 分支 / PR·MR），分析它对**其他程序模块**的影响，
 并给出：影响路径、影响原因、代码位置、影响类型、风险等级、分析置信度、建议验证的测试。
 
-> 扫描范围只有“其他程序”。本程序内部的调用方、模块、测试覆盖和传播链不会进入影响结果。
+> **扫描范围只有“其他程序”。** 本程序内部的调用方、模块、测试覆盖和传播链不会进入影响结果。
 > 因此每次分析至少需要选择一个被扫描的其他程序。
 
 支持的程序来源：本地目录、本地 Git 仓库、GitHub、GitLab、任意 Git 远程仓库。
@@ -15,9 +21,23 @@
 
 > 一次真实运行的界面：`user-service` 的 `isActive` 判定条件被改动，报告指出 `order-service`、
 > `payment-service` 受影响，并给出每条的路径、原因、风险与置信度。
->
-> 界面采用两级导航（图标栏 + 文字导航）与任务优先的不等宽卡片布局，
-> 包含总览、代码源导入、影响审核、影响详情、复核队列、模块地图六个工作区。
+
+---
+
+## 目录
+
+- [1. 它到底做了什么](#1-它到底做了什么)
+- [2. 快速开始](#2-快速开始)
+- [3. 命令行 / CI 集成](#3-命令行--ci-集成)
+- [4. 分析引擎是怎么工作的](#4-分析引擎是怎么工作的)
+- [5. 界面](#5-界面)
+- [6. 数据与存储](#6-数据与存储)
+- [7. 已知边界](#7-已知边界)
+- [8. 项目结构](#8-项目结构)
+- [9. AI 辅助解读（可选，默认关闭）](#9-ai-辅助解读可选默认关闭)
+- [10. 验收测试](#10-验收测试)
+- [11. 贡献与反馈](#11-贡献与反馈)
+- [12. 许可证](#12-许可证)
 
 ---
 
@@ -493,7 +513,11 @@ src/main/java/com/geek/association/
 
 src/main/resources/static/   零依赖前端（原生 JS + Cytoscape 本地内置）
 src/test/resources/fixture/  四模块 Java 示例项目（base/ 与 head/ 两个版本）
-src/test/java/               ImpactAnalysisTest（端到端验收）· RulesTest（评分与归一化规则）
+src/test/java/               62 个用例，按关注点分组（见第 10 节）
+
+docs/wiki/                   深度文档：核心概念 · 契约匹配 · 评分模型 · 架构 · 排错
+.github/                     Issue 模板与 PR 模板
+release.sh                   打包并发布 tar.gz / zip 到 GitHub Release
 ```
 
 ---
@@ -521,9 +545,20 @@ code-association:
 
 ```bash
 mvn test
-# Tests run: 1  ImpactAnalysisTest
-# Tests run: 6  RulesTest
+# 62 tests, 0 failures
 ```
+
+用例按关注点分组，每条规则都有对应断言：
+
+| 测试 | 覆盖内容 |
+|---|---|
+| `ImpactAnalysisTest` | 端到端：四模块工程的条件变更、SQL 变化、配置翻转、接口契约变化 |
+| `PeerImpactTest` | 跨程序契约匹配：HTTP / 数据库表 / 配置项，以及无关程序不误报 |
+| `ScheduledScanTest` | 定时扫描的判定：首次扫描、无新提交跳过、位置丢失跳过、孤儿任务恢复 |
+| `MessagingAnalysisTest` | Kafka / RabbitMQ / RocketMQ 主题、路由与消息 Schema 契约 |
+| `RulesTest` | 风险与置信度分离、评分归一化、用法权重 |
+| `ApiPathMatchTest` | 路径模板匹配：具体路径、拼接写法、不相关路径不误判 |
+| `PathBrowserTest` / `RefDiscoveryTest` / `SourceNamesTest` / `AnalysisProgressTest` | 目录选择、分支读取、自动命名、进度持久化 |
 
 `ImpactAnalysisTest` 用一个真实结构的多模块工程验证端到端行为：
 
@@ -533,3 +568,23 @@ mvn test
 断言：条件变更被识别为 `METHOD_CONDITION_CHANGED`；`order-service` 的 `createOrder`（分支消费）
 被判为 HIGH 且高于 `auditOrder`（仅日志消费）；`payment-service.validateUser` 被间接命中；
 控制器作为 2 层以上间接影响出现；接口契约变更产生 `API_CONTRACT` 影响；报告含模块依赖边。
+
+## 11. 贡献与反馈
+
+- **问题与建议**：[Issues](https://github.com/geek-xin/code-association/issues)
+- **变更记录**：[Releases](https://github.com/geek-xin/code-association/releases)
+- **深度文档**：[docs/wiki](docs/wiki/Home.md)（wiki 版见 [Wiki](https://github.com/geek-xin/code-association/wiki)，需先在网页端创建首页）
+
+提交代码前请确认：
+
+```bash
+mvn test          # 全部用例必须通过
+mvn -q -DskipTests package
+```
+
+新增分析能力时，请同时补一个用例：引擎的每一条传播规则都应当有可复现的断言，
+否则"这次改动为什么不影响对方"无法被验证。
+
+## 12. 许可证
+
+[MIT](LICENSE) © geek-xin
