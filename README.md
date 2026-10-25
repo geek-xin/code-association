@@ -573,7 +573,7 @@ mvn test
 
 - **问题与建议**：[Issues](https://github.com/geek-xin/code-association/issues)
 - **变更记录**：[Releases](https://github.com/geek-xin/code-association/releases)
-- **深度文档**：[docs/wiki](docs/wiki/Home.md)（wiki 版见 [Wiki](https://github.com/geek-xin/code-association/wiki)，需先在网页端创建首页）
+- **深度文档**：[docs/wiki](docs/wiki/Home.md) · 同步到 [Wiki](https://github.com/geek-xin/code-association/wiki) 用 `./scripts/sync-wiki.sh`
 
 提交代码前请确认：
 
