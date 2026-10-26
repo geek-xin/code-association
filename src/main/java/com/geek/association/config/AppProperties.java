@@ -167,6 +167,20 @@ public class AppProperties {
          * half-finished build must not be presented as "the latest version".
          */
         private boolean includePrerelease = false;
+        /**
+         * Whether bare git tags are read in addition to releases.
+         *
+         * A release is a tag plus notes and assets, and a maintainer sometimes pushes the tag and
+         * only later writes the release (or never does). Reading tags too is what makes the history
+         * list complete instead of hiding every version that was not turned into a release.
+         */
+        private boolean includeTags = true;
+        /**
+         * Download a newly found jar without being asked. Off by default: the download is large and
+         * the decision to interrupt a service stays with the operator. Applying is never automatic,
+         * whatever this is set to.
+         */
+        private boolean autoDownload = false;
 
         public boolean isEnabled() {
             return enabled;
@@ -222,6 +236,22 @@ public class AppProperties {
 
         public void setIncludePrerelease(boolean includePrerelease) {
             this.includePrerelease = includePrerelease;
+        }
+
+        public boolean isIncludeTags() {
+            return includeTags;
+        }
+
+        public void setIncludeTags(boolean includeTags) {
+            this.includeTags = includeTags;
+        }
+
+        public boolean isAutoDownload() {
+            return autoDownload;
+        }
+
+        public void setAutoDownload(boolean autoDownload) {
+            this.autoDownload = autoDownload;
         }
     }
 

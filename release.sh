@@ -40,7 +40,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 APP="code-association"
-VERSION="${1:-${VERSION:-0.4.0}}"
+VERSION="${1:-${VERSION:-0.4.1}}"
 TAG="v${VERSION}"
 RELEASE_ROOT="build/release"
 STAGE="${RELEASE_ROOT}/${APP}-${VERSION}"
@@ -353,63 +353,66 @@ echo "    OK  包内 Windows 脚本编码正确（ps1 带 BOM、bat 纯 ASCII、
 cat > "$NOTES" <<'NOTES_TEMPLATE'
 ## @@APP@@ @@VERSION@@
 
-跨程序变更影响扫描工具（Java / Maven 多模块仓库）：分析一次提交改动了哪些类、方法、SQL、MQ 消息结构，
-并推导出对其他模块 / 服务的连带影响与风险等级。
+跨程序变更影响扫描工具（Java / Maven 多模块仓库）：分析一次提交改动了哪些类、方法、
+SQL、MQ 消息结构，并推导出对其他模块 / 服务的连带影响与风险等级。
 
-### 本次重点：启动脚本适配 Windows 与 Linux
+### 本次重点：版本检查与自动更新
 
-此前只有一套 macOS 风格的 `start.sh` / `stop.sh`，Linux 与 Windows 用户都要自己想办法。
-0.3.0 把启动/停止能力补齐到三个平台，**jar 本身完全不变，只换了外壳脚本**。
+设置页新增「版本与更新」卡片：当前版本、最新版本、**历史版本列表**一目了然。
+服务会定时向 GitHub 查询 release，不用再手动去发布页翻。
 
-#### Linux / macOS：同一套 `start.sh` / `stop.sh`
+| 入口 | 作用 |
+| --- | --- |
+| `GET /api/update` | 当前 / 最新 / 历史版本（带缓存，命中不耗 GitHub 额度） |
+| `POST /api/update/check` | 强制重新检查 |
+| `POST /api/update/download` | 下载指定版本的 jar 到 `{data-dir}/updates/`，边下边算 SHA-256 |
+| `POST /api/update/apply` | 先备份当前 jar 为 `<jar>.bak-<版本>`，再替换 |
+| `POST /api/update/rollback` | 从最近的备份回滚 |
 
-原来 macOS 专用的问题有两个：靠 `python3` 做 `setsid` + 双 fork 脱离终端，
-以及靠 `lsof` 反查监听 PID。现在改成逐项探测、按可用性降级：
+**检查是自动的，替换 jar 需要你点确认。** 让程序重启自己会让前端拿不到响应，
+也把「什么时候中断服务」的决定权从运维手里拿走了。替换后界面会提示执行
+`./stop.sh && ./start.sh`（Windows 用 `stop.bat` 再 `start.bat`）。
 
-| 能力 | Linux | macOS | 都没有时 |
-| --- | --- | --- | --- |
-| 脱离终端 | `setsid` | `python3` 双 fork | `nohup` 后台 + 明确提示 |
-| 健康检查 | `curl` | `curl` | bash `/dev/tcp` 探测 |
-| 找监听 PID | `lsof` / `ss` / `netstat -tlnp` | `lsof` | 记录的 `$!` 或命令行匹配 |
-| 停止兜底 | pid 文件 → 端口 → 命令行 | 同左 | 同左 |
+三种情况会明确拒绝替换并说明原因：在 IDE 里跑（没有可替换的 jar）、Windows
+（运行中的 jar 被系统锁定）、还没下载（无暂存文件）。
 
-同时去掉了对 `seq` 的依赖（改用 bash 算术循环），保留 bash 3.2 兼容（macOS 自带的就是 3.2）。
-原有语义不变：已在运行则拒绝启动、启动失败打印日志尾部并非 0 退出、
-停止要等端口真正释放才返回（避免紧接着启动撞端口）。
+### 关于 GitHub 限流
 
-#### Windows：新增 `start.bat` / `stop.bat` / `start.ps1` / `stop.ps1`
+未认证调用 `api.github.com` 每小时只有 60 次。默认 6 小时检查一次，够用；
+频繁点「立即检查」会撞 403，此时界面会明确说明是限流并给出额度重置时间。
+配置 `GITHUB_TOKEN`（只读 classic token，无需任何 scope）可提到 5000 次/小时。
 
-- 双击或用命令行执行 `start.bat` 即可，`.bat` 只是薄封装，
-  自动带 `-ExecutionPolicy Bypass` 调用 `.ps1`，**不需要改系统执行策略**。
-- 以隐藏窗口在后台启动 java：`Start-Process` 拉起一个 `cmd /c` 外壳，由 cmd 的重定向把
-  `code-association.log` / `code-association.err.log` 的文件句柄直接交给 java。
-  这样脚本退出后日志照常写入（`Start-Process -RedirectStandardOutput` 在 5.1 上是管道实现，
-  读端在脚本手里，脚本一退日志就冻结，所以没有采用）。
-  启动完成后按端口反查真实 java 进程 PID 写入 `.code-association.pid`。
-- 停止：pid 文件 → `Get-NetTCPConnection` 按端口反查 → 命令行匹配 `code-association.jar` 兜底，
-  先优雅停止再强制，最后等端口释放。
-- 参数契约与 POSIX 版对齐：`start.bat 8080` / `-Port 8080` / 环境变量 `PORT`、`DATA_DIR`、`LOG_FILE`。
-- 编码按 Windows 的坑处理：`.ps1` 是 **UTF-8 with BOM**（PowerShell 5.1 会按 ANSI 解码无 BOM 文件，
-  中文会乱码甚至语法报错），`.bat` 是**纯 ASCII**（避开代码页问题），全部 **CRLF**。
-  发布脚本里有字节级校验，坏文件进不了发布包。
+### 左侧菜单栏可收起
 
-> 诚实说明：Linux 路径已在 Linux 上验证；Windows 脚本在 macOS 上只做了静态审查与字节级编码校验，
-> **没有在真实 Windows 机器上跑过**。第一次在 Windows 使用若遇到问题，请带日志提 issue。
+文字菜单可以折起来只留图标栏，把宽度让给工作区：
+
+- 侧栏右上角的折叠按钮，或图标栏底部收起后出现的展开按钮；
+- 快捷键 `Ctrl + B` / `⌘ + B`（在输入框里自动让位）；
+- 选择记在浏览器本地，刷新后保持，首帧就按记下的状态渲染。
+
+窄屏（≤860px）默认收起，但仍然可以手动展开——此前该断点把菜单藏死、没有展开入口。
+
+### 修复
+
+- **重启提示会误判**：`apply` 后要提示「已替换 jar，请重启服务生效」，原判据是
+  「当前版本 == 已应用版本」。但 JVM 一直报告它启动时的版本，所以「重新应用正在跑的
+  版本」会被当成「已经重启过」，提示当场消失。改用进程启动时间判断，
+  `status` 返回 `startedAt`、`apply`/`rollback` 返回 `swappedAt`，只有前者晚于后者才算重启完成。
+- **`release.sh` 的 jar 校验被 SIGPIPE 误判**：`unzip -Z1 ... | grep -q` 在 `pipefail` 下
+  是错的——`grep -q` 命中后立即退出，`unzip` 收到 SIGPIPE 被杀，整条管道返回 141，
+  于是「校验通过」被当成失败。改为先把清单读进变量再 grep。
 
 ### 下载
 
 | 文件 | 说明 |
 | --- | --- |
-| `@@APP@@-@@VERSION@@.zip` | **Windows 推荐**（Windows 自带解压即可，保留 CRLF） |
-| `@@APP@@-@@VERSION@@.tar.gz` | Linux / macOS 推荐 |
 | `@@APP@@-@@VERSION@@.jar` | 可执行 jar 单文件，**应用内「自动更新」用的就是它** |
+| `@@APP@@-@@VERSION@@.zip` | **Windows 推荐**（自带解压即可，保留 CRLF） |
+| `@@APP@@-@@VERSION@@.tar.gz` | Linux / macOS 推荐 |
 
-两个压缩包内容完全一致，均包含：可执行 jar（`target/@@APP@@.jar`）、
-`start.sh` / `stop.sh`、`start.bat` / `stop.bat` / `start.ps1` / `stop.ps1`、
-`application.yml` 示例配置、`README.md`、`docs/` 与 `INSTALL.md`。
-
-单独的 `.jar` 资产是为了让应用内更新能直接下载并替换：它和压缩包里的 jar 是同一个文件，
-只是省去解包这一步。
+两个压缩包内容完全一致，均包含：可执行 jar、`start.sh` / `stop.sh`、
+`start.bat` / `stop.bat` / `start.ps1` / `stop.ps1`、`application.yml` 示例配置、
+`README.md`、`docs/` 与 `INSTALL.md`。
 
 ### 运行
 
@@ -433,11 +436,10 @@ stop.bat
 
 需要 JDK 21+。详见包内 `INSTALL.md`。
 
-### 其他
+### 升级说明
 
-- `release.sh` 现在会把两个平台的启停脚本一起打进包，并在发布前校验：
-  六个脚本是否都在包里、`.ps1` 是否带 BOM、`.bat` 是否纯 ASCII、是否 CRLF。
-- `CHANGELOG.md`、`README.md`、`INSTALL.md` 补充了跨平台说明。
+从 0.3.0 起可以直接用应用内更新：设置 → 版本与更新 → 应用更新 → 按提示重启。
+0.3.0 及更早的版本没有这个功能，请手动下载替换 jar（旧 jar 会被备份为 `.bak-<版本>`，可回滚）。
 NOTES_TEMPLATE
 render "$NOTES"
 

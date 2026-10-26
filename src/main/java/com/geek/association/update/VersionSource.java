@@ -17,4 +17,15 @@ public interface VersionSource {
      * @throws UpdateException with a user-readable Chinese message when the source cannot be read
      */
     List<ReleaseInfo> fetch();
+
+    /**
+     * Problems from the last {@link #fetch()} that did not make the answer unusable.
+     *
+     * A source may consult several endpoints (releases, then tags); when one of them fails the
+     * rest is still worth showing, but silently dropping half the history would be a lie of
+     * omission. These strings are surfaced in the status payload and the UI.
+     */
+    default List<String> warnings() {
+        return List.of();
+    }
 }

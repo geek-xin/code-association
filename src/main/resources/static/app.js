@@ -54,6 +54,7 @@ const REVIEW_KEY = 'ca.review.v1';
 const PAGE_KEY = 'ca.page';
 const DENSITY_KEY = 'ca.density';
 const THEME_KEY = 'ca.theme';
+const NAV_KEY = 'ca.nav';
 
 function esc(v) {
   return String(v == null ? '' : v)
@@ -267,6 +268,75 @@ function initTheme() {
     if (themeQuery.addEventListener) themeQuery.addEventListener('change', onChange);
     else if (themeQuery.addListener) themeQuery.addListener(onChange);
   }
+}
+
+/* ------------------------------------------------- collapsible navigation */
+
+/**
+ * Folds the text menu away and leaves the icon rail, for narrow screens or when the content
+ * needs the width. Two details matter:
+ *
+ *   1. It is persisted, because a layout choice that resets on reload is worse than none;
+ *   2. It is applied before first paint (see boot), so the menu never flashes open and shut.
+ */
+function navCollapsed() {
+  return document.querySelector('.app').classList.contains('nav-collapsed');
+}
+
+function applyNavCollapsed(collapsed, opts) {
+  var app = document.querySelector('.app');
+  if (!app) return;
+  app.classList.toggle('nav-collapsed', !!collapsed);
+
+  // The toggle inside the menu is gone once folded, so both affordances carry the same state
+  // for assistive tech: a stale aria-expanded on a hidden button is worse than omitting it.
+  var collapseBtn = $('nav-collapse');
+  if (collapseBtn) collapseBtn.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+  var expandBtn = $('nav-expand');
+  if (expandBtn) expandBtn.setAttribute('aria-expanded', collapsed ? 'true' : 'false');
+
+  // Charts measure their container, so a width change needs a re-layout or they keep the old size.
+  if (!(opts && opts.silent)) {
+    requestAnimationFrame(function () { renderMapsFor(state.page); });
+  }
+}
+
+function setNavCollapsed(collapsed, opts) {
+  applyNavCollapsed(collapsed, opts);
+  if (!(opts && opts.silent)) {
+    try { localStorage.setItem(NAV_KEY, collapsed ? 'collapsed' : 'expanded'); } catch (e) { /* ignore quota */ }
+    toast(collapsed ? '已收起菜单栏' : '已展开菜单栏');
+  }
+}
+
+function toggleNav() {
+  setNavCollapsed(!navCollapsed());
+}
+
+function initNav() {
+  var saved = null;
+  try { saved = localStorage.getItem(NAV_KEY); } catch (e) { /* ignore */ }
+  // Narrow viewports start folded: at 860px the menu is already hidden by CSS, so starting
+  // expanded would only make the first toggle a no-op.
+  var narrow = window.matchMedia && window.matchMedia('(max-width: 860px)').matches;
+  applyNavCollapsed(saved ? saved === 'collapsed' : narrow, { silent: true });
+
+  var collapseBtn = $('nav-collapse');
+  if (collapseBtn) collapseBtn.addEventListener('click', toggleNav);
+  var expandBtn = $('nav-expand');
+  if (expandBtn) expandBtn.addEventListener('click', toggleNav);
+
+  // Ctrl/⌘+B, the shortcut editors use for the same thing. Skipped while typing so it never
+  // eats a keystroke meant for the search box or a form field.
+  document.addEventListener('keydown', function (ev) {
+    if (!(ev.key === 'b' || ev.key === 'B')) return;
+    if (!(ev.ctrlKey || ev.metaKey) || ev.altKey || ev.shiftKey) return;
+    var el = ev.target;
+    var tag = el && el.tagName ? el.tagName.toLowerCase() : '';
+    if (tag === 'input' || tag === 'textarea' || tag === 'select' || (el && el.isContentEditable)) return;
+    ev.preventDefault();
+    toggleNav();
+  });
 }
 
 /* --------------------------------------------------------------------- toast */
@@ -3010,6 +3080,8 @@ function bindEvents() {
 (async function boot() {
   state.review = loadReviewStore();
   initTheme();
+  // Before the first render: the persisted layout must not flash open and then fold.
+  initNav();
   bindEvents();
   await refreshAll(false);
   var remembered = null;

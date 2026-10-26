@@ -23,6 +23,22 @@ public class ReleaseInfo {
     public boolean current;
     /** True when this release is newer than the running version. */
     public boolean newer;
+    /**
+     * True when the entry came from the tags endpoint and has no GitHub release behind it.
+     *
+     * Such a version exists - the code is tagged and published - but carries no notes and usually
+     * no jar, so the UI must not offer it as if it were a full release.
+     */
+    public boolean fromTag;
+    /**
+     * True when this version's jar is already in {@code {dataDir}/updates}.
+     *
+     * Recomputed from the directory on every status view rather than stored, so a file deleted by
+     * hand, or a download made before this process started, is reported correctly.
+     */
+    public boolean downloaded;
+    /** When the local jar was downloaded, ISO-8601, or null when it is not downloaded. */
+    public String downloadedAt;
     /** Markdown body; empty string when absent so the UI never has to handle null. */
     public String notes = "";
     public String url;

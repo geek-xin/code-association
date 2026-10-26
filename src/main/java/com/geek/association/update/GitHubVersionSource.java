@@ -21,8 +21,10 @@ import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 
 /**
  * Reads the releases of this project from the GitHub REST API.
@@ -33,6 +35,11 @@ import java.util.Locale;
  * Every failure becomes an {@link UpdateException} whose message is written for the user, because
  * the update card in the UI shows it verbatim. Nothing here decides whether an update is available:
  * that needs the running version and belongs to {@link UpdateService}.
+ *
+ * Two GitHub endpoints are read: releases, and optionally bare tags. A release is a tag plus notes
+ * and assets, and a maintainer sometimes pushes the tag first and writes the release later (or
+ * never), so releases alone silently hide part of the history. Only the releases request is
+ * load-bearing - see {@link #withTags} for why a tags failure is downgraded to a warning.
  */
 @Component
 public class GitHubVersionSource implements VersionSource {
@@ -46,8 +53,30 @@ public class GitHubVersionSource implements VersionSource {
     private static final DateTimeFormatter RESET_FORMAT =
             DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss", Locale.ROOT);
 
+    /** GitHub's public API; overridable so a test can point the source at a loopback server. */
+    private static final String DEFAULT_API_BASE = "https://api.github.com";
+
+    /**
+     * Newest version first: the UI shows a history list and the first entry is what "latest" means.
+     * An unparsable version sinks to the end instead of throwing, because it is already an outlier
+     * by the time anything reaches this list.
+     */
+    private static final Comparator<ReleaseInfo> NEWEST_FIRST =
+            Comparator.comparing((ReleaseInfo release) -> Version.tryParse(release.version),
+                            Comparator.nullsFirst(Comparator.naturalOrder()))
+                    .reversed();
+
     private final AppProperties properties;
     private final HttpClient client;
+    /** REST base without a trailing slash, e.g. {@code https://api.github.com}. */
+    private final String apiBase;
+
+    /**
+     * Problems of the last {@link #fetch()} that did not make its answer unusable.
+     *
+     * Replaced as a whole, never mutated in place, so a reader never observes a half-updated list.
+     */
+    private volatile List<String> warnings = List.of();
 
     /**
      * The production constructor. Marked {@code @Autowired} because the class has a second one for
@@ -56,13 +85,26 @@ public class GitHubVersionSource implements VersionSource {
      */
     @Autowired
     public GitHubVersionSource(AppProperties properties) {
-        this(properties, HttpClient.newBuilder().connectTimeout(CONNECT_TIMEOUT).build());
+        this(properties, HttpClient.newBuilder().connectTimeout(CONNECT_TIMEOUT).build(), DEFAULT_API_BASE);
     }
 
     /** Visible for tests that need to assert the request shape without reaching GitHub. */
     GitHubVersionSource(AppProperties properties, HttpClient client) {
+        this(properties, client, DEFAULT_API_BASE);
+    }
+
+    /**
+     * Full form: a pinned client and a different API host.
+     *
+     * The host is a parameter rather than a constant because the request building (headers, token,
+     * timeout, status handling) is worth testing against a loopback server, and because a GitHub
+     * Enterprise installation would serve exactly the same paths under another host.
+     */
+    public GitHubVersionSource(AppProperties properties, HttpClient client, String apiBase) {
         this.properties = properties;
         this.client = client;
+        String base = Texts.trim(apiBase);
+        this.apiBase = stripTrailingSlash(base.isEmpty() ? DEFAULT_API_BASE : base);
     }
 
     @Override
@@ -73,7 +115,63 @@ public class GitHubVersionSource implements VersionSource {
             throw new UpdateException("未配置更新仓库（code-association.update.repo）");
         }
         int perPage = Math.max(1, Math.min(100, update.getMaxReleases()));
-        URI uri = URI.create("https://api.github.com/repos/" + repo + "/releases?per_page=" + perPage);
+        // The releases request carries what an update needs (notes, assets), so its failure stays
+        // fatal: a half-known answer here would be reported as "no update" and hide a real one.
+        List<ReleaseInfo> releases = parseReleases(get(releasesUri(repo, perPage), repo, update), repo);
+        if (!update.isIncludeTags()) {
+            // Nothing to warn about: tags were never asked for.
+            warnings = List.of();
+            return select(releases, update);
+        }
+        return withTags(releases, repo, perPage, update);
+    }
+
+    @Override
+    public List<String> warnings() {
+        return warnings;
+    }
+
+    /**
+     * Adds the versions that exist only as tags, and turns a tags failure into a warning.
+     *
+     * The whole point of the tags request is completeness, so losing it must not cost the answer
+     * that was already fetched: the user still gets every release, plus one line saying the history
+     * may be incomplete. A nested UpdateException would instead blank the card and, worse, reset
+     * "is there an update" to false.
+     */
+    private List<ReleaseInfo> withTags(List<ReleaseInfo> releases, String repo, int perPage,
+                                       AppProperties.Update update) {
+        List<ReleaseInfo> tags;
+        try {
+            tags = parseTags(get(tagsUri(repo, perPage), repo, update), repo);
+        } catch (UpdateException e) {
+            if (Thread.currentThread().isInterrupted()) {
+                // An interrupt is a request to stop, not a degraded answer: it must end the fetch.
+                throw e;
+            }
+            log.warn("tags request failed, serving releases only: {}", e.getMessage());
+            warnings = List.of("读取标签列表失败，本次仅显示 releases：" + e.getMessage());
+            return select(releases, update);
+        }
+        warnings = List.of();
+        return select(merge(releases, tags), update);
+    }
+
+    private URI releasesUri(String repo, int perPage) {
+        return URI.create(apiBase + "/repos/" + repo + "/releases?per_page=" + perPage);
+    }
+
+    private URI tagsUri(String repo, int perPage) {
+        return URI.create(apiBase + "/repos/" + repo + "/tags?per_page=" + perPage);
+    }
+
+    /**
+     * One GET against the REST API, with the headers and the failure mapping shared by both calls.
+     *
+     * Both endpoints are authenticated the same way; building the request twice would let the token
+     * (or the mandatory User-Agent) drift out of one of them unnoticed.
+     */
+    private String get(URI uri, String repo, AppProperties.Update update) {
         HttpRequest.Builder builder = HttpRequest.newBuilder(uri)
                 .timeout(REQUEST_TIMEOUT)
                 .header("Accept", "application/vnd.github+json")
@@ -96,7 +194,15 @@ public class GitHubVersionSource implements VersionSource {
             throw new UpdateException("版本检查被中断", e);
         }
         checkStatus(response, repo, update);
-        return select(parseReleases(response.body(), repo), update);
+        return response.body();
+    }
+
+    private static String stripTrailingSlash(String text) {
+        String out = text;
+        while (out.endsWith("/")) {
+            out = out.substring(0, out.length() - 1);
+        }
+        return out;
     }
 
     /**
@@ -203,15 +309,97 @@ public class GitHubVersionSource implements VersionSource {
             if (!node.isObject()) {
                 continue;
             }
+            // A draft is a release nobody has published yet. The list endpoint omits drafts for
+            // anonymous callers, but that is a server-side default, not a guarantee: a token with
+            // push access does receive them, and offering an unpublished build as an update would
+            // be the one mistake this feature cannot take back.
+            if (node.path("draft").asBoolean(false)) {
+                continue;
+            }
             ReleaseInfo release = toRelease(node, repo);
             if (release != null) {
                 out.add(release);
             }
         }
-        // Newest first: the UI shows a history list and the first entry is what "latest" means.
-        out.sort(Comparator.comparing((ReleaseInfo release) -> Version.tryParse(release.version),
-                        Comparator.nullsFirst(Comparator.naturalOrder()))
-                .reversed());
+        out.sort(NEWEST_FIRST);
+        return out;
+    }
+
+    /**
+     * Turns a GitHub tags payload into normalised entries, newest first.
+     *
+     * The tags endpoint is much poorer than releases: no notes, no assets, no timestamp, only a
+     * name and a commit. Everything it cannot answer is left empty rather than invented - in
+     * particular {@code publishedAt} stays null instead of borrowing the commit date, which is a
+     * different fact.
+     */
+    public static List<ReleaseInfo> parseTags(String json, String repo) {
+        if (Texts.isBlank(json)) {
+            throw new UpdateException("GitHub 返回了空响应");
+        }
+        JsonNode root;
+        try {
+            root = Json.mapper().readTree(json);
+        } catch (IOException e) {
+            throw new UpdateException("GitHub 返回的标签列表不是合法 JSON", e);
+        }
+        if (root == null || !root.isArray()) {
+            throw new UpdateException("GitHub 返回的标签列表格式不正确（应为数组）");
+        }
+        List<ReleaseInfo> out = new ArrayList<>();
+        for (JsonNode node : root) {
+            if (!node.isObject()) {
+                continue;
+            }
+            // "name" is what tags returns; "ref"/"tag_name" appear in other tag-shaped payloads
+            // and cost nothing to accept, which keeps the parser usable if the shape shifts.
+            String tag = text(node, "name");
+            if (tag == null) {
+                tag = text(node, "ref");
+            }
+            if (tag == null) {
+                tag = text(node, "tag_name");
+            }
+            // An unparsable tag is one entry lost, not the whole list: repositories carry
+            // non-version tags ("nightly", "latest") all the time.
+            Version version = tag == null ? null : Version.tryParse(tag);
+            if (version == null) {
+                log.debug("skipping an unusable tag: {}", tag);
+                continue;
+            }
+            ReleaseInfo release = new ReleaseInfo();
+            release.tag = tag;
+            release.version = version.toString();
+            release.name = tag;
+            release.fromTag = true;
+            release.prerelease = version.isPreRelease();
+            release.publishedAt = null;
+            release.notes = "";
+            release.url = releasePageUrl(repo, tag);
+            out.add(release);
+        }
+        out.sort(NEWEST_FIRST);
+        return out;
+    }
+
+    /**
+     * Unions releases and tags, with the release winning every collision.
+     *
+     * A release and the tag it was cut from describe the same version, and the release carries the
+     * only notes and assets either of them has, so keying on the normalised version and keeping the
+     * release is what makes the merge lossless. Same version from both sides is the common case,
+     * not an edge case: every released version is tagged.
+     */
+    static List<ReleaseInfo> merge(List<ReleaseInfo> releases, List<ReleaseInfo> tags) {
+        Map<String, ReleaseInfo> byVersion = new LinkedHashMap<>();
+        for (ReleaseInfo release : releases) {
+            byVersion.putIfAbsent(release.version, release);
+        }
+        for (ReleaseInfo tag : tags) {
+            byVersion.putIfAbsent(tag.version, tag);
+        }
+        List<ReleaseInfo> out = new ArrayList<>(byVersion.values());
+        out.sort(NEWEST_FIRST);
         return out;
     }
 

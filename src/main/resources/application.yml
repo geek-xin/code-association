@@ -54,6 +54,13 @@ code-association:
     # Pre-releases are built for testing; offering them as "the latest version" would push an
     # unfinished build onto every installation. Enable only when deliberately testing one.
     include-prerelease: false
+    # Read bare git tags as well as releases. Releases are tags with notes and assets, but a tag is
+    # sometimes pushed before (or without) its release, and those versions must still appear in the
+    # history. A tag that has no jar asset can be seen but not downloaded in place.
+    include-tags: true
+    # Fetch a newly discovered jar in the background so it is ready when someone presses 应用更新.
+    # Off by default: the download is tens of MB and applying is still a manual decision.
+    auto-download: false
   ai:
     enabled: false
     base-url: ""

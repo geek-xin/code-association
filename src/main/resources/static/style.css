@@ -339,6 +339,8 @@ button:focus:not(:focus-visible), input:focus:not(:focus-visible), select:focus:
 
 .app {
   display: grid;
+  /* The middle column is driven by --nav-w so collapsing the menu is a single-variable
+     change instead of a second layout rule that could drift out of sync. */
   grid-template-columns: var(--rail-w) var(--nav-w) minmax(0, 1fr);
   gap: 0;
   height: calc(100vh - 28px);
@@ -347,7 +349,34 @@ button:focus:not(:focus-visible), input:focus:not(:focus-visible), select:focus:
   background: radial-gradient(1200px 620px at 10% -10%, var(--app-grad-a) 0%, var(--app-bg) 48%, var(--app-grad-b) 100%);
   border-radius: 22px;
   box-shadow: var(--app-shadow);
+  transition: grid-template-columns var(--t-base) var(--ease);
 }
+
+/* ------------------------------------------------ collapsible navigation */
+/* Collapsed, the text menu folds to zero width and the icon rail remains, so every page is
+   still one click away: the rail is the persistent affordance, the menu the optional detail. */
+
+.app.nav-collapsed {
+  grid-template-columns: var(--rail-w) 0 minmax(0, 1fr);
+}
+
+.app.nav-collapsed .sidenav {
+  /* visibility (not just zero width) keeps a hidden menu out of the tab order: otherwise
+     keyboard users can focus controls that are inside a 0px column and cannot be seen. */
+  visibility: hidden;
+  opacity: 0;
+  padding-left: 0;
+  padding-right: 0;
+  border-right: 0;
+  transition: opacity var(--t-fast) var(--ease), visibility 0s linear var(--t-base);
+}
+
+/* The rail button that reopens the menu exists only while it is collapsed: it cannot live
+   inside the thing it reveals. */
+#nav-expand { display: none; }
+.app.nav-collapsed #nav-expand { display: grid; }
+
+.sidenav-head-actions { display: flex; align-items: center; gap: 4px; }
 
 /* icon rail */
 .rail {
@@ -432,6 +461,9 @@ button:focus:not(:focus-visible), input:focus:not(:focus-visible), select:focus:
   padding: 22px 16px 16px;
   min-height: 0;
   border-right: 1px solid var(--sidenav-border);
+  /* Fading out is what makes the collapse read as a fold rather than a jump cut; the column
+     width itself is animated on .app. */
+  transition: opacity var(--t-base) var(--ease), padding var(--t-base) var(--ease);
 }
 
 .sidenav-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; padding: 0 4px; }
@@ -1364,7 +1396,9 @@ body.compact .row-desc { -webkit-line-clamp: 1; }
 }
 
 @media (max-width: 1180px) {
-  .app { grid-template-columns: var(--rail-w) 220px minmax(0, 1fr); min-width: 0; }
+  /* Narrow the menu through the variable, not a literal column: a literal here would win
+     over .app.nav-collapsed and make the collapse button silently stop working. */
+  .app { --nav-w: 220px; grid-template-columns: var(--rail-w) var(--nav-w) minmax(0, 1fr); min-width: 0; }
   .workspace { padding: 20px 20px 40px; }
   .grid-2, .grid-2-even, .grid-3 { grid-template-columns: minmax(0, 1fr); }
   .flow { grid-template-columns: minmax(0, 1fr); }
@@ -1373,8 +1407,11 @@ body.compact .row-desc { -webkit-line-clamp: 1; }
 
 @media (max-width: 860px) {
   #an-progress-card .stepper { grid-auto-flow: row; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px 10px; }
-  .app { grid-template-columns: var(--rail-w) minmax(0, 1fr); }
-  .sidenav { display: none; }
+  /* Narrow screens start folded (see initNav) but can still be expanded on demand. The old
+     rule hid the menu unconditionally with display:none, which left the expand affordance
+     with nothing to reveal. */
+  .app { --nav-w: 216px; grid-template-columns: var(--rail-w) var(--nav-w) minmax(0, 1fr); }
+  .app.nav-collapsed { grid-template-columns: var(--rail-w) 0 minmax(0, 1fr); }
   .stats { grid-template-columns: minmax(0, 1fr); }
   .tr-impacts, .tr-changes, .tr-history { grid-template-columns: minmax(0, 1fr) 26px; }
   .tr .cell.optional { display: none; }
