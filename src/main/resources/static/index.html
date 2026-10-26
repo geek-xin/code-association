@@ -856,6 +856,20 @@
             <button class="btn btn-sm" id="set-clear" style="align-self:flex-start">清除本地复核状态</button>
           </div>
         </div>
+        <div class="card" id="card-update" style="grid-column:1/-1">
+          <div class="card-head">
+            <div>
+              <div class="card-title">版本与更新</div>
+              <div class="card-sub" id="upd-sub">来自 /api/update</div>
+            </div>
+            <div class="card-head-actions">
+              <button class="btn btn-sm" id="upd-check" data-update-check title="立即检查是否有新版本" aria-label="立即检查是否有新版本">
+                <svg><use href="#i-refresh"/></svg>立即检查
+              </button>
+            </div>
+          </div>
+          <div id="upd-body"></div>
+        </div>
       </div>
     </section>
 

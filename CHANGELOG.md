@@ -2,6 +2,32 @@
 
 遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.4.0] - 2026-10-26
+
+### 新增
+
+- **版本检查与自动更新**：服务定时向 GitHub 查询 release，设置页直接显示当前版本、
+  最新版本与**历史版本列表**（含每个版本的发布说明与下载入口）。
+  - `GET /api/update` 读状态（带缓存，命中缓存不消耗 GitHub 额度）；
+    `POST /api/update/check` 强制刷新。
+  - `POST /api/update/download` 下载指定版本的 jar 到 `{data-dir}/updates/`，
+    边下边算 SHA-256，下完再校验文件头确实是 jar。
+  - `POST /api/update/apply` 先备份当前 jar 为 `<jar>.bak-<版本>` 再替换；
+    `POST /api/update/rollback` 从备份恢复。
+  - 配置项 `code-association.update.*`：`enabled` / `repo` / `token` /
+    `check-interval-minutes` / `cron` / `max-releases` / `include-prerelease`。
+
+### 设计取舍
+
+- **检查自动、替换手动**：定时检查新版本不需要人工干预，但替换 jar 必须点确认。
+  服务自己重启自己会让前端拿不到响应，也会把「什么时候中断服务」的决定权从运维手里拿走。
+- **不自动重启**：替换后界面提示执行 `./stop.sh && ./start.sh`（Windows 用 `stop.bat` / `start.bat`），
+  由外部脚本完成重启，与现有启停脚本的语义一致。
+- **三种情况明确拒绝替换**并说明原因：在 IDE 里跑（没有可替换的 jar）、
+  Windows（运行中的 jar 被系统锁定）、没先下载（无暂存文件）。
+- **GitHub 限流如实暴露**：未认证每小时 60 次，撞上 403 时界面直接说明是限流并给出
+  额度重置时间，而不是显示一句含糊的「检查失败」。配置 `GITHUB_TOKEN` 可提到 5000 次/小时。
+
 ## [0.3.0] - 2026-10-26
 
 本次只改「外壳」：jar 里的分析能力一行没动，补的是启动/停止脚本的平台覆盖。

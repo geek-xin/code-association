@@ -10,6 +10,7 @@ import com.geek.association.source.PathBrowser;
 import com.geek.association.source.RepositoryPreparer;
 import com.geek.association.source.SourceNames;
 import com.geek.association.store.Store;
+import com.geek.association.update.UpdateService;
 import com.geek.association.util.Json;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -38,16 +39,18 @@ public class ApiController {
     private final AppProperties properties;
     private final PathBrowser pathBrowser;
     private final ScheduledScanService scheduledScan;
+    private final UpdateService updateService;
 
     public ApiController(Store store, AnalysisService analysisService, RepositoryPreparer preparer,
                          AppProperties properties, PathBrowser pathBrowser,
-                         ScheduledScanService scheduledScan) {
+                         ScheduledScanService scheduledScan, UpdateService updateService) {
         this.store = store;
         this.analysisService = analysisService;
         this.preparer = preparer;
         this.properties = properties;
         this.pathBrowser = pathBrowser;
         this.scheduledScan = scheduledScan;
+        this.updateService = updateService;
     }
 
     @GetMapping("/health")
@@ -91,6 +94,59 @@ public class ApiController {
     @PostMapping("/schedule/run")
     public ScheduledScanService.ScanResult runScheduleNow() {
         return scheduledScan.runAsync("manual");
+    }
+
+    // ----------------------------------------------------------------- update
+
+    /**
+     * Current version, newest release and the release history.
+     *
+     * Served from a cache when the last successful check is still fresh, so opening the settings
+     * page repeatedly does not burn GitHub's 60-requests-per-hour unauthenticated quota. The
+     * {@code source} field says where the answer came from, which is what makes a stale-but-served
+     * result honest instead of silently misleading.
+     */
+    @GetMapping("/update")
+    public Map<String, Object> update() {
+        return updateService.status();
+    }
+
+    /** Ignores the cache and asks GitHub again. Backs the "check now" button. */
+    @PostMapping("/update/check")
+    public Map<String, Object> checkForUpdate() {
+        return updateService.checkNow();
+    }
+
+    /**
+     * Downloads one release's jar into the data directory and verifies it.
+     *
+     * Deliberately separate from applying: the download is the slow, failure-prone half, and a user
+     * should be able to fetch an artifact without yet committing to replacing a running service.
+     */
+    @PostMapping("/update/download")
+    public Map<String, Object> downloadUpdate(@RequestBody(required = false) Map<String, Object> body) {
+        Object version = body == null ? null : body.get("version");
+        if (version == null || version.toString().isBlank()) {
+            throw new IllegalArgumentException("缺少 version 参数（要下载的版本号，例如 0.4.0）");
+        }
+        return updateService.download(version.toString());
+    }
+
+    /**
+     * Replaces the running jar with the downloaded one, after backing the current jar up.
+     *
+     * The process is not restarted here on purpose: the frontend needs this response to tell the
+     * user what happened, and when a service goes down should stay the operator's decision.
+     */
+    @PostMapping("/update/apply")
+    public Map<String, Object> applyUpdate() {
+        return updateService.apply();
+    }
+
+    /** Restores the most recent backup made by {@link #applyUpdate()}. */
+    @PostMapping("/update/rollback")
+    public Map<String, Object> rollbackUpdate() {
+        return updateService.rollback();
     }
 
     // ------------------------------------------------------------- filesystem

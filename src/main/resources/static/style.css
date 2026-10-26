@@ -1379,3 +1379,109 @@ body.compact .row-desc { -webkit-line-clamp: 1; }
   .tr-impacts, .tr-changes, .tr-history { grid-template-columns: minmax(0, 1fr) 26px; }
   .tr .cell.optional { display: none; }
 }
+
+/* ------------------------------------------------------- version & updates */
+/* Settings card for the self-update flow. Every colour comes from the existing
+   theme tokens so both palettes stay readable; the only structural bits are the
+   hero version number, the release row layout and the pre-formatted notes. */
+
+.upd-hero {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+  padding-bottom: 14px;
+  margin-bottom: 4px;
+  border-bottom: 1px solid var(--border);
+}
+.upd-version-num {
+  font-size: 30px;
+  line-height: 1.1;
+  font-weight: 600;
+  letter-spacing: -0.03em;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+.upd-version-cap { font-size: 11.5px; color: var(--text-3); margin-top: 5px; }
+.upd-hero-side { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.upd-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.upd-loading { display: flex; align-items: center; gap: 10px; font-size: 12.5px; color: var(--text-2); padding: 8px 0; }
+/* the shared .spinner is sized for the 14px icon slot; shrink it to fit a .btn-sm */
+.btn-sm .spinner { width: 11px; height: 11px; border-width: 1.5px; }
+
+/* release list: one row per version, notes expand underneath */
+.rel-list { display: flex; flex-direction: column; }
+.rel-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+  flex-wrap: wrap;
+  padding: 11px 0;
+}
+.rel-row + .rel-row { border-top: 1px solid var(--border); }
+.rel-main { min-width: 0; flex: 1 1 260px; }
+.rel-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.rel-version {
+  font-family: var(--mono);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+.rel-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 11px;
+  color: var(--text-3);
+  margin-top: 4px;
+}
+.rel-meta .sep { width: 3px; height: 3px; border-radius: 50%; background: var(--border-strong); }
+.rel-actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+
+/* Release notes are untrusted markdown shown as escaped text, never rendered. */
+.release-notes {
+  margin: 4px 0 10px;
+  padding: 11px 13px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--inset-bg);
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 1.7;
+  color: var(--text-body);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 320px;
+  overflow-y: auto;
+}
+.release-notes .release-list { margin: 2px 0; padding-left: 16px; list-style: disc; }
+.release-notes .release-list li { margin: 1px 0; }
+.release-notes .release-gap { display: block; height: 6px; }
+.release-notes .release-h { font-weight: 600; color: var(--text); margin: 4px 0 2px; }
+.upd-notes-foot { font-size: 11.5px; margin: -4px 0 10px; }
+.upd-notes-foot a { color: var(--primary-700); text-decoration: none; }
+.upd-notes-foot a:hover { text-decoration: underline; }
+
+/* restart command hint shown after apply / rollback */
+.restart-cmd { margin-top: 6px; font-size: 11.5px; color: var(--text-body); overflow-wrap: anywhere; }
+.restart-cmd code {
+  font-family: var(--mono);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 1px 5px;
+  color: var(--text);
+}
+
+/* Narrow windows: the release row stacks, so the flex-basis that widens .rel-main
+   horizontally must be dropped — in column direction it would become a 260px height. */
+@media (max-width: 1024px) {
+  .upd-version-num { font-size: 25px; }
+  .rel-row { flex-direction: column; align-items: stretch; gap: 8px; }
+  .rel-main { flex: 0 0 auto; }
+  .rel-actions { justify-content: flex-start; }
+}

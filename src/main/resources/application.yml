@@ -31,6 +31,29 @@ code-association:
     run-on-startup: false
     max-programs-per-run: 20
     directory-rescan-minutes: 1440
+  # Self-update from the project's GitHub releases. Checking is read-only; nothing is downloaded or
+  # replaced until someone presses the button in the UI.
+  update:
+    # On by default: an installation that never learns a new version exists is what this feature
+    # exists to fix. Turn it off for air-gapped hosts, where every check would only log a failure.
+    enabled: true
+    # Releases are read from this repository's tags. Change it for a fork.
+    repo: geek-xin/code-association
+    # Optional. Anonymous GitHub allows 60 requests/hour per IP; a token raises it to 5000. It is
+    # read from the environment so no secret has to live in this file.
+    token: ${GITHUB_TOKEN:}
+    # How long a successful check is reused. Six hours keeps polling the UI free of API calls while
+    # still noticing a release the same working day.
+    check-interval-minutes: 360
+    # Background re-check. Hourly is enough for a release cadence measured in days, and the result
+    # is cached anyway; cron format is second minute hour day-of-month month day-of-week.
+    cron: "0 0 * * * *"
+    # Upper bound on the history list. Each entry carries its notes and assets, so the payload grows
+    # with this number and 20 covers a typical release history without bloating the response.
+    max-releases: 20
+    # Pre-releases are built for testing; offering them as "the latest version" would push an
+    # unfinished build onto every installation. Enable only when deliberately testing one.
+    include-prerelease: false
   ai:
     enabled: false
     base-url: ""

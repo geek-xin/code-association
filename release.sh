@@ -3,9 +3,9 @@
 # release.sh — 构建、打包并发布 code-association 到 GitHub Release
 #
 # 用法:
-#   ./release.sh                  # 发布默认版本 0.3.0
-#   ./release.sh 0.4.0            # 发布指定版本
-#   VERSION=0.4.0 ./release.sh    # 同上（环境变量方式）
+#   ./release.sh                  # 发布默认版本 0.4.0
+#   ./release.sh 0.5.0            # 发布指定版本
+#   VERSION=0.5.0 ./release.sh    # 同上（环境变量方式）
 #
 # 产物:
 #   build/release/code-association-<version>/            # 干净的发布目录
@@ -40,12 +40,14 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 APP="code-association"
-VERSION="${1:-${VERSION:-0.3.0}}"
+VERSION="${1:-${VERSION:-0.4.0}}"
 TAG="v${VERSION}"
 RELEASE_ROOT="build/release"
 STAGE="${RELEASE_ROOT}/${APP}-${VERSION}"
 TARBALL="${RELEASE_ROOT}/${APP}-${VERSION}.tar.gz"
 ZIPBALL="${RELEASE_ROOT}/${APP}-${VERSION}.zip"
+# 独立 jar 资产：内置自动更新只认 *.jar，不认压缩包
+JARBALL="${RELEASE_ROOT}/${APP}-${VERSION}.jar"
 NOTES="${RELEASE_ROOT}/release-notes-${TAG}.md"
 
 die() { echo "错误: $*" >&2; exit 1; }
@@ -268,7 +270,14 @@ chmod 644 "${STAGE}/start.ps1" "${STAGE}/stop.ps1" "${STAGE}/start.bat" "${STAGE
 
 # ---------- 3. 生成压缩包 ----------
 mkdir -p "$RELEASE_ROOT"
-rm -f "$TARBALL" "$ZIPBALL"
+rm -f "$TARBALL" "$ZIPBALL" "$JARBALL"
+
+# 单独发布一个 jar 资产。
+# 为什么需要：应用内置的「自动更新」只会替换 jar，它从 release 资产里找 *.jar。
+# 如果只发 tar.gz / zip，自动更新就没有可下载的东西（tar/zip 里虽然也有 jar，
+# 但要先解包，服务自己不该做这件事），功能等于废的。
+log "生成 $JARBALL"
+cp "$JAR" "$JARBALL"
 
 log "生成 $TARBALL"
 # COPYFILE_DISABLE / --no-xattrs: 避免 macOS 打包出 ._ 资源分叉文件
@@ -296,6 +305,17 @@ for archive in "$TARBALL" "$ZIPBALL"; do
 
   echo "    OK  $(basename "$archive")：start.sh / stop.sh / start.ps1 / stop.ps1 / start.bat / stop.bat / target/${APP}.jar 均在 ${APP}-${VERSION}/ 下"
 done
+
+# 独立 jar 必须是可运行的 Spring Boot 包（内含 BOOT-INF/），而不是普通的薄 jar。
+# 自动更新会把下载到的 jar 直接替换到运行位置，装错了服务就起不来。
+[ -f "$JARBALL" ] || die "缺少独立 jar 资产：$JARBALL"
+if ! unzip -Z1 "$JARBALL" 2>/dev/null | grep -qx "BOOT-INF/classes/com/geek/association/CodeAssociationApplication.class"; then
+  die "$(basename "$JARBALL") 不是可运行的 Spring Boot jar（缺少 BOOT-INF/classes/.../CodeAssociationApplication.class）"
+fi
+if [ "$(head -c 2 "$JARBALL")" != "PK" ]; then
+  die "$(basename "$JARBALL") 不是 zip/jar 格式（自动更新会校验文件头，坏的进不去）"
+fi
+echo "    OK  $(basename "$JARBALL")：可运行的 Spring Boot jar（自动更新用这个资产）"
 
 # 配置必须带上每日扫描（schedule）配置块，否则打包出来的示例配置是旧的
 grep -q 'schedule:' "${STAGE}/application.yml" \
@@ -379,10 +399,14 @@ cat > "$NOTES" <<'NOTES_TEMPLATE'
 | --- | --- |
 | `@@APP@@-@@VERSION@@.zip` | **Windows 推荐**（Windows 自带解压即可，保留 CRLF） |
 | `@@APP@@-@@VERSION@@.tar.gz` | Linux / macOS 推荐 |
+| `@@APP@@-@@VERSION@@.jar` | 可执行 jar 单文件，**应用内「自动更新」用的就是它** |
 
-两个包内容完全一致，均包含：可执行 jar（`target/@@APP@@.jar`）、
+两个压缩包内容完全一致，均包含：可执行 jar（`target/@@APP@@.jar`）、
 `start.sh` / `stop.sh`、`start.bat` / `stop.bat` / `start.ps1` / `stop.ps1`、
 `application.yml` 示例配置、`README.md`、`docs/` 与 `INSTALL.md`。
+
+单独的 `.jar` 资产是为了让应用内更新能直接下载并替换：它和压缩包里的 jar 是同一个文件，
+只是省去解包这一步。
 
 ### 运行
 
@@ -429,13 +453,13 @@ log "发布 GitHub Release: $TAG"
 if gh release view "$TAG" >/dev/null 2>&1; then
   echo "    Release $TAG 已存在，更新标题与说明并覆盖资产"
   gh release edit "$TAG" --title "${APP} ${VERSION}" --notes-file "$NOTES"
-  gh release upload "$TAG" "$TARBALL" "$ZIPBALL" --clobber
+  gh release upload "$TAG" "$TARBALL" "$ZIPBALL" "$JARBALL" --clobber
 else
   gh release create "$TAG" \
     --title "${APP} ${VERSION}" \
     --notes-file "$NOTES" \
     --target "$TARGET_REF" \
-    "$TARBALL" "$ZIPBALL"
+    "$TARBALL" "$ZIPBALL" "$JARBALL"
 fi
 
 # ---------- 6. 汇总 ----------
@@ -448,4 +472,4 @@ echo "  Release: ${RELEASE_URL}"
 echo "  资产:"
 gh release view "$TAG" --json assets -q '.assets[] | "    - " + .name + "  (" + (.size|tostring) + " bytes)"' 2>/dev/null || echo "    （无法读取资产列表，请用 gh release view $TAG 查看）"
 echo "  本地包:"
-ls -lh "$TARBALL" "$ZIPBALL" | awk '{print "    "$9 "  "$5}'
+ls -lh "$TARBALL" "$ZIPBALL" "$JARBALL" | awk '{print "    "$9 "  "$5}'

@@ -160,7 +160,10 @@ var state = {
   importStep: -1,
   importError: false,
   maps: {},
-  picker: { target: null, path: null, selected: null }
+  picker: { target: null, path: null, selected: null },
+  /** Cached GET /api/update payload; see ensureUpdateLoaded(). */
+  update: null,
+  updateLoaded: false
 };
 
 /* ---------------------------------------------------------------- decisions */
@@ -1632,6 +1635,358 @@ async function renderSettings() {
     kvRow('最大文件数', h.maxFiles),
     kvRow('AI 解读', h.aiEnabled ? '已启用' : '未启用')
   ].join('') : emptyBlock('无法读取服务状态', '请确认后端服务正在运行。');
+  // Version info loads once per page load, not on every renderAll() tick.
+  ensureUpdateLoaded();
+}
+
+/* ------------------------------------------------------- version & updates */
+
+/**
+ * Update state is fetched once per page load. renderAll() runs on every poll tick, so
+ * re-fetching here would spam the backend; state.updateLoaded guards the first load and
+ * every explicit user action (check / download / apply / rollback) refreshes it directly.
+ */
+var SOURCE_LABEL = {
+  github: 'GitHub（本次刚拉取）',
+  cache: '本地缓存',
+  disabled: '已关闭',
+  error: '拉取失败',
+  never: '尚未检查'
+};
+
+function updateState() {
+  if (!state.update) {
+    state.update = { data: null, error: null, checking: false, busy: false, expanded: {}, pendingMsg: null };
+  }
+  return state.update;
+}
+
+function fmtBytes(bytes) {
+  if (bytes == null || isNaN(Number(bytes))) return '—';
+  var n = Number(bytes);
+  if (n < 1024) return n + ' B';
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+  return (n / 1024 / 1024).toFixed(1) + ' MB';
+}
+
+/**
+ * Minimal, deliberately dumb release-notes renderer: everything is escaped first, then
+ * newlines and leading "- " bullets are turned into markup. No markdown library, so
+ * nothing in the upstream release body can inject HTML or script.
+ */
+function renderNotes(md) {
+  var lines = String(md == null ? '' : md).replace(/\r\n/g, '\n').split('\n');
+  var out = [];
+  var inList = false;
+  for (var i = 0; i < lines.length; i++) {
+    var line = lines[i];
+    var bullet = /^\s*[-*]\s+(.*)$/.exec(line);
+    if (bullet) {
+      if (!inList) { out.push('<ul class="release-list">'); inList = true; }
+      out.push('<li>' + esc(bullet[1]) + '</li>');
+      continue;
+    }
+    if (inList) { out.push('</ul>'); inList = false; }
+    if (line.trim() === '') { out.push('<span class="release-gap"></span>'); continue; }
+    // Headings are only styled, never interpreted: "## 新增" loses the hashes but stays text.
+    var heading = /^\s*#{1,6}\s+(.*)$/.exec(line);
+    if (heading) out.push('<div class="release-h">' + esc(heading[1]) + '</div>');
+    else out.push('<div>' + esc(line) + '</div>');
+  }
+  if (inList) out.push('</ul>');
+  return out.join('') || '<div style="color:var(--text-3)">这个版本没有填写更新说明。</div>';
+}
+
+function jarAsset(release) {
+  var assets = (release && release.assets) || [];
+  for (var i = 0; i < assets.length; i++) {
+    if (/\.jar$/i.test(assets[i] && assets[i].name || '')) return assets[i];
+  }
+  return null;
+}
+
+/** Why the "应用更新" button is disabled, shown as tooltip and as an inline note. */
+function applyBlockedReason(d) {
+  if (!d) return '暂时无法判断当前环境是否支持自动应用。';
+  if (d.runningFromJar) return '检测到无法替换运行中的 jar（Windows 文件锁或权限不足），请手动下载后替换。';
+  return '当前不是以 java -jar 方式运行（可能是在 IDE 里启动），替换 jar 不会生效。';
+}
+
+/** The "current vs latest" summary block. */
+function renderUpdateSummary(d) {
+  var s = updateState();
+  var version = d.currentVersion || '未知';
+  var right;
+  if (d.updateAvailable && d.latestVersion) {
+    right = pill('有新版本 ' + d.latestVersion, 'brand', true);
+  } else if (d.latestVersion) {
+    right = pill('已是最新', 'success', true);
+  } else {
+    right = pill('尚未获取版本信息', 'neutral');
+  }
+  var rows = [
+    kvRow('最新版本', d.latestVersion || '—'),
+    kvRow('上次检查', d.checkedAt ? fmtTime(d.checkedAt) : '尚未检查'),
+    kvRow('检查来源', SOURCE_LABEL[d.source] || d.source || '—')
+  ];
+  if (d.repo) rows.push(kvRow('发布仓库', d.repo));
+  if (d.checkIntervalMinutes) rows.push(kvRow('自动检查间隔', d.checkIntervalMinutes + ' 分钟'));
+
+  var html = '<div class="upd-hero">' +
+    '<div class="upd-version"><div class="upd-version-num">' + esc(version) + '</div>' +
+    '<div class="upd-version-cap">当前运行版本</div></div>' +
+    '<div class="upd-hero-side">' + right + '</div></div>';
+
+  if (d.error) {
+    html += '<div class="callout danger" style="margin-bottom:14px"><svg><use href="#i-alert-circle"/></svg>' +
+      '<div><strong>检查更新失败</strong><br/>' + esc(d.error) + '</div></div>';
+  }
+  html += '<div class="kv-list">' + rows.join('') + '</div>';
+
+  // Downloaded-but-not-applied jar: applying needs a restart, so say so up front.
+  if (d.pending) {
+    var blocked = !d.applySupported;
+    html += '<div class="callout brand" style="margin-top:14px">' + icon('i-package') +
+      '<div><strong>已下载 ' + esc(d.pending.version || '') + '</strong> · ' + esc(fmtBytes(d.pending.bytes)) +
+      (d.pending.downloadedAt ? ' · ' + esc(fmtTime(d.pending.downloadedAt)) : '') +
+      '<div style="margin-top:6px;color:var(--text-2)">下载的文件还没有替换当前 jar，点击「应用更新」后需要重启服务才会生效。</div>' +
+      '<div class="upd-actions" style="margin-top:10px">' +
+        '<button class="btn btn-sm btn-primary" data-update-apply' +
+          (s.busy || d.busy || blocked ? ' disabled' : '') +
+          (blocked
+            ? ' title="' + esc(applyBlockedReason(d)) + '" aria-label="应用更新（不可用：' + esc(applyBlockedReason(d)) + '）"'
+            : ' title="把已下载的 jar 替换到运行位置"') + '>' +
+          icon('i-check') + '应用更新</button>' +
+        '<button class="btn btn-sm" data-update-rollback' + (s.busy || d.busy ? ' disabled' : '') +
+          ' title="用上一次的备份 jar 覆盖当前 jar" aria-label="回滚到上一个版本">' +
+          icon('i-corner-down') + '回滚</button>' +
+      '</div></div></div>';
+  } else {
+    html += '<div class="upd-actions" style="margin-top:14px">' +
+      '<button class="btn btn-sm" data-update-rollback' + (s.busy || d.busy ? ' disabled' : '') +
+        ' title="用上一次的备份 jar 覆盖当前 jar" aria-label="回滚到上一个版本">' +
+        icon('i-corner-down') + '回滚到上一个版本</button>' +
+      '</div>';
+  }
+
+  if (!d.applySupported) {
+    html += '<div class="callout warning" style="margin-top:12px"><svg><use href="#i-alert"/></svg>' +
+      '<div><strong>当前环境不支持自动应用</strong><br/>' + esc(applyBlockedReason(d)) +
+      '</div></div>';
+  }
+  return html;
+}
+
+/** One row per release, newest first, with an expandable notes panel. */
+function renderReleaseRow(release, idx) {
+  var s = updateState();
+  var key = String(release.version || idx);
+  var open = !!s.expanded[key];
+  var jar = jarAsset(release);
+  var pills = [];
+  if (release.current) pills.push(pill('当前版本', 'brand'));
+  if (release.prerelease) pills.push(pill('预发布', 'warning'));
+  if (release.newer && !release.current) pills.push(pill('可更新', 'success'));
+
+  var actions = '<button class="btn btn-sm btn-ghost" data-update-notes="' + esc(key) + '" ' +
+    'aria-expanded="' + (open ? 'true' : 'false') + '" aria-label="' +
+    (open ? '收起 ' : '查看 ') + esc(release.version || '') + ' 的更新说明">' +
+    icon(open ? 'i-chevron-down' : 'i-chevron-right') + (open ? '收起说明' : '查看说明') + '</button>';
+
+  if (jar) {
+    var downloaded = s.data && s.data.pending && s.data.pending.version === release.version;
+    actions += '<button class="btn btn-sm" data-update-download="' + esc(release.version || '') + '"' +
+      (s.busy || (s.data && s.data.busy) ? ' disabled' : '') +
+      ' title="下载 ' + esc(jar.name) + '（' + esc(fmtBytes(jar.size)) + '）" aria-label="下载版本 ' + esc(release.version || '') + '">' +
+      icon('i-upload') + (downloaded ? '重新下载' : '下载此版本') + '</button>';
+  }
+
+  var notes = open
+    ? '<div class="release-notes">' + renderNotes(release.notes) + '</div>' +
+      (release.url ? '<div class="upd-notes-foot"><a href="' + esc(release.url) + '" target="_blank" rel="noopener noreferrer">' +
+        '在 GitHub 上查看这个版本</a></div>' : '')
+    : '';
+
+  return '<div class="rel-row">' +
+    '<div class="rel-main">' +
+      '<div class="rel-head">' +
+        '<span class="rel-version">' + esc(release.version || '—') + '</span>' +
+        (pills.length ? '<span class="chips">' + pills.join('') + '</span>' : '') +
+      '</div>' +
+      '<div class="rel-meta">' +
+        '<span>' + esc(release.publishedAt ? fmtTime(release.publishedAt) : '发布时间未知') + '</span>' +
+        (release.name && release.name !== release.version ? '<span class="sep"></span><span>' + esc(release.name) + '</span>' : '') +
+        (jar ? '<span class="sep"></span><span>' + esc(jar.name) + ' · ' + esc(fmtBytes(jar.size)) + '</span>' : '') +
+      '</div>' +
+    '</div>' +
+    '<div class="rel-actions">' + actions + '</div>' +
+    '</div>' + notes;
+}
+
+function renderUpdateBody() {
+  var host = $('upd-body');
+  var sub = $('upd-sub');
+  var checkBtn = $('upd-check');
+  if (!host) return;
+  var s = updateState();
+  var d = s.data;
+
+  if (checkBtn) {
+    checkBtn.disabled = s.checking;
+    checkBtn.innerHTML = s.checking
+      ? '<span class="spinner"></span>检查中…'
+      : icon('i-refresh') + '立即检查';
+  }
+
+  if (!d && s.error) {
+    if (sub) sub.textContent = '无法读取更新信息';
+    host.innerHTML = '<div class="callout danger"><svg><use href="#i-alert-circle"/></svg><div>' +
+      '<strong>无法读取更新信息</strong><br/>' + esc(s.error) + '</div></div>' +
+      '<div style="margin-top:12px">' + emptyBlock('暂时拿不到版本信息', '可以稍后点击右上角「立即检查」重试。') + '</div>';
+    return;
+  }
+  if (!d) {
+    if (sub) sub.textContent = '正在读取…';
+    host.innerHTML = '<div class="upd-loading"><span class="spinner"></span>正在读取版本信息…</div>';
+    return;
+  }
+
+  if (sub) {
+    sub.textContent = d.enabled === false ? '自动更新已关闭' : '来自 /api/update';
+  }
+
+  if (d.enabled === false) {
+    host.innerHTML = '<div class="callout warning">' + icon('i-alert') + '<div>' +
+      '<strong>自动更新已关闭</strong><br/>' +
+      '当前服务以 <span class="mono">code-association.update.enabled=false</span> 启动，不会检查或下载新版本。' +
+      '如需启用，请去掉该配置后重启服务。</div></div>';
+    return;
+  }
+
+  var releases = (d.releases || []).slice().sort(function (a, b) {
+    var ta = a.publishedAt ? new Date(a.publishedAt).getTime() : 0;
+    var tb = b.publishedAt ? new Date(b.publishedAt).getTime() : 0;
+    if (isNaN(ta)) ta = 0;
+    if (isNaN(tb)) tb = 0;
+    return tb - ta;
+  });
+
+  var html = '';
+  // A successful apply/rollback only swaps the file on disk; the running process still serves
+  // the old code, so the restart instruction has to stay visible instead of being a toast.
+  // Once the running version catches up with the version we applied, the restart already
+  // happened and the notice would be stale, so it is dropped instead of lingering all session.
+  if (s.pendingMsg && d.currentVersion === s.pendingMsg.version) s.pendingMsg = null;
+  if (s.pendingMsg) {
+    html += '<div class="callout brand" style="margin-bottom:14px">' + icon('i-check-circle') + '<div>' +
+      '<strong>' + (s.pendingMsg.kind === 'rollback' ? '已回滚到 ' : '已替换为 ') +
+      esc(s.pendingMsg.version || '目标版本') + '</strong>' +
+      '<div style="margin-top:4px">jar 已写入磁盘，但当前进程仍在用旧代码。重启服务后新版本才会生效。</div>' +
+      '<div class="restart-cmd mono">POSIX：<code>./stop.sh &amp;&amp; ./start.sh</code></div>' +
+      '<div class="restart-cmd mono">Windows：先运行 <code>stop.bat</code>，再运行 <code>start.bat</code></div>' +
+      '</div></div>';
+  }
+  html += renderUpdateSummary(d);
+  html += '<div class="section-label">历史版本</div>';
+  html += releases.length
+    ? '<div class="rel-list">' + releases.map(renderReleaseRow).join('') + '</div>'
+    : emptyBlock('没有版本记录', '检查一次后这里会列出 GitHub 上发布的版本。');
+  host.innerHTML = html;
+}
+
+/** First load only; renderAll() calls this on every tick, so keep it idempotent. */
+async function ensureUpdateLoaded() {
+  var s = updateState();
+  if (state.updateLoaded) { renderUpdateBody(); return; }
+  state.updateLoaded = true;
+  await loadUpdate();
+}
+
+async function loadUpdate() {
+  var s = updateState();
+  try {
+    var data = await api('/update');
+    s.data = data;
+    s.error = null;
+  } catch (e) {
+    s.error = e && e.message ? e.message : String(e);
+  }
+  renderUpdateBody();
+}
+
+async function checkUpdateNow() {
+  var s = updateState();
+  if (s.checking) return;
+  s.checking = true;
+  renderUpdateBody();
+  try {
+    var data = await api('/update/check', { method: 'POST' });
+    s.data = data;
+    s.error = null;
+    state.updateLoaded = true;
+    if (data && data.error) toast('检查完成，但拉取版本信息失败', 'error');
+    else if (data && data.updateAvailable) toast('发现新版本 ' + data.latestVersion, 'success');
+    else toast('已是最新版本', 'success');
+  } catch (e) {
+    s.error = e && e.message ? e.message : String(e);
+    toast('检查更新失败：' + s.error, 'error');
+  } finally {
+    s.checking = false;
+    renderUpdateBody();
+  }
+}
+
+async function downloadVersion(version) {
+  var s = updateState();
+  if (s.busy) return;
+  s.busy = true;
+  renderUpdateBody();
+  try {
+    var res = await api('/update/download', { method: 'POST', body: JSON.stringify({ version: version }) });
+    toast('已下载 ' + ((res && res.version) || version) + (res && res.bytes ? '（' + fmtBytes(res.bytes) + '）' : ''), 'success');
+    await loadUpdate();
+  } catch (e) {
+    toast('下载失败：' + (e && e.message ? e.message : e), 'error');
+  } finally {
+    s.busy = false;
+    renderUpdateBody();
+  }
+}
+
+async function applyUpdate() {
+  var s = updateState();
+  if (s.busy) return;
+  s.busy = true;
+  s.pendingMsg = null;
+  renderUpdateBody();
+  try {
+    var res = await api('/update/apply', { method: 'POST' });
+    s.pendingMsg = { kind: 'apply', version: res && res.version, backupPath: res && res.backupPath };
+    toast('已替换 jar，请重启服务生效', 'success');
+  } catch (e) {
+    toast('应用更新失败：' + (e && e.message ? e.message : e), 'error');
+  } finally {
+    s.busy = false;
+    try { await loadUpdate(); } catch (ignored) { renderUpdateBody(); }
+  }
+}
+
+async function rollbackUpdate() {
+  var s = updateState();
+  if (s.busy) return;
+  s.busy = true;
+  s.pendingMsg = null;
+  renderUpdateBody();
+  try {
+    var res = await api('/update/rollback', { method: 'POST' });
+    s.pendingMsg = { kind: 'rollback', version: res && res.version };
+    toast('已回滚，请重启服务生效', 'success');
+  } catch (e) {
+    toast('回滚失败：' + (e && e.message ? e.message : e), 'error');
+  } finally {
+    s.busy = false;
+    try { await loadUpdate(); } catch (ignored) { renderUpdateBody(); }
+  }
 }
 
 /* ------------------------------------------------------------- render master */
@@ -2269,8 +2624,23 @@ function openDecision(kind, impactId) {
 
 function bindEvents() {
   document.addEventListener('click', function (ev) {
-    var el = ev.target.closest('[data-nav],[data-impact-id],[data-analysis-id],[data-source-id],[data-module],[data-change-id],[data-confirm-impact],[data-dismiss-impact],[data-open-impact],[data-close],[data-open-run],[data-tab],[data-filter],[data-pick-dir],[data-pk-dir],[data-pk-root],[data-delete-source],[data-background-analysis]');
+    var el = ev.target.closest('[data-nav],[data-impact-id],[data-analysis-id],[data-source-id],[data-module],[data-change-id],[data-confirm-impact],[data-dismiss-impact],[data-open-impact],[data-close],[data-open-run],[data-tab],[data-filter],[data-pick-dir],[data-pk-dir],[data-pk-root],[data-delete-source],[data-background-analysis],[data-update-check],[data-update-notes],[data-update-download],[data-update-apply],[data-update-rollback]');
     if (!el) return;
+
+    // Version & update actions live on the settings card; each one is a single async call
+    // that re-renders the card itself, so no other page needs to be refreshed here.
+    if (el.hasAttribute('data-update-check')) { checkUpdateNow(); return; }
+    if (el.hasAttribute('data-update-notes')) {
+      var notesKey = el.getAttribute('data-update-notes');
+      var expanded = updateState().expanded;
+      if (expanded[notesKey]) delete expanded[notesKey];
+      else expanded[notesKey] = true;
+      renderUpdateBody();
+      return;
+    }
+    if (el.hasAttribute('data-update-download')) { downloadVersion(el.getAttribute('data-update-download')); return; }
+    if (el.hasAttribute('data-update-apply')) { applyUpdate(); return; }
+    if (el.hasAttribute('data-update-rollback')) { rollbackUpdate(); return; }
 
     if (el.hasAttribute('data-delete-source')) {
       // The delete control sits inside a clickable row, so stop it from also selecting the source.

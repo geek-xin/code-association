@@ -484,6 +484,11 @@ REST 接口：
 | `POST` | `/api/analyses` | 提交分析（异步，立即返回 id） |
 | `GET` | `/api/analyses` `/api/analyses/{id}` | 历史与状态 |
 | `GET` | `/api/analyses/{id}/report` | 完整报告（未完成时返回 202） |
+| `GET` | `/api/update` | 当前版本、最新版本、历史版本列表 |
+| `POST` | `/api/update/check` | 强制向 GitHub 重新检查 |
+| `POST` | `/api/update/download` | 下载指定版本的 jar（校验后暂存） |
+| `POST` | `/api/update/apply` | 用暂存的 jar 替换当前 jar（备份旧的） |
+| `POST` | `/api/update/rollback` | 从备份回滚 |
 
 配置项（`application.yml`）：
 
@@ -495,6 +500,51 @@ code-association:
   max-files: 20000      # 单仓库解析文件上限
   max-depth: 8          # 影响传播最大深度
 ```
+
+---
+
+## 6.1 版本检查与自动更新
+
+服务会定时向 GitHub 查询 release，设置页能直接看到「当前版本 / 最新版本 / 历史版本」。
+**检查是自动的，替换 jar 需要你点确认**——让程序重启自己会让前端拿不到响应，
+把「什么时候中断服务」的决定权交给人更稳妥。
+
+```yaml
+code-association:
+  update:
+    enabled: true
+    repo: geek-xin/code-association
+    token: ${GITHUB_TOKEN:}      # 可选，见下方限流说明
+    check-interval-minutes: 360   # 6 小时
+    cron: "0 0 * * * *"           # 每小时一次定时检查（命中缓存时只读内存）
+    max-releases: 20              # 历史版本列表最多返回多少条
+    include-prerelease: false
+```
+
+**关于 GitHub 限流。** 未认证调用 `api.github.com` 每小时只有 60 次。默认 6 小时检查一次，
+一天 4 次，够用；但如果你频繁点「立即检查」，就会撞上 403。此时界面会明确提示是限流，
+并给出额度重置时间。设置 `GITHUB_TOKEN`（一个只读的 classic token 即可，不需要任何 scope）
+可把上限提到每小时 5000 次：
+
+```bash
+export GITHUB_TOKEN=ghp_xxx
+./start.sh
+```
+
+**更新流程。** 点「下载此版本」→ 下载到 `{data-dir}/updates/`，边下边算 SHA-256，
+下完再校验文件头确实是 jar（`PK\x03\x04`），不是就删掉并报错；然后点「应用更新」→
+当前 jar 先备份成 `<jar>.bak-<版本>`，再被新 jar 覆盖。**替换完不会自动重启**，
+界面会提示你执行 `./stop.sh && ./start.sh`（Windows 上是 `stop.bat` 再 `start.bat`）。
+
+三种情况下「应用更新」会被拒绝，并说明原因：
+
+| 情况 | 原因 |
+|---|---|
+| 在 IDE 里跑（不是 `java -jar`） | 没有可替换的 jar，CodeSource 不是文件 |
+| Windows | 运行中的 jar 被系统锁定，无法覆盖 |
+| 没先下载 | 没有暂存文件可应用 |
+
+回滚用同一套机制：`POST /api/update/rollback` 从最近的 `.bak-*` 恢复。
 
 ---
 

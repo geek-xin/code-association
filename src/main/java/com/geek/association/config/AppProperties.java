@@ -22,6 +22,9 @@ public class AppProperties {
     /** Daily proactive scan: analyse programs that received new commits. */
     private Schedule schedule = new Schedule();
 
+    /** Self-update from the project's GitHub releases. */
+    private Update update = new Update();
+
 
     public String getDataDir() {
         return dataDir;
@@ -61,6 +64,14 @@ public class AppProperties {
 
     public void setSchedule(Schedule schedule) {
         this.schedule = schedule;
+    }
+
+    public Update getUpdate() {
+        return update;
+    }
+
+    public void setUpdate(Update update) {
+        this.update = update;
     }
 
     public Path dataPath() {
@@ -122,6 +133,95 @@ public class AppProperties {
 
         public void setDirectoryRescanMinutes(int directoryRescanMinutes) {
             this.directoryRescanMinutes = directoryRescanMinutes;
+        }
+    }
+
+    /**
+     * Self-update settings.
+     *
+     * The update is fetched from GitHub releases because that is where release.sh already publishes
+     * the jars. It is on by default: an installation that never learns about a new version is the
+     * situation this feature exists to end. Everything it can reach is read-only until the operator
+     * explicitly downloads and applies.
+     */
+    public static class Update {
+        private boolean enabled = true;
+        /** GitHub repository in owner/repo form; the release list is read from its tags. */
+        private String repo = "geek-xin/code-association";
+        /**
+         * Optional GitHub token. Anonymous access is capped at 60 requests per hour per IP, which a
+         * UI that polls the status endpoint reaches quickly; a token raises it to 5000.
+         */
+        private String token = "";
+        /**
+         * How long a successful check is reused before asking GitHub again. Six hours keeps the
+         * status cheap while still noticing a release the same working day.
+         */
+        private int checkIntervalMinutes = 360;
+        /** Spring cron: second minute hour day-of-month month day-of-week. Default hourly. */
+        private String cron = "0 0 * * * *";
+        /** How many releases the history list returns; the API payload grows with this. */
+        private int maxReleases = 20;
+        /**
+         * Whether pre-releases are offered. Off by default: they are built for testing, and a
+         * half-finished build must not be presented as "the latest version".
+         */
+        private boolean includePrerelease = false;
+
+        public boolean isEnabled() {
+            return enabled;
+        }
+
+        public void setEnabled(boolean enabled) {
+            this.enabled = enabled;
+        }
+
+        public String getRepo() {
+            return repo;
+        }
+
+        public void setRepo(String repo) {
+            this.repo = repo;
+        }
+
+        public String getToken() {
+            return token;
+        }
+
+        public void setToken(String token) {
+            this.token = token;
+        }
+
+        public int getCheckIntervalMinutes() {
+            return checkIntervalMinutes;
+        }
+
+        public void setCheckIntervalMinutes(int checkIntervalMinutes) {
+            this.checkIntervalMinutes = checkIntervalMinutes;
+        }
+
+        public String getCron() {
+            return cron;
+        }
+
+        public void setCron(String cron) {
+            this.cron = cron;
+        }
+
+        public int getMaxReleases() {
+            return maxReleases;
+        }
+
+        public void setMaxReleases(int maxReleases) {
+            this.maxReleases = maxReleases;
+        }
+
+        public boolean isIncludePrerelease() {
+            return includePrerelease;
+        }
+
+        public void setIncludePrerelease(boolean includePrerelease) {
+            this.includePrerelease = includePrerelease;
         }
     }
 
