@@ -72,6 +72,17 @@ public class UpdateService {
     private final HttpClient downloadClient;
     private final Version runningVersion;
 
+    /**
+     * When this process started, in epoch millis.
+     *
+     * Reported to the UI so it can distinguish "the jar was replaced but you have not restarted
+     * yet" from "you already restarted": the running version cannot answer that, because a JVM
+     * keeps reporting the version it booted with no matter what is on disk. Epoch millis rather
+     * than an ISO string so it is directly comparable with the {@code swappedAt} returned by
+     * apply/rollback, without either side reinterpreting a timestamp format.
+     */
+    private final long startedAt = System.currentTimeMillis();
+
     /** Guards against two downloads or two applies running at the same time. */
     private final AtomicBoolean working = new AtomicBoolean(false);
 
@@ -160,6 +171,11 @@ public class UpdateService {
         out.put("enabled", update.isEnabled());
         out.put("repo", update.getRepo());
         out.put("currentVersion", runningVersion.toString());
+        // When this process started. The UI needs it to tell "the restart already happened" from
+        // "the file was swapped but you are still running the old code": comparing versions cannot
+        // answer that, because a process keeps reporting the version it booted with, and
+        // re-applying the version you already run would look identical to a completed restart.
+        out.put("startedAt", startedAt);
         out.put("latestVersion", latest == null ? null : latest.toString());
         out.put("updateAvailable", latest != null && latest.isNewerThan(runningVersion));
         out.put("checkedAt", checkedAt == null ? null : checkedAt.toString());
@@ -499,6 +515,10 @@ public class UpdateService {
             out.put("backupPath", backup.toAbsolutePath().toString());
             out.put("jarPath", jar.toAbsolutePath().toString());
             out.put("restartRequired", true);
+            // Epoch millis, not an ISO string: the client compares it against status().startedAt
+            // to decide whether the restart already happened, and two clocks formatted differently
+            // (fractional digits, time zones) must not decide that.
+            out.put("swappedAt", System.currentTimeMillis());
             return out;
         } finally {
             working.set(false);
@@ -542,6 +562,7 @@ public class UpdateService {
             out.put("version", backupVersion(jar, backup));
             out.put("jarPath", jar.toAbsolutePath().toString());
             out.put("restartRequired", true);
+            out.put("swappedAt", System.currentTimeMillis());
             return out;
         } finally {
             working.set(false);

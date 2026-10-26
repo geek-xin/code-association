@@ -1874,9 +1874,17 @@ function renderUpdateBody() {
   var html = '';
   // A successful apply/rollback only swaps the file on disk; the running process still serves
   // the old code, so the restart instruction has to stay visible instead of being a toast.
-  // Once the running version catches up with the version we applied, the restart already
-  // happened and the notice would be stale, so it is dropped instead of lingering all session.
-  if (s.pendingMsg && d.currentVersion === s.pendingMsg.version) s.pendingMsg = null;
+  //
+  // Clearing it is keyed on the process start time, not on the version: a JVM keeps reporting
+  // the version it booted with, so after applying a jar the running version can equal the
+  // applied one (re-applying what you already run) while the restart has not happened at all.
+  // Once the server reports a start time later than the swap, the restart really did happen.
+  // Both values are epoch millis produced by the server, so this comparison never mixes the
+  // browser's clock or timezone with the server's.
+  if (s.pendingMsg && d.startedAt != null && s.pendingMsg.swappedAt != null &&
+      Number(d.startedAt) > Number(s.pendingMsg.swappedAt)) {
+    s.pendingMsg = null;
+  }
   if (s.pendingMsg) {
     html += '<div class="callout brand" style="margin-bottom:14px">' + icon('i-check-circle') + '<div>' +
       '<strong>' + (s.pendingMsg.kind === 'rollback' ? '已回滚到 ' : '已替换为 ') +
@@ -1961,7 +1969,10 @@ async function applyUpdate() {
   renderUpdateBody();
   try {
     var res = await api('/update/apply', { method: 'POST' });
-    s.pendingMsg = { kind: 'apply', version: res && res.version, backupPath: res && res.backupPath };
+    // Remember when the swap happened (server clock): it is the only reliable
+    // "not restarted yet" signal, see the guard in renderUpdateBody().
+    s.pendingMsg = { kind: 'apply', version: res && res.version, backupPath: res && res.backupPath,
+                     swappedAt: res && res.swappedAt };
     toast('已替换 jar，请重启服务生效', 'success');
   } catch (e) {
     toast('应用更新失败：' + (e && e.message ? e.message : e), 'error');
@@ -1979,7 +1990,7 @@ async function rollbackUpdate() {
   renderUpdateBody();
   try {
     var res = await api('/update/rollback', { method: 'POST' });
-    s.pendingMsg = { kind: 'rollback', version: res && res.version };
+    s.pendingMsg = { kind: 'rollback', version: res && res.version, swappedAt: res && res.swappedAt };
     toast('已回滚，请重启服务生效', 'success');
   } catch (e) {
     toast('回滚失败：' + (e && e.message ? e.message : e), 'error');
