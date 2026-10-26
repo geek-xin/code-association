@@ -309,9 +309,12 @@ done
 # 独立 jar 必须是可运行的 Spring Boot 包（内含 BOOT-INF/），而不是普通的薄 jar。
 # 自动更新会把下载到的 jar 直接替换到运行位置，装错了服务就起不来。
 [ -f "$JARBALL" ] || die "缺少独立 jar 资产：$JARBALL"
-if ! unzip -Z1 "$JARBALL" 2>/dev/null | grep -qx "BOOT-INF/classes/com/geek/association/CodeAssociationApplication.class"; then
-  die "$(basename "$JARBALL") 不是可运行的 Spring Boot jar（缺少 BOOT-INF/classes/.../CodeAssociationApplication.class）"
-fi
+# 先把清单读进变量再 grep，不要写成 `unzip ... | grep -q`：
+# grep -q 命中后立即退出，unzip 收到 SIGPIPE 被杀，在 pipefail 下整条管道返回 141，
+# 于是「校验通过」会被误判成失败（这个坑在写这一行时真踩了一次）。
+JAR_LISTING="$(unzip -Z1 "$JARBALL" 2>/dev/null || true)"
+printf '%s\n' "$JAR_LISTING" | grep -qx "BOOT-INF/classes/com/geek/association/CodeAssociationApplication.class" \
+  || die "$(basename "$JARBALL") 不是可运行的 Spring Boot jar（缺少 BOOT-INF/classes/.../CodeAssociationApplication.class）"
 if [ "$(head -c 2 "$JARBALL")" != "PK" ]; then
   die "$(basename "$JARBALL") 不是 zip/jar 格式（自动更新会校验文件头，坏的进不去）"
 fi
