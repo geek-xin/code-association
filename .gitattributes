@@ -1,0 +1,21 @@
+# 换行符按「目标平台」固定，避免跨平台 checkout 把脚本弄坏。
+#
+#   .sh  → LF    CRLF 会让 bash 报 "$'\r': command not found"
+#   .ps1 → CRLF  Windows PowerShell 5.1 对 LF 结尾的脚本兼容性差
+#   .bat → CRLF  cmd.exe 解析 LF 结尾的 .bat 会出奇怪问题（尤其 goto/label）
+#
+# 只声明这几类文件，不使用 `* text=auto` 全量重规范化：
+# 那会在首次提交时产生整仓库的换行 diff，把真实改动淹没掉。
+*.sh    text eol=lf
+*.bash  text eol=lf
+*.ps1   text eol=crlf
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+
+# 二进制，禁止任何文本处理
+*.jar   binary
+*.png   binary
+*.jpg   binary
+*.gif   binary
+*.zip   binary
+*.gz    binary

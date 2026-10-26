@@ -3,9 +3,9 @@
 # release.sh — 构建、打包并发布 code-association 到 GitHub Release
 #
 # 用法:
-#   ./release.sh                  # 发布默认版本 0.2.1
-#   ./release.sh 0.3.0            # 发布指定版本
-#   VERSION=0.3.0 ./release.sh    # 同上（环境变量方式）
+#   ./release.sh                  # 发布默认版本 0.3.0
+#   ./release.sh 0.4.0            # 发布指定版本
+#   VERSION=0.4.0 ./release.sh    # 同上（环境变量方式）
 #
 # 产物:
 #   build/release/code-association-<version>/            # 干净的发布目录
@@ -14,9 +14,11 @@
 #
 # 流程:
 #   1. mvn -q -DskipTests package 构建 target/code-association.jar
-#   2. 组装干净目录：jar、start.sh、stop.sh、README.md、application.yml、INSTALL.md、docs/
-#   3. 生成 .tar.gz 与 .zip 两个压缩包
-#   4. 校验压缩包内确实包含 start.sh / stop.sh（缺失则直接失败）
+#   2. 组装干净目录：jar、start.sh / stop.sh（Linux·macOS）、
+#      start.ps1 / stop.ps1 / start.bat / stop.bat（Windows）、README.md、
+#      application.yml、INSTALL.md、docs/
+#   3. 生成 .tar.gz 与 .zip 两个压缩包（两者内容一致，Windows 用户用 zip）
+#   4. 校验压缩包内确实包含两个平台的启停脚本（缺失则直接失败）
 #   5. 创建或更新 tag 为 v<version> 的 GitHub Release，并上传两个资产
 #
 # 幂等性:
@@ -30,13 +32,15 @@
 #   —— 绝不能改成不带引号的 heredoc：那样 bash 会执行文档中反引号/$( ) 里的内容
 #      （曾经因此误执行过 ./start.sh 与 ./stop.sh）。
 #
-# 依赖: bash、mvn、tar、zip、unzip、gh（已登录）
+# 依赖: bash、mvn、tar、zip、unzip、gh（已登录）、git
+# 说明: 本脚本是「发布者」用的，只在开发机上跑，不随发布包分发，
+#       因此不必像 start.sh 那样做成跨平台（Linux/macOS 可跑，Windows 用 WSL/Git Bash）。
 set -euo pipefail
 
 cd "$(dirname "$0")"
 
 APP="code-association"
-VERSION="${1:-${VERSION:-0.2.1}}"
+VERSION="${1:-${VERSION:-0.3.0}}"
 TAG="v${VERSION}"
 RELEASE_ROOT="build/release"
 STAGE="${RELEASE_ROOT}/${APP}-${VERSION}"
@@ -113,7 +117,13 @@ mkdir -p "${STAGE}/target"
 
 cp "$JAR" "${STAGE}/target/${APP}.jar"
 # 脚本与文档同样取自构建所用的那棵树，保证「包内所有文件都对应同一个提交」
-cp "${SRC_DIR}/start.sh" "${SRC_DIR}/stop.sh" "${SRC_DIR}/README.md" "$STAGE/"
+# 两个平台的启停脚本都进同一个包：tar.gz 与 zip 内容完全一致，
+# Windows 用户用 zip 解压后跑 start.bat，Linux / macOS 用户跑 ./start.sh。
+for f in start.sh stop.sh start.ps1 stop.ps1 start.bat stop.bat; do
+  [ -f "${SRC_DIR}/$f" ] || die "源码树缺少 $f（两个平台的启停脚本都必须存在）"
+  cp "${SRC_DIR}/$f" "$STAGE/"
+done
+cp "${SRC_DIR}/README.md" "$STAGE/"
 # 示例配置：与 jar 内置默认配置同源，用户可修改后通过 --spring.config.location 覆盖
 cp "${SRC_DIR}/src/main/resources/application.yml" "${STAGE}/application.yml"
 if [ -d "${SRC_DIR}/docs" ]; then cp -R "${SRC_DIR}/docs" "${STAGE}/docs"; fi
@@ -125,39 +135,85 @@ cat > "${STAGE}/INSTALL.md" <<'INSTALL_TEMPLATE'
 ## 环境要求
 
 - JDK 21+（`java -version` 确认）
-- 默认监听端口 9996（可用 `./start.sh 8080` 或 `PORT=8080 ./start.sh` 修改）
+- 默认监听端口 9996
+- 支持 Linux、macOS、Windows 三个平台，启动脚本随平台分别提供
 
 ## 目录说明
 
 ```
 @@APP@@-@@VERSION@@/
-├── target/@@APP@@.jar     # Spring Boot 可执行 jar（start.sh 默认加载此路径）
-├── start.sh               # 启动脚本（后台运行 + 健康检查）
-├── stop.sh                # 停止脚本（优雅停止并等待端口释放）
+├── target/@@APP@@.jar     # Spring Boot 可执行 jar（各启动脚本默认加载此路径）
+├── start.sh  / stop.sh    # Linux / macOS 启停脚本（bash）
+├── start.bat / stop.bat   # Windows 启停脚本（双击或命令行执行，内部调用 .ps1）
+├── start.ps1 / stop.ps1   # Windows 启停脚本（PowerShell 实现）
 ├── application.yml        # 示例配置（可修改后通过启动参数覆盖）
 ├── README.md              # 项目说明
 ├── docs/                  # 截图等文档
 └── INSTALL.md             # 本文件
 ```
 
-包内保持与源码仓库一致的 `target/` 目录结构，因此 start.sh / stop.sh 无需任何修改即可直接使用。
+两个平台的脚本读同一份 `target/@@APP@@.jar`，可以混着用（例如先在 Linux 上跑，把整个目录拷到 Windows 继续跑）；
+但它们操作的是同一个 pid 文件与同一个端口，同一时间只应该有一个实例。
 
 ## 快速开始
+
+### Linux / macOS
 
 ```bash
 tar -xzf @@APP@@-@@VERSION@@.tar.gz      # 或 unzip @@APP@@-@@VERSION@@.zip
 cd @@APP@@-@@VERSION@@
 chmod +x start.sh stop.sh
 ./start.sh                # 默认 9996 端口
+./start.sh 8080           # 指定端口
+PORT=8080 ./start.sh      # 同上，环境变量方式
 curl http://127.0.0.1:9996/api/health
-./stop.sh
+./stop.sh                 # 停止（默认 9996 端口）
+./stop.sh 8080            # 停止 8080 上的实例
+```
+
+脚本不硬依赖 `python3` / `lsof` / `pgrep` / `seq` / `curl`：每一项都会先探测本机有什么，
+再选可用的实现。Linux 上优先用 `setsid` 脱离终端，macOS（没有 `setsid`）用 `python3` 兜底，
+两者都没有时退化为 `nohup` 并提示「关闭终端可能带走服务」。
+
+### Windows
+
+```bat
+:: 解压 zip 后，在解压出来的目录里执行
+start.bat                 :: 默认 9996 端口
+start.bat 8080            :: 指定端口
+stop.bat                  :: 停止
+stop.bat 8080             :: 停止 8080 上的实例
+```
+
+也可以直接用 PowerShell（参数同名）：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\start.ps1 -Port 8080
+powershell -NoProfile -ExecutionPolicy Bypass -File .\stop.ps1 -Port 8080
+```
+
+`start.bat` / `stop.bat` 只是薄封装，会自动带 `-ExecutionPolicy Bypass`，
+所以即使系统策略禁止运行脚本也能用，不需要改注册表。
+Windows 上 `start.ps1` 以隐藏窗口在后台启动 java，stdout / stderr 分别重定向到
+`code-association.log` / `code-association.err.log`（句柄由 java 直接持有，脚本退出后照常写入），
+并把反查到的真实 java 进程 PID 写入 `.code-association.pid`。
+
+### 前台运行（三平台通用，调试用）
+
+```bash
+java -jar target/@@APP@@.jar --server.port=9996
 ```
 
 ## 运行时文件（不随包发布）
 
-- `.code-association/`：默认数据目录（可用 `DATA_DIR=/path ./start.sh` 修改）
-- `code-association.log`：运行日志（可用 `LOG_FILE=/path/log ./start.sh` 修改）
-- `.code-association.pid`：进程号文件，start.sh 写入、stop.sh 清理
+| 文件 | 用途 | 覆盖方式 |
+| --- | --- | --- |
+| `.code-association/` | 默认数据目录（SQLite、克隆的仓库） | `DATA_DIR=/path`（Windows：`set DATA_DIR=D:\path`） |
+| `code-association.log` | 运行日志 | `LOG_FILE=/path/log`（Windows 同理） |
+| `.code-association.pid` | 进程号文件，启动脚本写入、停止脚本清理 | 不建议手工修改 |
+
+> Windows 上的 `start.ps1` 会把 stderr 单独写到 `code-association.err.log`，
+> 便于区分启动期错误与正常日志；两个文件都在启动时被截断重写。
 
 ## 每日自动扫描（schedule）
 
@@ -206,8 +262,9 @@ render "${STAGE}/INSTALL.md"
 # 统一包内权限：源文件权限可能是 600/711，直接打包会让别人无法读取
 find "$STAGE" -type d -exec chmod 755 {} +
 find "$STAGE" -type f -exec chmod 644 {} +
-# 包内脚本必须可执行
+# 包内脚本必须可执行（.ps1 / .bat 在 Windows 上不看这个位，但保持一致也无害）
 chmod 755 "${STAGE}/start.sh" "${STAGE}/stop.sh"
+chmod 644 "${STAGE}/start.ps1" "${STAGE}/stop.ps1" "${STAGE}/start.bat" "${STAGE}/stop.bat"
 
 # ---------- 3. 生成压缩包 ----------
 mkdir -p "$RELEASE_ROOT"
@@ -229,14 +286,15 @@ for archive in "$TARBALL" "$ZIPBALL"; do
     *) die "未知压缩格式: $archive" ;;
   esac
 
-  for entry in start.sh stop.sh; do
+  # 两个平台的启停脚本都必须进包：Linux/macOS 用 .sh，Windows 用 .bat/.ps1
+  for entry in start.sh stop.sh start.ps1 stop.ps1 start.bat stop.bat; do
     printf '%s\n' "$LISTING" | grep -qx "${APP}-${VERSION}/${entry}" \
       || die "$(basename "$archive") 中缺少 ${APP}-${VERSION}/${entry}"
   done
   printf '%s\n' "$LISTING" | grep -qx "${APP}-${VERSION}/target/${APP}.jar" \
     || die "$(basename "$archive") 中缺少 ${APP}-${VERSION}/target/${APP}.jar"
 
-  echo "    OK  $(basename "$archive")：start.sh / stop.sh / target/${APP}.jar 均在 ${APP}-${VERSION}/ 下"
+  echo "    OK  $(basename "$archive")：start.sh / stop.sh / start.ps1 / stop.ps1 / start.bat / stop.bat / target/${APP}.jar 均在 ${APP}-${VERSION}/ 下"
 done
 
 # 配置必须带上每日扫描（schedule）配置块，否则打包出来的示例配置是旧的
@@ -246,49 +304,89 @@ grep -q 'cron: "0 30 2 \* \* \*"' "${STAGE}/application.yml" \
   || die "包内 application.yml 的 schedule.cron 不是预期的每日 02:30"
 echo "    OK  包内 application.yml 含 schedule 配置块（默认 02:30）"
 
+# Windows 脚本的编码是硬约束：PowerShell 5.1 会把无 BOM 的文件按 ANSI 解码，
+# 中文注释会变成乱码甚至导致语法错误；.bat 则要避开代码页问题，必须是纯 ASCII。
+# 这里在发布前用字节级检查兜底，避免把坏文件发出去。
+for f in start.ps1 stop.ps1; do
+  head -c 3 "${STAGE}/$f" | od -An -tx1 | tr -d ' \n' | grep -qx 'efbbbf' \
+    || die "包内 $f 缺少 UTF-8 BOM（Windows PowerShell 5.1 会按 ANSI 解码导致乱码）"
+done
+for f in start.bat stop.bat; do
+  # 用 tr 删掉全部 ASCII 字节，剩下的若不为空就说明有非 ASCII 字符
+  if [ -n "$(LC_ALL=C tr -d '\000-\177' < "${STAGE}/$f")" ]; then
+    die "包内 $f 含非 ASCII 字符（bat 必须纯 ASCII，否则中文代码页下会乱码）"
+  fi
+done
+for f in start.ps1 stop.ps1 start.bat stop.bat; do
+  if ! grep -q $'\r' "${STAGE}/$f"; then
+    die "包内 $f 不是 CRLF 换行（Windows 记事本/旧版 PowerShell 会出问题）"
+  fi
+done
+echo "    OK  包内 Windows 脚本编码正确（ps1 带 BOM、bat 纯 ASCII、均为 CRLF）"
+
 # ---------- 5. 发布到 GitHub Release ----------
+# 打包自检：SKIP_PUBLISH=1 时只构建并校验压缩包，不碰远端。
+# 用途是验证「包内容对不对」，避免为了看一眼包而真的发一个 Release 出去。
 cat > "$NOTES" <<'NOTES_TEMPLATE'
 ## @@APP@@ @@VERSION@@
 
 跨程序变更影响扫描工具（Java / Maven 多模块仓库）：分析一次提交改动了哪些类、方法、SQL、MQ 消息结构，
 并推导出对其他模块 / 服务的连带影响与风险等级。
 
-### 本次修复（0.2.1）
+### 本次重点：启动脚本适配 Windows 与 Linux
 
-0.2.0 的每日扫描有几个实质问题，本次全部修复：
+此前只有一套 macOS 风格的 `start.sh` / `stop.sh`，Linux 与 Windows 用户都要自己想办法。
+0.3.0 把启动/停止能力补齐到三个平台，**jar 本身完全不变，只换了外壳脚本**。
 
-- **提交持久化（关键）**：分析结束时保存 `base_commit` / `head_commit`。此前不保存，
-  扫描无法区分「这个提交已经分析过」和「从未分析过」，导致**每个程序每天都被重新分析一遍**。
-- **零宽限恢复**：`recoverStaleAnalyses(0)` 现在表示「全部」，不再被当成「1 分钟前」，
-  避免刚产生的中断记录一直停留在 RUNNING。
-- **位置缺失保护**：源目录已不存在时跳过并给出原因（「位置不可访问」），不再每个周期重试失败。
-- **列表查询提速**：`analyses()` / `analysesOfSource()` 不再 SELECT 报告正文
-  （单个报告约 7MB，`/api/analyses` 曾超时 >60s，现约 21ms）。
-- 新增 `ScheduledScanTest`（4 个用例）：扫描 / 跳过 / 位置缺失 / 孤儿恢复。
+#### Linux / macOS：同一套 `start.sh` / `stop.sh`
 
-实测：扫描耗时 70s，结果 scanned 0 / skipped 4（3 个「没有新提交」+ 1 个「位置不可访问」）；
-修复前是每次都 scanned 4 / skipped 0。
+原来 macOS 专用的问题有两个：靠 `python3` 做 `setsid` + 双 fork 脱离终端，
+以及靠 `lsof` 反查监听 PID。现在改成逐项探测、按可用性降级：
 
-### 每日自动扫描
+| 能力 | Linux | macOS | 都没有时 |
+| --- | --- | --- | --- |
+| 脱离终端 | `setsid` | `python3` 双 fork | `nohup` 后台 + 明确提示 |
+| 健康检查 | `curl` | `curl` | bash `/dev/tcp` 探测 |
+| 找监听 PID | `lsof` / `ss` / `netstat -tlnp` | `lsof` | 记录的 `$!` 或命令行匹配 |
+| 停止兜底 | pid 文件 → 端口 → 命令行 | 同左 | 同左 |
 
-- 每天 **02:30** 自动检查所有程序，只分析有新提交的那些，无需人工触发。
-  由 `code-association.schedule.*` 控制（`enabled` / `cron` / `run-on-startup` /
-  `max-programs-per-run` / `directory-rescan-minutes`）。
-- 手动触发一次扫描：`curl -X POST http://127.0.0.1:9996/api/schedule/run`；
-  查看调度状态（下次执行时间、是否运行中、上次结果）：`curl http://127.0.0.1:9996/api/schedule`。
-- 影响范围**仅跨程序（peer-only）**，不把本地自身影响计入结果。
+同时去掉了对 `seq` 的依赖（改用 bash 算术循环），保留 bash 3.2 兼容（macOS 自带的就是 3.2）。
+原有语义不变：已在运行则拒绝启动、启动失败打印日志尾部并非 0 退出、
+停止要等端口真正释放才返回（避免紧接着启动撞端口）。
+
+#### Windows：新增 `start.bat` / `stop.bat` / `start.ps1` / `stop.ps1`
+
+- 双击或用命令行执行 `start.bat` 即可，`.bat` 只是薄封装，
+  自动带 `-ExecutionPolicy Bypass` 调用 `.ps1`，**不需要改系统执行策略**。
+- 以隐藏窗口在后台启动 java：`Start-Process` 拉起一个 `cmd /c` 外壳，由 cmd 的重定向把
+  `code-association.log` / `code-association.err.log` 的文件句柄直接交给 java。
+  这样脚本退出后日志照常写入（`Start-Process -RedirectStandardOutput` 在 5.1 上是管道实现，
+  读端在脚本手里，脚本一退日志就冻结，所以没有采用）。
+  启动完成后按端口反查真实 java 进程 PID 写入 `.code-association.pid`。
+- 停止：pid 文件 → `Get-NetTCPConnection` 按端口反查 → 命令行匹配 `code-association.jar` 兜底，
+  先优雅停止再强制，最后等端口释放。
+- 参数契约与 POSIX 版对齐：`start.bat 8080` / `-Port 8080` / 环境变量 `PORT`、`DATA_DIR`、`LOG_FILE`。
+- 编码按 Windows 的坑处理：`.ps1` 是 **UTF-8 with BOM**（PowerShell 5.1 会按 ANSI 解码无 BOM 文件，
+  中文会乱码甚至语法报错），`.bat` 是**纯 ASCII**（避开代码页问题），全部 **CRLF**。
+  发布脚本里有字节级校验，坏文件进不了发布包。
+
+> 诚实说明：Linux 路径已在 Linux 上验证；Windows 脚本在 macOS 上只做了静态审查与字节级编码校验，
+> **没有在真实 Windows 机器上跑过**。第一次在 Windows 使用若遇到问题，请带日志提 issue。
 
 ### 下载
 
 | 文件 | 说明 |
 | --- | --- |
+| `@@APP@@-@@VERSION@@.zip` | **Windows 推荐**（Windows 自带解压即可，保留 CRLF） |
 | `@@APP@@-@@VERSION@@.tar.gz` | Linux / macOS 推荐 |
-| `@@APP@@-@@VERSION@@.zip` | 通用格式（Windows / 通用） |
 
-两个包内容一致，均包含：可执行 jar（`target/@@APP@@.jar`）、`start.sh`、`stop.sh`、
+两个包内容完全一致，均包含：可执行 jar（`target/@@APP@@.jar`）、
+`start.sh` / `stop.sh`、`start.bat` / `stop.bat` / `start.ps1` / `stop.ps1`、
 `application.yml` 示例配置、`README.md`、`docs/` 与 `INSTALL.md`。
 
 ### 运行
+
+**Linux / macOS**
 
 ```bash
 tar -xzf @@APP@@-@@VERSION@@.tar.gz   # 或 unzip @@APP@@-@@VERSION@@.zip
@@ -298,9 +396,34 @@ chmod +x start.sh stop.sh
 ./stop.sh
 ```
 
+**Windows**
+
+```bat
+:: 解压 zip，进入解压目录
+start.bat                           :: 默认 http://127.0.0.1:9996
+stop.bat
+```
+
 需要 JDK 21+。详见包内 `INSTALL.md`。
+
+### 其他
+
+- `release.sh` 现在会把两个平台的启停脚本一起打进包，并在发布前校验：
+  六个脚本是否都在包里、`.ps1` 是否带 BOM、`.bat` 是否纯 ASCII、是否 CRLF。
+- `CHANGELOG.md`、`README.md`、`INSTALL.md` 补充了跨平台说明。
 NOTES_TEMPLATE
 render "$NOTES"
+
+# 只验包不发布：本地产物与校验都已完成，到这里直接收尾
+if [ "${SKIP_PUBLISH:-0}" = "1" ]; then
+  echo
+  echo "SKIP_PUBLISH=1：已完成构建、打包与全部校验，跳过 GitHub 发布。"
+  echo "  发布目录: $STAGE"
+  echo "  tar.gz:   $TARBALL"
+  echo "  zip:      $ZIPBALL"
+  echo "  Release 说明草稿: $NOTES"
+  exit 0
+fi
 
 log "发布 GitHub Release: $TAG"
 if gh release view "$TAG" >/dev/null 2>&1; then

@@ -28,7 +28,7 @@
 ## 目录
 
 - [1. 它到底做了什么](#1-它到底做了什么)
-- [2. 快速开始](#2-快速开始)
+- [2. 快速开始](#2-快速开始)（[Linux / macOS](#21-linux--macos) · [Windows](#22-windows)）
 - [3. 命令行 / CI 集成](#3-命令行--ci-集成)
 - [4. 分析引擎是怎么工作的](#4-分析引擎是怎么工作的)
 - [5. 界面](#5-界面)
@@ -81,17 +81,42 @@ log.info("audit active={}", active);
 
 ## 2. 快速开始
 
+需要 JDK 21+，Linux / macOS / Windows 三平台都支持。
+
+### 2.1 Linux / macOS
+
 ```bash
-# 需要 JDK 21+
 mvn -q -DskipTests package
 
 ./start.sh          # 后台启动，默认 http://127.0.0.1:9996
 ./start.sh 8080     # 指定端口
+PORT=8080 ./start.sh  # 同上，环境变量方式
 ./stop.sh           # 停止
+./stop.sh 8080      # 停止 8080 上的实例
 ```
 
-`start.sh` 用 `nohup` 把进程从当前 shell 脱离（PPID=1），关闭终端不会带走服务；
-日志写到 `code-association.log`，PID 写到 `.code-association.pid`。也可以前台直接运行：
+`start.sh` 会把进程从当前 shell 完全脱离（PPID=1、独立进程组），关掉终端不会带走服务；
+日志写到 `code-association.log`，PID 写到 `.code-association.pid`。
+脱离方式按平台自动选择：Linux 用 `setsid`，macOS 没有 `setsid` 时用 `python3` 双 fork，
+两者都没有则退化为 `nohup` 并提示。同理，健康检查与查监听进程也不硬依赖 `curl` / `lsof`，
+见 [INSTALL.md](INSTALL.md) 的兼容表。
+
+### 2.2 Windows
+
+```bat
+mvn -q -DskipTests package
+
+start.bat           :: 后台启动，默认 http://127.0.0.1:9996
+start.bat 8080      :: 指定端口
+stop.bat            :: 停止
+```
+
+`start.bat` / `stop.bat` 是薄封装，内部带 `-ExecutionPolicy Bypass` 调用同目录的
+`start.ps1` / `stop.ps1`，所以**不需要修改系统的 PowerShell 执行策略**。
+Windows 上以隐藏窗口后台启动，日志写到 `code-association.log`，
+启动期错误单独写到 `code-association.err.log`。
+
+### 2.3 前台运行（调试用，三平台通用）
 
 ```bash
 java -jar target/code-association.jar --server.port=9996
@@ -99,7 +124,7 @@ java -jar target/code-association.jar --server.port=9996
 
 界面里：右上角「新建分析」→ 选择代码源与分析模式 → 开始分析。首次使用先在「代码源」页导入项目。
 
-### 2.1 三种分析模式
+### 2.4 三种分析模式
 
 | 模式 | 含义 | 典型场景 |
 |---|---|---|
@@ -109,7 +134,7 @@ java -jar target/code-association.jar --server.port=9996
 
 不填基线时，`GIT_DIFF` 自动取目标提交的父提交（即"最近一次提交改了什么"）。
 
-### 2.2 来源类型
+### 2.5 来源类型
 
 | 类型 | 位置写法 | 说明 |
 |---|---|---|
@@ -518,8 +543,32 @@ src/test/java/               62 个用例，按关注点分组（见第 10 节�
 
 docs/wiki/                   深度文档：核心概念 · 契约匹配 · 评分模型 · 架构 · 排错
 .github/                     Issue 模板与 PR 模板
-release.sh                   打包并发布 tar.gz / zip 到 GitHub Release
+start.sh / stop.sh           Linux · macOS 启停脚本（bash，逐项探测可用工具）
+start.ps1 / stop.ps1         Windows 启停脚本（PowerShell 实现）
+start.bat / stop.bat         Windows 薄封装（自带 -ExecutionPolicy Bypass）
+release.sh                   打包并发布 tar.gz / zip 到 GitHub Release（含两个平台脚本）
 ```
+
+### 8.1 启动脚本的平台适配
+
+同一个 jar、同一份数据目录，三个平台各有对应的启停脚本，参数契约完全一致：
+
+| 平台 | 启动 | 停止 | 端口参数 |
+|---|---|---|---|
+| Linux / macOS | `./start.sh` | `./stop.sh` | `./start.sh 8080` · `PORT=8080` |
+| Windows | `start.bat` | `stop.bat` | `start.bat 8080` · `-Port 8080` · `set PORT=8080` |
+
+`start.sh` / `stop.sh` 不硬依赖任何单一工具，缺什么就换实现：
+
+| 能力 | 首选 | 备选 | 都没有 |
+|---|---|---|---|
+| 脱离终端 | `setsid`（Linux） | `python3` 双 fork（macOS） | `nohup` + 提示 |
+| 健康检查 | `curl` | bash `/dev/tcp` | 纯 sleep 轮询 |
+| 查监听 PID | `lsof` | `ss` / `netstat -tlnp` | 记录的 `$!` / 命令行匹配 |
+
+Windows 侧以隐藏窗口后台启动，`.ps1` 保存为 UTF-8 with BOM、
+`.bat` 为纯 ASCII、统一 CRLF —— PowerShell 5.1 会按 ANSI 解码无 BOM 文件，
+不这样处理中文注释会乱码甚至语法报错。发布脚本对这些编码做了字节级校验。
 
 ---
 
@@ -585,6 +634,10 @@ mvn -q -DskipTests package
 
 新增分析能力时，请同时补一个用例：引擎的每一条传播规则都应当有可复现的断言，
 否则"这次改动为什么不影响对方"无法被验证。
+
+改动启停脚本时请注意：`start.sh` / `stop.sh` 必须同时能在 Linux 与 macOS 跑，
+Windows 的 `start.ps1` / `stop.ps1` 保持 UTF-8 BOM + CRLF、`start.bat` / `stop.bat` 保持纯 ASCII + CRLF。
+`release.sh` 会在发布前校验这些编码约束，改坏了会直接失败而不是发出坏包。
 
 ## 12. 许可证
 
