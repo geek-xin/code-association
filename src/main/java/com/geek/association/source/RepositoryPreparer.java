@@ -5,6 +5,8 @@ import com.geek.association.model.RepoSource;
 import com.geek.association.util.Texts;
 import org.eclipse.jgit.lib.ObjectId;
 import org.eclipse.jgit.lib.Repository;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
 import java.io.IOException;
@@ -22,6 +24,8 @@ import java.util.Map;
  */
 @Component
 public class RepositoryPreparer {
+
+    private static final Logger log = LoggerFactory.getLogger(RepositoryPreparer.class);
 
     private final AppProperties properties;
 
@@ -389,8 +393,12 @@ public class RepositoryPreparer {
             return out;
         }
         if (isRemote(normalizedType)) {
+            long started = System.nanoTime();
+            String masked = GitSupport.maskCredentials(location);
             try {
                 String token = Texts.isBlank(credentialEnv) ? null : System.getenv(credentialEnv);
+                log.debug("refs lookup for {} (credential env: {})",
+                        masked, Texts.isBlank(credentialEnv) ? "none" : credentialEnv);
                 java.util.Collection<org.eclipse.jgit.lib.Ref> refs =
                         GitSupport.lsRemote(GitSupport.withCredentials(location, token), token);
                 List<String> branches = new java.util.ArrayList<>();
@@ -410,11 +418,21 @@ public class RepositoryPreparer {
                 out.put("defaultRef", branches.contains("main") ? "main"
                         : branches.contains("master") ? "master"
                         : branches.isEmpty() ? "" : branches.get(0));
+                log.debug("refs lookup for {} found {} branches, {} tags in {} ms",
+                        masked, branches.size(), tags.size(), elapsedMillis(started));
                 return out;
             } catch (IOException | RuntimeException e) {
                 // A form field cannot show a stack trace; keep the reason but phrase it for people.
-                out.put("note", "无法读取远程分支，请检查地址、网络或凭据");
-                out.put("detail", e.getMessage());
+                // The log keeps the full cause chain, because the UI detail is one short sentence and
+                // "why did the same URL work yesterday" is only answerable from the chain.
+                String cause = GitSupport.describe(e);
+                log.warn("refs lookup for {} failed after {} ms: {}",
+                        masked, elapsedMillis(started), cause);
+                out.put("note", refsFailureNote(cause));
+                // The URL that failed may carry a token (https://oauth2:<token>@host/...), so the
+                // detail is masked before it reaches the browser or any saved response.
+                out.put("detail", GitSupport.maskCredentials(
+                        e.getMessage() == null ? cause : e.getMessage()));
                 return out;
             }
         }
@@ -523,6 +541,53 @@ public class RepositoryPreparer {
         }
     }
 
+    private static long elapsedMillis(long startedNanos) {
+        return (System.nanoTime() - startedNanos) / 1_000_000L;
+    }
+
+    /**
+     * Turns a transport failure into the one sentence the branch dropdown can show.
+     *
+     * "Check the address, network or credentials" covers three very different fixes and leaves the
+     * user guessing. The cause chain usually names which one it is, so name it here instead.
+     */
+    static String refsFailureNote(String cause) {
+        String c = Texts.lower(cause);
+        // SSH URLs deserve their own answer: the JGit distribution this service ships has no SSH
+        // transport, so git@host:group/repo.git fails inside JGit with a null SshSessionFactory and
+        // reads like a network problem. GitLab hands out exactly that URL in its clone box, so this
+        // is the mistake people actually make.
+        if (c.contains("sshsessionfactory") || c.contains("ssh://")
+                || c.contains("git@") || c.contains("ssh not supported")) {
+            return "不支持 SSH 地址：请改用 https 形式，例如 https://gitlab.com/group/repo.git";
+        }
+        // "URI not supported" means the host was given without a repository path.
+        if (c.contains("uri not supported")) {
+            return "地址不完整：请填到仓库一级，例如 https://gitlab.com/group/repo.git";
+        }
+        if (c.contains("timeout") || c.contains("timed out") || c.contains("read timed out")) {
+            return "读取远程分支超时：网络到 GitLab/GitHub 太慢或不可达，可稍后重试";
+        }
+        if (c.contains("authentication") || c.contains("not authorized")
+                || c.contains("401") || c.contains("403")) {
+            return "远程仓库需要认证：请确认地址正确，私有仓库还要配置有效的凭据环境变量";
+        }
+        if (c.contains("not found") || c.contains("404") || c.contains("repository does not exist")) {
+            return "远程仓库不存在或无权访问：请检查地址拼写、命名空间与仓库名";
+        }
+        if (c.contains("unknownhost") || c.contains("unable to resolve")
+                || c.contains("connection refused") || c.contains("connect timed out")) {
+            return "无法连接远程主机：请检查网络、代理或主机名";
+        }
+        if (c.contains("ssl") || c.contains("certificate")) {
+            return "TLS 证书校验失败：请检查代理设置或系统证书";
+        }
+        if (c.contains("hung up") || c.contains("connection reset")) {
+            return "连接被远程中断：地址可能不完整，或代理拦截了 Git 协议";
+        }
+        return "无法读取远程分支，请检查地址、网络或凭据";
+    }
+
     /** True when the source has a git history at all, i.e. a commit can be compared. */
     public boolean isVersioned(RepoSource source) {
         String type = source.type == null ? "LOCAL_DIR" : source.type.toUpperCase();
@@ -552,8 +617,11 @@ public class RepositoryPreparer {
             if (isRemote(type)) {
                 try {
                     GitSupport.fetchAll(repo, token);
-                } catch (IOException ignored) {
-                    // offline: report whatever the cache already has
+                } catch (IOException e) {
+                    // offline: report whatever the cache already has. Worth a log line, because a
+                    // stale ref list looks like a bug in this application until you know the fetch failed.
+                    log.warn("refs of {} served from the cache, refresh failed: {}",
+                            source.name, GitSupport.describe(e));
                 }
             }
             List<String> branches = new java.util.ArrayList<>();

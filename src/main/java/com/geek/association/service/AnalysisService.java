@@ -14,10 +14,13 @@ import com.geek.association.parse.CodeIndexer;
 import com.geek.association.report.AiExplainer;
 import com.geek.association.report.ImpactReport;
 import com.geek.association.report.ReportBuilder;
+import com.geek.association.source.GitSupport;
 import com.geek.association.source.RepositoryPreparer;
 import com.geek.association.source.RevisionPair;
 import com.geek.association.store.Store;
 import com.geek.association.util.Json;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
@@ -34,6 +37,8 @@ import java.util.concurrent.atomic.AtomicInteger;
  */
 @Service
 public class AnalysisService {
+
+    private static final Logger log = LoggerFactory.getLogger(AnalysisService.class);
 
     private final Store store;
     private final AppProperties properties;
@@ -287,6 +292,11 @@ public class AnalysisService {
                         .analyze(changes, headIndex, peerIndex, peerInfo, firstImpactId));
             } catch (Exception e) {
                 peerInfo.note = "无法读取该程序：" + messageOf(e);
+                // The report only carries one sentence; the log keeps the transport cause chain so
+                // "why could this program not be read" is answerable after the fact.
+                log.warn("peer {} ({}) could not be read: {}",
+                        peerSource.name, GitSupport.maskCredentials(peerSource.location),
+                        GitSupport.describe(e));
                 out.add(peerInfo);
             }
         }
