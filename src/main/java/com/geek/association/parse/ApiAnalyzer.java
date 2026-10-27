@@ -7,6 +7,7 @@ import com.geek.association.model.TypeInfo;
 import com.geek.association.source.FileSource;
 import com.geek.association.util.Hashes;
 
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -25,15 +26,39 @@ public class ApiAnalyzer {
     /** A placeholder after normalizePath has run, i.e. the empty form {@code {}}. */
     private static final Pattern NORMALIZED_VARIABLE = Pattern.compile("\\{[^}]*}");
     private static final Pattern URL_LITERAL = Pattern.compile("\"(/[^\"\\s]*)\"");
+    /** 请求体参数的类型：原先在 requestBodyType 里每次调用都 compile 一遍。 */
+    private static final Pattern REQUEST_BODY_TYPE = Pattern.compile(
+            "@RequestBody\\s+(?:final\\s+)?([A-Za-z_][\\w.<>,\\[\\] ?]*)");
+    /** Feign 注解里的 path 属性。 */
+    private static final Pattern FEIGN_PATH = Pattern.compile("path\\s*=\\s*\"([^\"]*)\"");
+    /** OpenAPI 文档里的顶层路径行。 */
+    private static final Pattern OPENAPI_PATH = Pattern.compile("^\\s{2}(/[^:\\s]+)\\s*:", Pattern.MULTILINE);
 
     private final FileSource source;
     private final CodeIndex index;
     private final MavenParser maven;
+    /**
+     * 建一次、全程复用。
+     *
+     * TypeResolver 的构造函数会遍历全部类型重建继承体系，代价 O(类型数)；
+     * 而类型链接在每个 controller 方法的每个参数/返回值上都要解析一次名字。
+     * 之前每次 addTypeLink 都 new 一个，等于把"每处类型链接"变成 O(类型数)，
+     * 在模块代码量大时是明确的平方级开销。继承体系在一次分析内不会变，共享实例是安全的。
+     */
+    private final TypeResolver typeResolver;
+    /** 同一文件的按方法片段都从这里取行数组，避免每个方法重新切分整个文件。 */
+    private final SourceLines lines = new SourceLines();
+    /**
+     * 注解取值用的正则按注解名缓存：注解名只有有限几个（6 个 Spring mapping + FeignClient），
+     * 而这段代码在"每个 controller 方法"上都会跑一次，原先每次都重新编译。
+     */
+    private final Map<String, Pattern> annotationValuePatterns = new HashMap<>();
 
     public ApiAnalyzer(FileSource source, CodeIndex index, MavenParser maven) {
         this.source = source;
         this.index = index;
         this.maven = maven;
+        this.typeResolver = new TypeResolver(index);
     }
 
     public void analyze() {
@@ -60,7 +85,7 @@ public class ApiAnalyzer {
             if (!type.annotations.contains(annotation)) {
                 continue;
             }
-            String value = JavaIndexer.stripQuotes(firstAnnotationValue(content, annotation, type.startLine));
+            String value = JavaIndexer.stripQuotes(firstAnnotationValue(type.filePath, content, annotation, type.startLine));
             basePath = normalizePath(value);
             break;
         }
@@ -77,7 +102,7 @@ public class ApiAnalyzer {
                     continue;
                 }
                 String httpMethod = httpMethodOf(mapping);
-                String path = normalizePath(JavaIndexer.stripQuotes(firstAnnotationValue(content, mapping, m.line)));
+                String path = normalizePath(JavaIndexer.stripQuotes(firstAnnotationValue(type.filePath, content, mapping, m.line)));
                 String full = joinPath(basePath, path);
                 Sym endpoint = endpointSymbol(httpMethod, full, type.modulePath, type.filePath, m.line);
                 endpoint.meta.put("controller", type.qualifiedName);
@@ -85,7 +110,7 @@ public class ApiAnalyzer {
                 endpoint.meta.put("responseType", m.returnType);
                 endpoint.meta.put("declaredPath", path);
                 endpoint.meta.put("basePath", basePath);
-                endpoint.meta.put("requestType", requestBodyType(content, m.line));
+                endpoint.meta.put("requestType", requestBodyType(type.filePath, content, m.line));
 
                 Edge exposes = new Edge();
                 exposes.from = m.key;
@@ -109,14 +134,13 @@ public class ApiAnalyzer {
      * The request payload type of a handler: the parameter annotated with {@code @RequestBody}.
      * Path variables and query parameters are not part of the payload contract, so they are skipped.
      */
-    private String requestBodyType(String content, int nearLine) {
-        String[] lines = content.split("\\R", -1);
+    private String requestBodyType(String filePath, String content, int nearLine) {
+        String[] fileLines = lines.lines(filePath, content);
         StringBuilder sb = new StringBuilder();
-        for (int i = Math.max(0, nearLine - 2); i < Math.min(lines.length, nearLine + 8); i++) {
-            sb.append(lines[i]).append('\n');
+        for (int i = Math.max(0, nearLine - 2); i < Math.min(fileLines.length, nearLine + 8); i++) {
+            sb.append(fileLines[i]).append('\n');
         }
-        Matcher m = Pattern.compile("@RequestBody\\s+(?:final\\s+)?([A-Za-z_][\\w.<>,\\[\\] ?]*)")
-                .matcher(sb.toString());
+        Matcher m = REQUEST_BODY_TYPE.matcher(sb.toString());
         return m.find() ? m.group(1).trim() : "";
     }
 
@@ -144,9 +168,9 @@ public class ApiAnalyzer {
         if (content == null) {
             return;
         }
-        String name = firstAnnotationValue(content, "FeignClient", type.startLine);
+        String name = firstAnnotationValue(type.filePath, content, "FeignClient", type.startLine);
         String base = "";
-        Matcher m = Pattern.compile("path\\s*=\\s*\"([^\"]*)\"").matcher(name == null ? "" : name);
+        Matcher m = FEIGN_PATH.matcher(name == null ? "" : name);
         if (m.find()) {
             base = m.group(1);
         }
@@ -160,7 +184,7 @@ public class ApiAnalyzer {
                     }
                 }
                 String httpMethod = mapping == null ? "ANY" : httpMethodOf(mapping);
-                String path = mapping == null ? "" : JavaIndexer.stripQuotes(firstAnnotationValue(content, mapping, method.line));
+                String path = mapping == null ? "" : JavaIndexer.stripQuotes(firstAnnotationValue(type.filePath, content, mapping, method.line));
                 String full = joinPath(normalizePath(base), normalizePath(path));
                 if (full.isEmpty() || full.equals("/")) {
                     continue;
@@ -192,7 +216,7 @@ public class ApiAnalyzer {
             }
             for (List<TypeInfo.MethodInfo> methods : t.methods.values()) {
                 for (TypeInfo.MethodInfo m : methods) {
-                    String body = methodBody(content, m.line);
+                    String body = methodBody(t.filePath, content, m.line);
                     if (body.isEmpty()) {
                         continue;
                     }
@@ -228,16 +252,16 @@ public class ApiAnalyzer {
         }
     }
 
-    private String methodBody(String content, int startLine) {
-        String[] lines = content.split("\\R", -1);
-        if (startLine <= 0 || startLine > lines.length) {
+    private String methodBody(String filePath, String content, int startLine) {
+        String[] fileLines = lines.lines(filePath, content);
+        if (startLine <= 0 || startLine > fileLines.length) {
             return "";
         }
         StringBuilder sb = new StringBuilder();
         int depth = 0;
         boolean started = false;
-        for (int i = startLine - 1; i < Math.min(lines.length, startLine + 80); i++) {
-            String line = lines[i];
+        for (int i = startLine - 1; i < Math.min(fileLines.length, startLine + 80); i++) {
+            String line = fileLines[i];
             sb.append(line).append('\n');
             for (char c : line.toCharArray()) {
                 if (c == '{') {
@@ -315,7 +339,7 @@ public class ApiAnalyzer {
             if (content == null) {
                 continue;
             }
-            Matcher m = Pattern.compile("^\\s{2}(/[^:\\s]+)\\s*:", Pattern.MULTILINE).matcher(content);
+            Matcher m = OPENAPI_PATH.matcher(content);
             while (m.find()) {
                 String path = normalizePath(m.group(1));
                 Sym endpoint = endpointSymbol("ANY", path, maven.moduleOf(file), file, lineOf(content, m.start()));
@@ -329,8 +353,7 @@ public class ApiAnalyzer {
         if (typeName == null || typeName.isBlank() || typeName.equals("void")) {
             return;
         }
-        TypeResolver resolver = new TypeResolver(index);
-        List<TypeInfo> types = resolver.resolve(TypeResolver.stripGenerics(typeName), scope.imports, scope.packageName);
+        List<TypeInfo> types = typeResolver.resolve(TypeResolver.stripGenerics(typeName), scope.imports, scope.packageName);
         for (TypeInfo t : types) {
             Edge e = new Edge();
             e.from = fromKey;
@@ -459,14 +482,16 @@ public class ApiAnalyzer {
         return normalizePath(b + "/" + p);
     }
 
-    private String firstAnnotationValue(String content, String annotation, int nearLine) {
-        String[] lines = content.split("\\R", -1);
+    private String firstAnnotationValue(String filePath, String content, String annotation, int nearLine) {
+        String[] fileLines = lines.lines(filePath, content);
         int from = Math.max(0, nearLine - 4);
         StringBuilder sb = new StringBuilder();
-        for (int i = from; i < Math.min(lines.length, nearLine + 6); i++) {
-            sb.append(lines[i]).append('\n');
+        for (int i = from; i < Math.min(fileLines.length, nearLine + 6); i++) {
+            sb.append(fileLines[i]).append('\n');
         }
-        Matcher m = Pattern.compile("@" + annotation + "\\s*\\(([^)]*)\\)").matcher(sb.toString());
+        Matcher m = annotationValuePatterns
+                .computeIfAbsent(annotation, a -> Pattern.compile("@" + a + "\\s*\\(([^)]*)\\)"))
+                .matcher(sb.toString());
         return m.find() ? m.group(1) : "";
     }
 

@@ -63,7 +63,7 @@ public class AnalysisService {
 
     public static final class RunRequest {
         public long sourceId;
-        /** GIT_DIFF | WORKTREE_DIFF | PULL_REQUEST */
+        /** GIT_DIFF | WORKTREE_DIFF | COMMIT_RANGE | PULL_REQUEST */
         public String mode;
         public String baseRef;
         public String targetRef;
@@ -72,6 +72,15 @@ public class AnalysisService {
         public boolean includeUncommitted = true;
         /** Other programs to scan for cross-program impact, by source id. */
         public List<Long> peerSourceIds = new ArrayList<>();
+        /**
+         * Whether this run should also generate the AI review.
+         *
+         * A boxed Boolean on purpose: {@code null} means "the client did not decide", which is
+         * resolved to {@code defaultForRuns && ready}. {@code true} on an unconfigured instance is
+         * honoured as "skip", never as an error - the static analysis is the product and the AI
+         * section is an optional extra.
+         */
+        public Boolean aiReview;
     }
 
     public Analysis submit(RunRequest request) {
@@ -161,9 +170,23 @@ public class AnalysisService {
             if (hasPeers) {
                 progress.complete("PEERS", "REPORT", 94, "生成报告", "汇总跨程序契约、路径与证据");
             }
-            if (aiExplainer.enabled()) {
-                progress.update("REPORT", 96, "生成报告", "正在生成 AI 评审说明");
-                report.ai = aiExplainer.explain(report, 12);
+            if (wantsAiReview(request)) {
+                if (aiExplainer.ready()) {
+                    progress.update("REPORT", 96, "生成报告", "正在生成 AI 评审说明");
+                    // The AI section must never be able to fail the run: the facts are already
+                    // computed and stored by the time this is called, and explain() returns a
+                    // generated:false object rather than throwing. The catch is for the
+                    // belt-and-braces case (an OOM in prompt building) so a broken extra cannot
+                    // turn a good analysis into a FAILED row.
+                    try {
+                        report.ai = aiExplainer.explain(report, properties.getAi().getMaxImpacts());
+                    } catch (RuntimeException e) {
+                        log.warn("AI 评审说明生成失败，已跳过：{}", e.toString());
+                    }
+                } else {
+                    log.info("本次分析请求生成 AI 评审说明，但 AI 审核未配置完成（{}），已跳过",
+                            aiExplainer.notReadyReason());
+                }
             }
 
             Map<String, Object> summary = new LinkedHashMap<>();
@@ -179,18 +202,25 @@ public class AnalysisService {
             summary.put("lowRisk", report.summary.lowRisk);
             summary.put("unresolvedCalls", report.summary.unresolvedCalls);
             summary.put("parsedFiles", report.summary.parsedFiles);
+            // Listed separately from the report payload so the history rows can say "12 个提交"
+            // without loading a full report per row.
+            summary.put("commitCount", report.summary.commitCount);
 
             store.finishAnalysis(analysis.id, Analysis.DONE, null, System.currentTimeMillis() - start,
                     summary, report, analysis.baseCommit, analysis.headCommit);
-            source.lastSyncedAt = RepoSource.now();
-            source.status = "OK";
-            source.message = "analysed at " + RepoSource.now();
-            store.saveSource(source);
+            // Only the sync outcome is written back, never the whole row: {@code source} is the
+            // snapshot taken when the run was submitted, and a run lasts minutes. Saving it would
+            // revert any edit the user made in the meantime - a new tag, a different default
+            // branch - with no warning and no way to notice.
+            String analysedAt = RepoSource.now();
+            store.updateSourceSyncState(source.id, "OK", "analysed at " + analysedAt, analysedAt);
         } catch (Exception e) {
             store.updateProgress(analysis.id, "FAILED", 0, "分析失败", messageOf(e),
                     List.of(), List.of());
             store.finishAnalysis(analysis.id, Analysis.FAILED, messageOf(e),
                     System.currentTimeMillis() - start, null, null);
+            // 失败分支会把 report_json 清空（null），缓存若不随之失效，就会比数据库里的行活得更久。
+            reportCache.remove(analysis.id);
         }
     }
 
@@ -340,6 +370,21 @@ public class AnalysisService {
         return out;
     }
 
+    /**
+     * Resolves the run dialog's optional checkbox into a decision.
+     *
+     * The three cases are deliberately distinct: an explicit {@code true} on an unconfigured
+     * instance still "wants" it (the caller logs why it was skipped), while a missing value falls
+     * back to the operator's default. Folding "not ready" into "not wanted" here would make the two
+     * indistinguishable in the log.
+     */
+    private boolean wantsAiReview(RunRequest request) {
+        if (request.aiReview != null) {
+            return request.aiReview;
+        }
+        return properties.getAi().isDefaultForRuns() && aiExplainer.ready();
+    }
+
     private String peersNote(RunRequest request, List<ChangeRecord> changes) {
         if (request.peerSourceIds == null || request.peerSourceIds.isEmpty()) {
             return "本次分析没有选择对比程序";
@@ -358,11 +403,78 @@ public class AnalysisService {
         return message.length() > 900 ? message.substring(0, 900) : message;
     }
 
+    /**
+     * 已解析报告的缓存。
+     *
+     * 一份报告在 DONE 之后就不再变化：finishAnalysis 只在完成时写一次 report_json，
+     * 重跑一定新建 analysis id，旧行永远不再被改写。所以按 id 缓存是安全的。
+     *
+     * 上界 4 条：实测单份报告解析后常驻约 1.4 MB，4 条约 5–10 MB，足够覆盖
+     * 「打开分析 → 返回队列 → 再打开同一份」这个真实重复模式，又不会让长时间运行的进程
+     * 把历史上所有报告都留在堆里。
+     */
+    private static final int REPORT_CACHE_SIZE = 4;
+    private final Map<Long, ImpactReport> reportCache =
+            java.util.Collections.synchronizedMap(new java.util.LinkedHashMap<>(8, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<Long, ImpactReport> eldest) {
+                    return size() > REPORT_CACHE_SIZE;
+                }
+            });
+
+    /**
+     * Generates (or regenerates) the AI section of an already finished report.
+     *
+     * Backs the "生成 AI 评审" button on a historical report, which is the reason this exists outside
+     * {@link #run}: an analysis is expensive and a missing optional paragraph must not force a
+     * re-run of the whole thing.
+     *
+     * Returns {@code null} when the analysis has no report yet, so the controller can answer 409
+     * without knowing how reports are stored. Throws {@link IllegalArgumentException} when the
+     * feature is not configured, because that is a request the user can fix in the settings page
+     * and the 400 body says exactly what is missing.
+     *
+     * The write goes through {@link Store#updateReportJson} and the parsed report is replaced in
+     * {@link #reportCache} in the same step: without the cache update the page would keep serving
+     * the copy parsed before the generation, and the button would look broken until a restart.
+     */
+    public Map<String, Object> saveAiReview(long analysisId) {
+        if (!aiExplainer.ready()) {
+            throw new IllegalArgumentException("AI 审核未启用或未配置完成：" + aiExplainer.notReadyReason());
+        }
+        ImpactReport current = report(analysisId);
+        if (current == null) {
+            return null;
+        }
+        Map<String, Object> ai = aiExplainer.explain(current, properties.getAi().getMaxImpacts());
+        if (ai == null) {
+            // explain() only returns null when it is not ready, which was checked above; treating
+            // it as "nothing to save" keeps the endpoint from writing a null section.
+            throw new IllegalArgumentException("AI 审核未启用或未配置完成：" + aiExplainer.notReadyReason());
+        }
+        current.ai = ai;
+        // A failed call still updates the stored section (generated:false + error): the page has to
+        // show why the retry failed instead of falling back to "本次没有生成".
+        store.updateReportJson(analysisId, current);
+        reportCache.put(analysisId, current);
+        log.info("分析 {} 的 AI 评审说明已更新：generated={}", analysisId, ai.get("generated"));
+        return ai;
+    }
+
     public ImpactReport report(long analysisId) {
-        Analysis analysis = store.analysis(analysisId);
+        // 先查缓存再读库：命中时连 SQLite 都不碰，这是「队列里反复点开同一条」的主要路径。
+        ImpactReport cached = reportCache.get(analysisId);
+        if (cached != null) {
+            return cached;
+        }
+        Analysis analysis = store.analysisWithReport(analysisId);
         if (analysis == null || analysis.reportJson == null) {
             return null;
         }
-        return Json.read(analysis.reportJson, ImpactReport.class);
+        ImpactReport parsed = Json.read(analysis.reportJson, ImpactReport.class);
+        if (parsed != null) {
+            reportCache.put(analysisId, parsed);
+        }
+        return parsed;
     }
 }

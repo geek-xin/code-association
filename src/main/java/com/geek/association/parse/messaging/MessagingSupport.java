@@ -34,6 +34,16 @@ public final class MessagingSupport {
     private final CodeIndex index;
     private final TypeResolver resolver;
     private final Map<String, Map<String, String>> constantsByFile = new LinkedHashMap<>();
+    /**
+     * 裸常量名 -> (值 -> 出现文件数)。
+     *
+     * resolveConstant 在本地文件里查不到时，需要判断"这个名字在别的文件里是否唯一"。
+     * 原先每个未命中都要遍历所有文件的常量表，代价 O(文件数 × 常量数)，
+     * 而它在每个 topic/queue/routingKey 表达式上都会被调用一次。
+     * 常量表在构造后不再变化，所以建一次索引、之后 O(1) 查询即可；
+     * 用 "值 -> 次数" 而不是 "值 -> 第一个值"，是为了在多个不同值同名时依然返回 null（保持原语义）。
+     */
+    private final Map<String, Map<String, Integer>> constantsByName = new LinkedHashMap<>();
     private final Map<String, String> configValues = new LinkedHashMap<>();
 
     public MessagingSupport(FileSource source, CodeIndex index) {
@@ -162,16 +172,13 @@ public final class MessagingSupport {
         if (local != null && local.containsKey(bare)) {
             return local.get(bare);
         }
-        String found = null;
-        int count = 0;
-        for (Map<String, String> values : constantsByFile.values()) {
-            String value = values.get(bare);
-            if (value != null) {
-                found = value;
-                count++;
-            }
+        // 命中全局索引：只有恰好一个文件声明了这个裸名时才认，多个文件同名视为有歧义。
+        Map<String, Integer> occurrences = constantsByName.get(bare);
+        if (occurrences == null || occurrences.size() != 1) {
+            return null;
         }
-        return count == 1 ? found : null;
+        Map.Entry<String, Integer> only = occurrences.entrySet().iterator().next();
+        return only.getValue() == 1 ? only.getKey() : null;
     }
 
     public void unresolved(String file, int line, String expression, String reason) {
@@ -254,6 +261,10 @@ public final class MessagingSupport {
             }
             if (!values.isEmpty()) {
                 constantsByFile.put(file, values);
+                for (Map.Entry<String, String> e : values.entrySet()) {
+                    constantsByName.computeIfAbsent(e.getKey(), k -> new LinkedHashMap<>())
+                            .merge(e.getValue(), 1, Integer::sum);
+                }
             }
         }
     }

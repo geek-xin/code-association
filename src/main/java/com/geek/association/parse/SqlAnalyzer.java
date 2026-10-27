@@ -35,10 +35,37 @@ public class SqlAnalyzer {
             "\\balter\\s+table\\s+([\\w.]+)\\s+drop\\s+(?:column\\s+)?([\\w]+)", Pattern.CASE_INSENSITIVE);
     private static final Pattern ALTER_MODIFY = Pattern.compile(
             "\\balter\\s+table\\s+([\\w.]+)\\s+(?:modify|alter)\\s+(?:column\\s+)?([\\w]+)", Pattern.CASE_INSENSITIVE);
+    /** A table reference with an optional alias: {@code from orders o}, {@code join order_item as i}. */
+    private static final Pattern TABLE_REF = Pattern.compile(
+            "\\b(?:from|join|into|update)\\s+([a-zA-Z_][\\w.]*)(?:\\s+(?:as\\s+)?([a-zA-Z_][\\w]*))?",
+            Pattern.CASE_INSENSITIVE);
+    /**
+     * One MyBatis statement element. Compiled once: this used to be recompiled for every mapper
+     * file, and a large repository has thousands of them.
+     */
+    private static final Pattern MYBATIS_STATEMENT = Pattern.compile(
+            "<(select|insert|update|delete)\\s+[^>]*id\\s*=\\s*\"([^\"]+)\"[^>]*>(.*?)</\\1>",
+            Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
+    /** Statement-shape patterns of {@code linkTables}; compiled once, not per statement. */
+    private static final Pattern INSERT_INTO = Pattern.compile(
+            "\\binsert\\s+into\\s+([a-zA-Z_][\\w.]*)", Pattern.CASE_INSENSITIVE);
+    private static final Pattern UPDATE_TABLE = Pattern.compile(
+            "\\bupdate\\s+([a-zA-Z_][\\w.]*)", Pattern.CASE_INSENSITIVE);
+    private static final Pattern DELETE_FROM = Pattern.compile(
+            "\\bdelete\\s+from\\s+([a-zA-Z_][\\w.]*)", Pattern.CASE_INSENSITIVE);
+    private static final Pattern FROM_JOIN = Pattern.compile(
+            "\\b(?:from|join)\\s+([a-zA-Z_][\\w.]*)", Pattern.CASE_INSENSITIVE);
+    /** Words that follow a table reference but are not aliases. */
+    private static final Set<String> SQL_KEYWORDS = Set.of(
+            "where", "set", "values", "select", "from", "join", "left", "right", "inner", "outer", "full",
+            "cross", "on", "group", "order", "by", "having", "limit", "offset", "union", "and", "or",
+            "as", "insert", "update", "delete", "into", "duplicate", "ignore", "returning", "for");
 
     private final FileSource source;
     private final MavenParser maven;
     private final CodeIndex index;
+    /** 行数组按文件缓存：methodSnippet 在每个方法上调用一次，重复切分整个文件是 O(方法数 × 文件大小)。 */
+    private final SourceLines lines = new SourceLines();
 
     public SqlAnalyzer(FileSource source, MavenParser maven, CodeIndex index) {
         this.source = source;
@@ -65,9 +92,7 @@ public class SqlAnalyzer {
                 continue;
             }
             String namespace = attr(content, "<mapper", "namespace");
-            Pattern stmt = Pattern.compile("<(select|insert|update|delete)\\s+[^>]*id\\s*=\\s*\"([^\"]+)\"[^>]*>(.*?)</\\1>",
-                    Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
-            Matcher m = stmt.matcher(content);
+            Matcher m = MYBATIS_STATEMENT.matcher(content);
             while (m.find()) {
                 String kind = m.group(1).toLowerCase(Locale.ROOT);
                 String id = m.group(2);
@@ -101,25 +126,26 @@ public class SqlAnalyzer {
         if (namespace == null || namespace.isBlank()) {
             return;
         }
-        for (TypeInfo t : index.types.values()) {
-            if (!t.qualifiedName.equals(namespace)) {
-                continue;
-            }
-            List<TypeInfo.MethodInfo> methods = t.methods.get(id);
-            if (methods == null) {
-                continue;
-            }
-            for (TypeInfo.MethodInfo method : methods) {
-                Edge e = new Edge();
-                e.from = method.key;
-                e.to = sym.key;
-                e.relation = "EXECUTES_SQL";
-                e.filePath = t.filePath;
-                e.line = method.line;
-                e.confidence = 0.95;
-                e.detail = "MyBatis " + id;
-                index.addEdge(e);
-            }
+        // index.types is keyed by qualified name, so the namespace is a direct lookup. Scanning
+        // every type for it made each mapper statement cost O(types) on a large repository.
+        TypeInfo t = index.types.get(namespace);
+        if (t == null) {
+            return;
+        }
+        List<TypeInfo.MethodInfo> methods = t.methods.get(id);
+        if (methods == null) {
+            return;
+        }
+        for (TypeInfo.MethodInfo method : methods) {
+            Edge e = new Edge();
+            e.from = method.key;
+            e.to = sym.key;
+            e.relation = "EXECUTES_SQL";
+            e.filePath = t.filePath;
+            e.line = method.line;
+            e.confidence = 0.95;
+            e.detail = "MyBatis " + id;
+            index.addEdge(e);
         }
     }
 
@@ -136,7 +162,7 @@ public class SqlAnalyzer {
             }
             for (Map.Entry<String, List<TypeInfo.MethodInfo>> e : t.methods.entrySet()) {
                 for (TypeInfo.MethodInfo m : e.getValue()) {
-                    String snippet = methodSnippet(content, m.line, 40);
+                    String snippet = methodSnippet(content, t.filePath, m.line, 40);
                     Matcher matcher = annotation.matcher(snippet);
                     while (matcher.find()) {
                         String kind = matcher.group(1).toLowerCase(Locale.ROOT);
@@ -173,11 +199,18 @@ public class SqlAnalyzer {
         }
     }
 
-    private String methodSnippet(String content, int line, int window) {
-        String[] lines = content.split("\\R", -1);
+    /**
+     * A window of lines around one method, for the annotation scan.
+     *
+     * The line array comes from {@link SourceLines}, which splits a file once and caches the
+     * result. Splitting here made every method of a file re-split the whole file, so a large
+     * class cost O(methods x file size) - the "large module" slowdown.
+     */
+    private String methodSnippet(String content, String file, int line, int window) {
+        String[] fileLines = lines.lines(file, content);
         int from = Math.max(0, line - 2);
-        int to = Math.min(lines.length, line + window);
-        return String.join("\n", java.util.Arrays.copyOfRange(lines, from, to));
+        int to = Math.min(fileLines.length, line + window);
+        return String.join("\n", java.util.Arrays.copyOfRange(fileLines, from, to));
     }
 
     private String guessKind(String sqlText) {
@@ -326,25 +359,35 @@ public class SqlAnalyzer {
 
     // ---------------------------------------------------------------- linking
 
+    /**
+     * Links a statement to the tables and columns it touches.
+     *
+     * Columns are attributed to their owning table instead of being attached to every table of the
+     * statement: a join over three tables used to give each table every selected column, which made
+     * a column-level contract indistinguishable from a table-level one.
+     *
+     * The two column lists are also written to metadata, because the change detector and the peer
+     * engine need to know which columns a statement reads and writes without walking the graph.
+     */
     private void linkTables(Sym sym, String sqlText, String kind) {
         String lower = sqlText.toLowerCase(Locale.ROOT);
         Set<String> reads = new LinkedHashSet<>();
         Set<String> writes = new LinkedHashSet<>();
-        Matcher insert = Pattern.compile("\\binsert\\s+into\\s+([a-zA-Z_][\\w.]*)", Pattern.CASE_INSENSITIVE).matcher(sqlText);
+        Matcher insert = INSERT_INTO.matcher(sqlText);
         while (insert.find()) {
             writes.add(normalizeTable(insert.group(1)));
         }
-        Matcher update = Pattern.compile("\\bupdate\\s+([a-zA-Z_][\\w.]*)", Pattern.CASE_INSENSITIVE).matcher(sqlText);
+        Matcher update = UPDATE_TABLE.matcher(sqlText);
         while (update.find()) {
             if (!lower.startsWith("select")) {
                 writes.add(normalizeTable(update.group(1)));
             }
         }
-        Matcher delete = Pattern.compile("\\bdelete\\s+from\\s+([a-zA-Z_][\\w.]*)", Pattern.CASE_INSENSITIVE).matcher(sqlText);
+        Matcher delete = DELETE_FROM.matcher(sqlText);
         while (delete.find()) {
             writes.add(normalizeTable(delete.group(1)));
         }
-        Matcher from = Pattern.compile("\\b(?:from|join)\\s+([a-zA-Z_][\\w.]*)", Pattern.CASE_INSENSITIVE).matcher(sqlText);
+        Matcher from = FROM_JOIN.matcher(sqlText);
         while (from.find()) {
             reads.add(normalizeTable(from.group(1)));
         }
@@ -355,22 +398,77 @@ public class SqlAnalyzer {
             }
         }
         reads.removeAll(writes);
+        Map<String, String> aliases = tableAliases(sqlText);
+        Set<String> readColumns = new LinkedHashSet<>();
+        Set<String> writeColumns = new LinkedHashSet<>();
         for (String table : reads) {
             link(sym, tableSymbol(table, sym.modulePath, sym.filePath, sym.startLine), "READS_TABLE", "select from " + table);
-            for (String column : selectColumns(sqlText)) {
-                link(sym, columnSymbol(table, column, sym.modulePath, sym.filePath, sym.startLine),
-                        "READS_COLUMN", table + "." + column);
+        }
+        for (String ref : selectColumnRefs(sqlText)) {
+            String table = ownerTable(ref, reads, aliases);
+            if (table == null) {
+                continue; // cannot tell which table the column belongs to; a blind spot, not a guess
             }
+            String column = columnName(ref);
+            readColumns.add(table + "." + column);
+            link(sym, columnSymbol(table, column, sym.modulePath, sym.filePath, sym.startLine),
+                    "READS_COLUMN", table + "." + column);
         }
         for (String table : writes) {
             link(sym, tableSymbol(table, sym.modulePath, sym.filePath, sym.startLine), "WRITES_TABLE", kind + " " + table);
-            for (String column : writtenColumns(sqlText)) {
-                link(sym, columnSymbol(table, column, sym.modulePath, sym.filePath, sym.startLine),
-                        "WRITES_COLUMN", table + "." + column);
+        }
+        for (String column : writtenColumns(sqlText)) {
+            String table = ownerTable(column, writes, aliases);
+            if (table == null) {
+                continue;
             }
+            writeColumns.add(table + "." + column);
+            link(sym, columnSymbol(table, column, sym.modulePath, sym.filePath, sym.startLine),
+                    "WRITES_COLUMN", table + "." + column);
         }
         sym.meta.put("readsTables", String.join(",", reads));
         sym.meta.put("writesTables", String.join(",", writes));
+        sym.meta.put("readsColumns", String.join(",", readColumns));
+        sym.meta.put("writesColumns", String.join(",", writeColumns));
+    }
+
+    /**
+     * Alias table of one statement: {@code alias -> table}, plus each table mapped to itself.
+     *
+     * A column written as {@code o.status} can only be attributed when {@code o} is known to be an
+     * alias of {@code orders}; without this the column would be dropped rather than guessed.
+     */
+    private Map<String, String> tableAliases(String sqlText) {
+        Map<String, String> out = new java.util.LinkedHashMap<>();
+        Matcher m = TABLE_REF.matcher(sqlText);
+        while (m.find()) {
+            String table = normalizeTable(m.group(1));
+            out.put(table, table);
+            String alias = m.group(2) == null ? "" : m.group(2).toLowerCase(Locale.ROOT);
+            if (!alias.isEmpty() && !SQL_KEYWORDS.contains(alias)) {
+                out.put(alias, table);
+            }
+        }
+        return out;
+    }
+
+    /** The table a column reference belongs to, or null when it cannot be determined. */
+    private String ownerTable(String ref, Set<String> tables, Map<String, String> aliases) {
+        if (tables.isEmpty()) {
+            return null;
+        }
+        int dot = ref.lastIndexOf('.');
+        if (dot > 0) {
+            String owner = aliases.get(ref.substring(0, dot).toLowerCase(Locale.ROOT));
+            return owner != null && tables.contains(owner) ? owner : null;
+        }
+        // An unqualified column is only attributable when the statement touches a single table.
+        return tables.size() == 1 ? tables.iterator().next() : null;
+    }
+
+    private String columnName(String ref) {
+        int dot = ref.lastIndexOf('.');
+        return (dot < 0 ? ref : ref.substring(dot + 1)).toLowerCase(Locale.ROOT);
     }
 
     private void link(Sym from, Sym to, String relation, String detail) {
@@ -388,7 +486,15 @@ public class SqlAnalyzer {
         index.addEdge(e);
     }
 
-    private Set<String> selectColumns(String sqlText) {
+    /**
+     * Column references of the select list, table-qualified where the statement writes them that way.
+     *
+     * The reference is kept as written ({@code o.status}, {@code status}) so the caller can resolve
+     * the owning table through the statement's aliases. A select list containing {@code *} returns
+     * nothing: the column list is only known at runtime, which is a blind spot rather than an empty
+     * read set.
+     */
+    private Set<String> selectColumnRefs(String sqlText) {
         Set<String> out = new LinkedHashSet<>();
         Matcher m = SELECT_COLUMNS.matcher(sqlText);
         if (!m.find()) {
@@ -403,35 +509,41 @@ public class SqlAnalyzer {
             if (c.contains("(") || c.contains(" ")) {
                 continue;
             }
-            String name = c.contains(".") ? c.substring(c.lastIndexOf('.') + 1) : c;
-            if (name.matches("[a-zA-Z_][\\w]*")) {
-                out.add(name.toLowerCase(Locale.ROOT));
+            if (c.matches("[a-zA-Z_][\\w]*(?:\\.[a-zA-Z_][\\w]*)?") && !SQL_KEYWORDS.contains(c.toLowerCase(Locale.ROOT))) {
+                out.add(c);
             }
         }
         return out;
     }
 
+    /**
+     * Columns a statement writes: the insert column list and the columns of an update's set clause.
+     *
+     * Only the names matter, so a qualified form ({@code o.status}) keeps its qualifier for the
+     * owning-table lookup and is normalised by the caller.
+     */
     private Set<String> writtenColumns(String sqlText) {
         Set<String> out = new LinkedHashSet<>();
         Matcher m = Pattern.compile("\\(([^()]*)\\)\\s*values\\s*\\(", Pattern.CASE_INSENSITIVE).matcher(sqlText);
         if (m.find()) {
             for (String c : m.group(1).split(",")) {
-                String name = c.strip().toLowerCase(Locale.ROOT);
-                if (name.matches("[a-zA-Z_][\\w]*")) {
-                    out.add(name);
-                }
+                addColumnRef(out, c.strip());
             }
         }
         Matcher set = Pattern.compile("\\bset\\s+(.*?)(?:\\bwhere\\b|$)", Pattern.CASE_INSENSITIVE | Pattern.DOTALL).matcher(sqlText);
         if (set.find()) {
             for (String part : set.group(1).split(",")) {
-                String c = part.split("=")[0].strip();
-                if (c.matches("[a-zA-Z_][\\w]*")) {
-                    out.add(c.toLowerCase(Locale.ROOT));
-                }
+                addColumnRef(out, part.split("=")[0].strip());
             }
         }
         return out;
+    }
+
+    private void addColumnRef(Set<String> out, String raw) {
+        if (raw.matches("[a-zA-Z_][\\w]*(?:\\.[a-zA-Z_][\\w]*)?")
+                && !SQL_KEYWORDS.contains(raw.toLowerCase(Locale.ROOT))) {
+            out.add(raw.toLowerCase(Locale.ROOT));
+        }
     }
 
     public Sym tableSymbol(String table, String modulePath, String file, int line) {

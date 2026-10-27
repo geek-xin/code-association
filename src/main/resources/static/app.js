@@ -32,7 +32,7 @@ const CHANGE_LABEL = {
   MESSAGE_ENUM_CHANGED: '消息枚举值变化',
   TEST_CHANGED: '测试变化', BUILD_CHANGED: '构建变化'
 };
-const MODE_LABEL = { GIT_DIFF: '提交对比', WORKTREE_DIFF: '未提交改动', PULL_REQUEST: 'PR / MR' };
+const MODE_LABEL = { GIT_DIFF: '提交对比', WORKTREE_DIFF: '未提交改动', PULL_REQUEST: 'PR / MR', COMMIT_RANGE: '提交范围' };
 const STATUS_LABEL = { DONE: '已就绪', RUNNING: '分析中', PENDING: '排队中', FAILED: '失败' };
 const STATUS_TONE = { DONE: 'success', RUNNING: 'brand', PENDING: 'neutral', FAILED: 'danger' };
 const FACTOR_LABEL = { changeRisk: '变更风险', depth: '传播深度', behavior: '行为变化', criticality: '影响面', uncertainty: '不确定性' };
@@ -64,6 +64,13 @@ const TAG_MAX_COUNT = 12;
 const TAG_MAX_LENGTH = 24;
 /** Sources without any tag are listed under this pseudo group; it is never a real tag. */
 const UNTAGGED_GROUP = '未分类';
+/**
+ * 复核发现列表每页条数。
+ *
+ * 14 模块规模的报告有 756 条影响，一次性 map 成 HTML 塞进 innerHTML 就是 756 个卡片 DOM 节点，
+ * 首屏要等它们全部解析完才出来。50 条一页既能一屏看完，又让单次渲染的成本与报告规模无关。
+ */
+const REVIEW_PAGE_SIZE = 50;
 
 function esc(v) {
   return String(v == null ? '' : v)
@@ -162,6 +169,20 @@ var state = {
   sourceId: null,
   review: {},
   reviewTab: 'all',
+  /** 复核发现列表的当前页（从 1 开始）；切标签、换分析时回到第 1 页。 */
+  reviewPage: 1,
+  /**
+   * 被复核决策改了数据、但当时不在屏幕上的页面。
+   *
+   * 页面是预渲染后用 CSS 显隐切换的，所以一次确认不必立刻重绘另外两张页面；
+   * 打个脏标，等用户真的切过去时由 go() 补一次渲染即可 —— 反正那一刻本来就要渲染。
+   */
+  stalePages: {},
+  /**
+   * impacts 的排序与聚合缓存，见 sortedImpacts() / impactStats()。
+   * source 保存报告里那个数组的引用，换成别的报告时引用不同，缓存自然失效。
+   */
+  impactCache: { analysisId: null, source: null, sorted: null, stats: null },
   selectedImpactId: null,
   selectedModule: null,
   search: '',
@@ -188,7 +209,28 @@ var state = {
    * persisted: only "忽略此版本" is a lasting choice, closing is "not now". Kept on state rather
    * than in the DOM so a re-render cannot resurrect a banner the user just closed.
    */
-  updateBannerClosed: null
+  updateBannerClosed: null,
+  /**
+   * AI review state, kept in one object because four surfaces read it: the settings card,
+   * the analysis card, the run dialog and the health rows.
+   *
+   * `data` is the last GET/PUT /api/ai payload, `loaded` guards the one-time fetch (renderSettings
+   * runs on every poll tick), and `formFilled` is what keeps that tick from rewriting the inputs
+   * under the user's cursor - see fillAiForm().
+   */
+  ai: {
+    data: null,
+    loaded: false,
+    loading: false,
+    error: null,
+    formFilled: false,
+    saving: false,
+    testing: false,
+    /** The last POST /api/ai/test result, or null. Rendered separately from the form. */
+    test: null,
+    /** Analysis id whose AI section is being (re)generated, or null. */
+    generating: null
+  }
 };
 
 /* ---------------------------------------------------------------- decisions */
@@ -383,7 +425,110 @@ function toast(message, tone) {
 
 /* -------------------------------------------------------------------- counts */
 
-function impacts() { return (state.report && state.report.impacts) || []; }
+/**
+ * 空报告时返回同一个空数组，而不是每次 new 一个字面量。
+ * 缓存用数组引用当键（见 sortedImpacts），如果这里每次都返回新数组，
+ * 没有报告时缓存永远命中不了，反而每帧白排一次空列表。
+ * 这个数组只被读（filter / slice / forEach），不会被改写，共享是安全的。
+ */
+var EMPTY_IMPACTS = [];
+function impacts() { return (state.report && state.report.impacts) || EMPTY_IMPACTS; }
+
+/**
+ * 按风险分从高到低排好的 impacts，按报告缓存。
+ *
+ * 之前 renderReview / renderOverview / renderTriage 各自对全量 impacts 做一遍
+ * filter().sort()，而 renderAll 一次会跑三遍：756 条就是三次全量排序，且每次复核决策后
+ * 还会再来一遍。排序结果只跟报告内容有关、跟复核决策无关，所以按"哪个分析 + 哪个数组"
+ * 缓存即可 —— 决策变化时这份缓存依然有效，不需要失效。
+ *
+ * 缓存键用数组引用而不只是 analysisId：重新拉同一份报告时 JSON 会解析出新数组，
+ * 引用变了就说明数据变了，比"记得在某处手动清缓存"可靠。
+ */
+function sortedImpacts() {
+  var list = impacts();
+  var cache = state.impactCache;
+  if (cache.source === list && cache.analysisId === state.analysisId && cache.sorted) {
+    return cache.sorted;
+  }
+  var sorted = list.slice().sort(function (a, b) { return (b.riskScore || 0) - (a.riskScore || 0); });
+  cache.analysisId = state.analysisId;
+  cache.source = list;
+  cache.sorted = sorted;
+  cache.stats = null;
+  return sorted;
+}
+
+/**
+ * 全量 impacts 的聚合结果，同样按报告缓存。
+ *
+ * 这些计数（高风险条数、高置信度条数、涉及程序数、各风险级分布）每次渲染都要重算一遍，
+ * 但它们同样只取决于报告内容。复核决策只影响"哪些条已处理"，在需要时按决策再筛一次即可。
+ */
+function impactStats() {
+  sortedImpacts();
+  var cache = state.impactCache;
+  if (cache.stats) return cache.stats;
+  var list = cache.sorted;
+  var byLevel = { CRITICAL: 0, HIGH: 0, MEDIUM: 0, LOW: 0, INFO: 0 };
+  var highConfidence = 0;
+  var programs = {};
+  for (var i = 0; i < list.length; i++) {
+    var it = list[i];
+    if (byLevel[it.riskLevel] != null) byLevel[it.riskLevel]++;
+    if (it.confidence === 'HIGH') highConfidence++;
+    programs[impactProgram(it)] = 1;
+  }
+  cache.stats = {
+    total: list.length,
+    byLevel: byLevel,
+    highRisk: byLevel.HIGH + byLevel.CRITICAL,
+    highConfidence: highConfidence,
+    programCount: Object.keys(programs).length
+  };
+  return cache.stats;
+}
+
+/**
+ * 当前复核标签下、按风险分排好的行。
+ *
+ * 筛选只跟决策状态有关，而决策是用户点出来的，条目数量级远小于 impacts，
+ * 所以在已排好的数组上做一次 O(n) 过滤就够，不必再缓存第二份。
+ */
+function reviewRows(tab, decisions) {
+  var sorted = sortedImpacts();
+  var rows = [];
+  for (var i = 0; i < sorted.length; i++) {
+    var it = sorted[i];
+    var d = decisions[String(it.id)];
+    if (tab === 'pending' && d) continue;
+    if (tab === 'confirmed' && !(d && d.decision === 'confirmed')) continue;
+    if (tab === 'dismissed' && !(d && d.decision === 'dismissed')) continue;
+    rows.push(it);
+  }
+  return rows;
+}
+
+/**
+ * 分页状态：当前页、总页数、本页首尾下标。
+ * 抽成纯函数是为了能单独验证边界（空列表、越界页码、恰好整页），不依赖 DOM。
+ */
+function pageWindow(totalItems, page, pageSize) {
+  // 缺省回到每页 50 条，而不是 1：漏传参数时应当退化成默认分页，不该变成"每页一条"。
+  var size = pageSize > 0 ? pageSize : REVIEW_PAGE_SIZE;
+  var pages = Math.max(1, Math.ceil(totalItems / size));
+  var current = Math.min(Math.max(1, Number(page) || 1), pages);
+  var start = (current - 1) * size;
+  return {
+    page: current,
+    pages: pages,
+    start: start,
+    end: Math.min(start + size, totalItems),
+    total: totalItems,
+    hasPrev: current > 1,
+    hasNext: current < pages
+  };
+}
 
 /**
  * The program an impact belongs to.
@@ -589,6 +734,8 @@ function selectedAnalysis() {
 
 async function openAnalysis(id) {
   state.analysisId = id;
+  // 换了一份报告，页码必须回到第 1 页；impactCache 由 sortedImpacts() 按数组引用自动失效。
+  state.reviewPage = 1;
   var owner = state.analyses.filter(function (a) { return a.id === id; })[0] || null;
   // A finished run has a report, but a pending one does not, and asking for it anyway is how a
   // failed record ended up with a null report *and* no visible reason.
@@ -648,6 +795,7 @@ async function selectSource(sourceId) {
   state.sourceId = sourceId == null ? null : Number(sourceId);
   state.selectedModule = null;
   state.selectedImpactId = null;
+  state.reviewPage = 1;
   if (state.sourceId == null) {
     state.report = null;
     state.analysisId = null;
@@ -734,6 +882,16 @@ function go(page) {
   var ws = $('workspace');
   if (ws) ws.scrollTop = 0;
   try { localStorage.setItem(PAGE_KEY, page); } catch (e) { /* ignore */ }
+
+  // 复核决策在别的页面上留下的脏标：这里补一次渲染，用户切过来看到的就是最新数据。
+  // 只在确实标过脏时才刷，平时切页仍然是零成本的纯显隐切换。
+  if (state.stalePages && state.stalePages[page]) {
+    delete state.stalePages[page];
+    if (page === 'review') renderReview();
+    else if (page === 'overview') renderOverview();
+    else if (page === 'triage') renderTriage();
+  }
+
   renderMapsFor(page);
   // Page switches do not re-fetch anything, but the notice is page-independent and cheap to
   // re-evaluate; doing it here keeps the rail dot in sync without a poll-time API call.
@@ -1048,9 +1206,13 @@ function renderOverview() {
   for (var id in decisions) {
     if (decisions[id].decision === 'confirmed') confirmedSet[id] = true; else dismissedSet[id] = true;
   }
-  var attention = impacts().filter(function (i) {
-    return !dismissedSet[String(i.id)] && !confirmedSet[String(i.id)];
-  }).sort(function (a, b) { return (b.riskScore || 0) - (a.riskScore || 0); }).slice(0, 4);
+  // sortedImpacts() 已经是风险分降序，这里只需从头挑 4 条未复核的，不必再排一次全量。
+  var ordered = sortedImpacts();
+  var attention = [];
+  for (var ai = 0; ai < ordered.length && attention.length < 4; ai++) {
+    var cand = ordered[ai];
+    if (!dismissedSet[String(cand.id)] && !confirmedSet[String(cand.id)]) attention.push(cand);
+  }
 
   var attnHost = $('ov-attention');
   if (attnHost) {
@@ -1088,9 +1250,10 @@ function renderOverview() {
 
   var bars = $('ov-risk-bars');
   if (bars) {
-    var byLevel = { CRITICAL: 0, HIGH: 0, MEDIUM: 0, LOW: 0, INFO: 0 };
-    impacts().forEach(function (i) { if (byLevel[i.riskLevel] != null) byLevel[i.riskLevel]++; });
-    var total = impacts().length || 1;
+    // 风险级分布只跟报告内容有关，缓存后每次渲染都是常数时间。
+    var stats = impactStats();
+    var byLevel = stats.byLevel;
+    var total = stats.total || 1;
     bars.innerHTML = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'INFO'].map(function (level) {
       var n = byLevel[level];
       return '<div>' +
@@ -1254,7 +1417,7 @@ function renderSourcesPage() {
       '<div class="cell optional" style="font-size:11.5px;color:var(--text-2)">' + esc(relTime(s.lastSyncedAt)) + '</div>' +
       '<div class="cell actions">' +
         '<button class="icon-btn row-edit" data-edit-source="' + s.id + '" title="编辑代码源" aria-label="编辑代码源 ' + esc(s.name) + '">' +
-          icon('i-edit') + '</button>' +
+          icon('i-pencil') + '</button>' +
         '<button class="icon-btn row-delete" data-delete-source="' + s.id + '" title="删除代码源" aria-label="删除代码源 ' + esc(s.name) + '">' +
           icon('i-trash') + '</button>' +
         '<span class="row-arrow">' + icon('i-chevron-right') + '</span>' +
@@ -1290,20 +1453,44 @@ function renderImportStepper() {
 
 /* ------------------------------------------------------------------- review */
 
-function renderReview() {
-  var report = state.report;
-  var counts = reviewCounts();
-  renderPeerPanel(report, 'rv');
+/**
+ * 复核页的计数部分：页头的"已复核"、四个标签上的数字、以及统计卡里的"已确认"。
+ *
+ * 单独抽出来是因为复核决策只需要改这些数字，不需要重建整个列表。
+ * counts 参数可省，省了就地算一次 —— reviewCounts() 只遍历决策表，不碰 impacts，很便宜。
+ */
+function renderReviewCounters(counts) {
+  counts = counts || reviewCounts();
   var setText = function (id, v) { var el = $(id); if (el) el.textContent = v; };
   var setHtml = function (id, v) { var el = $(id); if (el) el.innerHTML = v; };
 
-  var pickedSource = currentSource();
-  setText('rv-crumb-source', report ? report.sourceName : (pickedSource ? pickedSource.name : '—'));
   setHtml('rv-reviewed', counts.confirmed + counts.dismissed + ' <small>/ ' + counts.total + '</small>');
   setText('rv-n-all', counts.total);
   setText('rv-n-pending', counts.pending);
   setText('rv-n-confirmed', counts.confirmed);
   setText('rv-n-dismissed', counts.dismissed);
+
+  var statsHost = $('rv-stats');
+  if (statsHost) {
+    var report = state.report;
+    statsHost.innerHTML = [
+      statTile('i-database', '对比程序', fmtNum((report && report.summary && report.summary.comparedPrograms) || 0), 'brand'),
+      statTile('i-network', '命中契约', fmtNum((report && report.summary && report.summary.matchedContracts) || 0), 'brand'),
+      statTile('i-alert', '高风险影响', impactStats().highRisk, 'danger'),
+      statTile('i-check-circle', '已确认', counts.confirmed, 'success')
+    ].join('');
+  }
+}
+
+function renderReview() {
+  var report = state.report;
+  var counts = reviewCounts();
+  renderPeerPanel(report, 'rv');
+  var setText = function (id, v) { var el = $(id); if (el) el.textContent = v; };
+
+  var pickedSource = currentSource();
+  setText('rv-crumb-source', report ? report.sourceName : (pickedSource ? pickedSource.name : '—'));
+  renderReviewCounters(counts);
 
   var statePill = $('rv-state-pill');
   if (statePill) {
@@ -1325,61 +1512,150 @@ function renderReview() {
     }
   }
 
-  var statsHost = $('rv-stats');
-  if (statsHost) {
-    statsHost.innerHTML = [
-      statTile('i-database', '对比程序', fmtNum((report && report.summary && report.summary.comparedPrograms) || 0), 'brand'),
-      statTile('i-network', '命中契约', fmtNum((report && report.summary && report.summary.matchedContracts) || 0), 'brand'),
-      statTile('i-alert', '高风险影响', impacts().filter(function (i) { return i.riskLevel === 'HIGH' || i.riskLevel === 'CRITICAL'; }).length, 'danger'),
-      statTile('i-check-circle', '已确认', counts.confirmed, 'success')
-    ].join('');
-  }
-
-  var decisions = decisionsFor(state.analysisId);
   var tab = state.reviewTab;
-  var rows = impacts().filter(function (i) {
-    var d = decisions[String(i.id)];
-    if (tab === 'pending') return !d;
-    if (tab === 'confirmed') return d && d.decision === 'confirmed';
-    if (tab === 'dismissed') return d && d.decision === 'dismissed';
-    return true;
-  });
-  rows.sort(function (a, b) { return (b.riskScore || 0) - (a.riskScore || 0); });
-
   var tabs = document.querySelectorAll('#rv-tabs .tab');
   for (var i = 0; i < tabs.length; i++) {
     tabs[i].classList.toggle('active', tabs[i].getAttribute('data-tab') === tab);
   }
-  var tabNames = { all: '全部发现', pending: '待复核', confirmed: '已确认', dismissed: '已忽略' };
-  setText('rv-findings-sub', (tabNames[tab] || '全部发现') + ' · ' + rows.length + ' 项');
-
-  var host = $('rv-findings');
-  if (host) {
-    host.className = 'card-list';
-    host.innerHTML = rows.length ? rows.map(function (i) {
-      var d = decisions[String(i.id)];
-      var selected = String(state.selectedImpactId) === String(i.id);
-      var statusPill = d
-        ? pill(d.decision === 'confirmed' ? '已确认' : '已忽略', d.decision === 'confirmed' ? 'success' : 'neutral', true)
-        : pill('待审核', 'warning', true);
-      return '<div class="card-row' + (selected ? ' selected' : '') + '" data-impact-id="' + i.id + '">' +
-        '<div class="row-icon ' + (RISK_TONE[i.riskLevel] || 'neutral') + '">' + icon('i-shield') + '</div>' +
-        '<div class="row-main">' +
-          '<div class="row-title"><span class="sym">' + esc(shortSymbol(i.targetSymbol)) + '</span>' + statusPill + '</div>' +
-          '<div class="row-desc">' + esc(i.reason) + '</div>' +
-          '<div class="row-meta">' + chip(impactProgram(i)) +
-            chip(TYPE_LABEL[i.impactType] || i.impactType) +
-            chip('风险 ' + Math.round(i.riskScore || 0)) +
-            chip('置信度 ' + i.confidence) + '</div>' +
-        '</div>' +
-        '<div class="row-right"><div class="row-arrow">' + icon('i-chevron-right') + '</div></div>' +
-        '</div>';
-    }).join('') : (state.report
-      ? emptyBlock('没有符合条件的发现', '切换上方标签，或运行一次新的分析。')
-      : emptyBlockForSource());
-  }
+  var rows = reviewRows(tab, decisionsFor(state.analysisId));
+  renderReviewList(rows, tab);
 
   renderReviewEvidence();
+}
+
+/**
+ * 只重建"发现列表 + 分页控件"这一块，不动页头、统计卡和右侧证据面板。
+ *
+ * 抽出来是为了让切页 / 复核决策 / 切标签都走同一条局部重渲染路径：决策变化时重算计数是必要的，
+ * 但没必要连带重建导航、总览、历史、关系图这些跟决策无关的页面。
+ */
+function renderReviewList(rows, tab) {
+  var host = $('rv-findings');
+  if (!host) return;
+  var setText = function (id, v) { var el = $(id); if (el) el.textContent = v; };
+  // 小标题里的条数是"当前标签下的总数"，不是本页条数，所以跟着列表一起更新。
+  var tabNames = { all: '全部发现', pending: '待复核', confirmed: '已确认', dismissed: '已忽略' };
+  setText('rv-findings-sub', (tabNames[tab] || '全部发现') + ' · ' + rows.length + ' 项');
+  host.className = 'card-list';
+  var win = pageWindow(rows.length, state.reviewPage, REVIEW_PAGE_SIZE);
+  // 页数可能因为筛选变少而夹紧（比如从"全部"切到"已确认"），把夹紧后的值写回 state，
+  // 否则下一次 renderReview 会拿一个越界的页码继续算。
+  state.reviewPage = win.page;
+  var pageRows = rows.slice(win.start, win.end);
+
+  host.innerHTML = pageRows.length ? pageRows.map(reviewRowHtml).join('') : (state.report
+    ? emptyBlock('没有符合条件的发现', '切换上方标签，或运行一次新的分析。')
+    : emptyBlockForSource());
+
+  renderReviewPager(win, rows.length);
+}
+
+/**
+ * 只更新发现列表里"选中"高亮，不重建列表。
+ *
+ * 点一行原来会 renderReview() 整页：50 张卡片全部重新生成 HTML 再让浏览器解析一遍。
+ * 选中的效果只是给一行加 .selected 类，逐个切换 class 比重建整页快一个数量级。
+ * 若选中的发现不在当前页（比如翻了页又点回来），列表里没有任何一行匹配，
+ * 此时保持选中状态不变、只是不高亮 —— 证据面板仍然显示它的内容，行为与改造前一致。
+ */
+function markSelectedReviewRow(impactId) {
+  var host = $('rv-findings');
+  if (!host) return;
+  var rows = host.querySelectorAll('.card-row[data-impact-id]');
+  for (var i = 0; i < rows.length; i++) {
+    rows[i].classList.toggle('selected', rows[i].getAttribute('data-impact-id') === String(impactId));
+  }
+}
+
+/** 一条发现卡片。抽成独立函数，避免分页改动时重复维护这段较长的模板字符串。 */
+function reviewRowHtml(i) {
+  var decisions = decisionsFor(state.analysisId);
+  var d = decisions[String(i.id)];
+  var selected = String(state.selectedImpactId) === String(i.id);
+  var statusPill = d
+    ? pill(d.decision === 'confirmed' ? '已确认' : '已忽略', d.decision === 'confirmed' ? 'success' : 'neutral', true)
+    : pill('待审核', 'warning', true);
+  return '<div class="card-row' + (selected ? ' selected' : '') + '" data-impact-id="' + i.id + '">' +
+    '<div class="row-icon ' + (RISK_TONE[i.riskLevel] || 'neutral') + '">' + icon('i-shield') + '</div>' +
+    '<div class="row-main">' +
+      '<div class="row-title"><span class="sym">' + esc(shortSymbol(i.targetSymbol)) + '</span>' + statusPill + '</div>' +
+      '<div class="row-desc">' + esc(i.reason) + '</div>' +
+      '<div class="row-meta">' + chip(impactProgram(i)) +
+        chip(TYPE_LABEL[i.impactType] || i.impactType) +
+        chip('风险 ' + Math.round(i.riskScore || 0)) +
+        chip('置信度 ' + i.confidence) + '</div>' +
+    '</div>' +
+    '<div class="row-right"><div class="row-arrow">' + icon('i-chevron-right') + '</div></div>' +
+    '</div>';
+}
+
+/**
+ * 分页条：上一页 / 页码 / 下一页。
+ *
+ * 控件动态建在 #rv-findings 的父卡片里，而不是写进 index.html —— 分页是纯前端行为，
+ * 不给静态结构增加一个必须同步维护的节点。页码最多显示 7 个并带省略号，
+ * 756 条 / 每页 50 = 16 页时不会把一条控件撑成两行。
+ */
+function renderReviewPager(win, rowCount) {
+  var host = $('rv-findings');
+  if (!host || !host.parentNode) return;
+  var bar = $('rv-pager');
+  if (!bar) {
+    bar = document.createElement('div');
+    bar.id = 'rv-pager';
+    bar.className = 'pager';
+    host.parentNode.appendChild(bar);
+  }
+  // 只有一页时不显示：没有可翻的页，控件只会占地方。
+  if (win.pages <= 1) {
+    bar.classList.add('hidden');
+    bar.innerHTML = '';
+    return;
+  }
+  bar.classList.remove('hidden');
+
+  var btn = function (label, page, opts) {
+    var o = opts || {};
+    return '<button class="btn btn-sm' + (o.active ? ' btn-primary' : '') + '" type="button"' +
+      ' data-review-page="' + page + '"' + (o.disabled ? ' disabled' : '') +
+      (o.title ? ' title="' + esc(o.title) + '"' : '') + '>' + label + '</button>';
+  };
+
+  var parts = [
+    '<span class="pager-info">第 ' + win.page + ' / ' + win.pages + ' 页 · 共 ' + rowCount + ' 项</span>',
+    '<span class="pager-pages">',
+    btn(icon('i-chevron-left'), win.page - 1, { disabled: !win.hasPrev, title: '上一页' })
+  ];
+  pageNumbers(win.page, win.pages).forEach(function (p) {
+    if (p === '…') { parts.push('<span class="pager-gap">…</span>'); return; }
+    parts.push(btn(String(p), p, { active: p === win.page }));
+  });
+  parts.push(btn(icon('i-chevron-right'), win.page + 1, { disabled: !win.hasNext, title: '下一页' }));
+  parts.push('</span>');
+  bar.innerHTML = parts.join('');
+}
+
+/**
+ * 页码序列，超过 7 页时用 '…' 折叠中间段。
+ * 返回的是数字与字符串 '…' 的混合数组，方便调用方直接 map。
+ */
+function pageNumbers(current, pages) {
+  var max = 7;
+  if (pages <= max) {
+    var all = [];
+    for (var i = 1; i <= pages; i++) all.push(i);
+    return all;
+  }
+  var keep = [1, pages, current, current - 1, current + 1];
+  keep = keep.filter(function (p) { return p >= 1 && p <= pages; })
+    .filter(function (p, idx, arr) { return arr.indexOf(p) === idx; })
+    .sort(function (a, b) { return a - b; });
+  var out = [];
+  for (var j = 0; j < keep.length; j++) {
+    if (j > 0 && keep[j] - keep[j - 1] > 1) out.push('…');
+    out.push(keep[j]);
+  }
+  return out;
 }
 
 function renderReviewEvidence() {
@@ -1443,6 +1719,87 @@ function renderReviewEvidence() {
     ((impact.suggestedTests || []).length
       ? '<ul class="test-list">' + impact.suggestedTests.map(function (t) { return '<li>' + esc(t) + '</li>'; }).join('') + '</ul>'
       : '<div class="empty">未发现覆盖该符号的测试用例，建议新增针对性测试。</div>');
+}
+
+/** 按 id 找一条影响；id 可能来自 data 属性（字符串），所以统一转成字符串比。 */
+function impactById(impactId) {
+  var list = impacts();
+  var key = String(impactId);
+  for (var i = 0; i < list.length; i++) {
+    if (String(list[i].id) === key) return list[i];
+  }
+  return null;
+}
+
+/** 发现列表里对应那一条的 DOM 节点，不在当前页时返回 null。 */
+function findReviewRowNode(impactId) {
+  var host = $('rv-findings');
+  if (!host) return null;
+  var rows = host.querySelectorAll('.card-row[data-impact-id]');
+  var key = String(impactId);
+  for (var i = 0; i < rows.length; i++) {
+    if (rows[i].getAttribute('data-impact-id') === key) return rows[i];
+  }
+  return null;
+}
+
+/**
+ * 复核页在决策之后的最小更新：只替换那一条卡片，外加右侧证据面板里的决策提示。
+ *
+ * 为什么值得这么做：756 条规模下"全部"标签页每页仍有 50 张卡片，
+ * 重建一次就是重新生成并解析 50 段 HTML，而其中 49 段的内容一模一样。
+ *
+ * 只有"全部"标签可以原地替换：其余三个标签的筛选条件本身就包含决策状态，
+ * 这一条会直接进出列表，总条数、总页数都会变，所以退回重建当前这一页（仍然只有 ≤50 行）。
+ */
+function patchReviewAfterDecision(impactId) {
+  var tab = state.reviewTab;
+  var impact = impactById(impactId);
+  if (tab === 'all' && impact) {
+    var node = findReviewRowNode(impactId);
+    if (node) {
+      node.outerHTML = reviewRowHtml(impact);
+      renderReviewEvidence();
+      return;
+    }
+  }
+  renderReviewList(reviewRows(tab, decisionsFor(state.analysisId)), tab);
+  renderReviewEvidence();
+}
+
+/**
+ * 复核决策改变后的局部刷新。
+ *
+ * 之前这里直接 renderAll()：一次确认/忽略会依次重建导航、总览、源码页、发现列表、影响详情、
+ * 分析页、triage、历史、关系图，最后还要 renderMapsFor 重建一次 cytoscape 场景 —— 756 条规模下
+ * 这一整串跟"某一条发现被确认了"没有半点关系。
+ *
+ * 现在只做两件事：刷新计数（导航徽标 + 复核页页头，都是几个数字），
+ * 再按当前所在页面刷新真正受决策影响的那一块内容。
+ *
+ * 其余受决策影响、但此刻不可见的页面不立即重绘 —— 页面是预渲染后靠 CSS 显隐切换的（见 go()），
+ * 给它们标脏，等用户真的切过去时再刷。这样一次确认的代价与"当前页面有多少行"成正比，
+ * 而不是与"工作台一共有多少页面"成正比。
+ */
+function renderAfterDecision(impactId) {
+  renderNavCounts();
+  renderReviewCounters();
+
+  var page = state.page;
+  if (page === 'review') {
+    patchReviewAfterDecision(impactId);
+  } else if (page === 'overview') {
+    renderOverview();
+  } else if (page === 'triage') {
+    renderTriage();
+  }
+  // 其余页面（源码 / 分析 / 历史 / 地图）与复核决策无关，一个都不用碰。
+
+  // 上面只刷了当前页；另外两张依赖决策的页面留到切过去时再刷。
+  state.stalePages = state.stalePages || {};
+  if (page !== 'review') state.stalePages.review = true;
+  if (page !== 'overview') state.stalePages.overview = true;
+  if (page !== 'triage') state.stalePages.triage = true;
 }
 
 /* ------------------------------------------------------------------- impact */
@@ -1605,6 +1962,9 @@ function renderAnalysis() {
   if (report) {
     subHtml = esc(report.baseLabel || '') + ' → ' + esc(report.headLabel || '')
       + ' <span class="sep">·</span> ' + esc(fmtTime(report.generatedAt));
+    // The commit count belongs in the header line: it is the scale of the range, and the card
+    // below repeats it only for readers who scrolled there.
+    if (commitTotal(report) > 0) subHtml += ' <span class="sep">·</span> ' + commitTotal(report) + ' 个提交';
   } else if (selected) {
     subHtml = esc(MODE_LABEL[selected.mode] || selected.mode || '')
       + (selected.targetRef ? ' <span class="sep">·</span> ' + esc(selected.targetRef) : '')
@@ -1650,6 +2010,9 @@ function renderAnalysis() {
       : emptyBlockForSource());
   }
 
+  renderAnalysisCommits(report);
+  renderAnalysisAi(report);
+
   var changes = (report && report.changes) || [];
   setText('an-change-count', changes.length + ' 项');
   var changesHost = $('an-changes');
@@ -1683,7 +2046,8 @@ function renderAnalysis() {
       '<div class="ev-meta">' + esc(size) + ' — 超过单文件读取上限，未参与分析</div></div>';
   }).join('');
   setHtml('an-blindspots', (skippedRows + (blind.length ? blind.slice(0, 30).map(function (b) {
-    return '<div class="ev-row" style="margin-bottom:6px"><div class="ev-type">未解析调用</div>' +
+    var kind = b.kind === 'COLUMN_BLIND_SPOT' ? '字段盲区' : '未解析调用';
+    return '<div class="ev-row" style="margin-bottom:6px"><div class="ev-type">' + kind + '</div>' +
       '<div class="ev-main">' + esc(b.module) + ' · ' + esc(shortFile(b.file)) + ':' + b.line + '</div>' +
       '<div class="ev-meta">' + esc(b.expression) + ' — ' + esc(b.reason) + '</div></div>';
   }).join('') : '')) || (report
@@ -1698,6 +2062,191 @@ function renderAnalysis() {
   }).join('') : (report
     ? emptyBlock('没有附加说明', '引擎未给出额外口径说明。')
     : emptyBlockForSource()));
+}
+
+
+/* ------------------------------------------------------- ai review (report) */
+
+/**
+ * The AI section of an analysis page.
+ *
+ * Four states, and the difference between them is the whole point of the card: a generated review
+ * (labelled 待验证, with the model and the time it was produced), a failed generation (the reason,
+ * because "AI 审核失败" alone cannot be acted on), a report that simply has none yet (offer to
+ * generate one - that is how an old report gets reviewed without re-running the analysis), and an
+ * installation where the feature is off (point at the settings card, do not pretend it exists).
+ *
+ * Hidden entirely while AI is not configured AND the report has no AI section: an installation that
+ * never turns this on must not see a new card appear on every analysis it opens.
+ */
+function renderAnalysisAi(report) {
+  var host = $('an-ai-body');
+  var card = $('an-ai-card');
+  var actions = $('an-ai-actions');
+  var sub = $('an-ai-sub');
+  if (!host || !card || !actions) return;
+
+  var ai = state.ai;
+  var section = report ? report.ai : null;
+  var configured = !!(ai.data && ai.data.ready);
+  var busy = ai.generating != null;
+
+  // No report: nothing to explain, and #an-body is hidden anyway.
+  if (!report) {
+    card.classList.add('hidden');
+    host.innerHTML = '';
+    actions.innerHTML = '';
+    return;
+  }
+
+  // The configuration decides three of the four states, and the analysis page is often the first
+  // screen opened after a reload. Fetch it once and redraw, rather than rendering "未启用" for a
+  // second and then changing the card's meaning under the reader.
+  if (!ai.loaded && !ai.error) {
+    ensureAiLoaded().then(function () {
+      if (state.report) renderAnalysisAi(state.report);
+    });
+  }
+
+  // Neither generated nor configured: stay out of the way entirely.
+  if (!section && !configured) {
+    card.classList.add('hidden');
+    host.innerHTML = '';
+    actions.innerHTML = '';
+    return;
+  }
+
+  card.classList.remove('hidden');
+  var html = '';
+  var buttons = '';
+
+  if (section && section.generated === true) {
+    if (sub) sub.textContent = '基于本页静态分析事实生成的评审要点，不是已验证的结论';
+    html += '<div class="ai-verified-note">' + icon('i-alert') +
+      '<div>' + esc(section.disclaimer || 'AI 生成内容，仅基于下列静态分析事实，属于待验证的分析结论。') + '</div></div>';
+    // renderNotes is the escaped, no-markdown-library renderer already used for release notes:
+    // model output must never reach innerHTML unescaped, and this is the one place it could.
+    html += '<div class="ai-text">' + renderNotes(section.text || '') + '</div>';
+    var foot = [];
+    if (section.model) foot.push('模型 ' + esc(section.model));
+    if (section.generatedAt) foot.push('生成于 ' + esc(fmtTime(section.generatedAt)));
+    if (section.maxImpacts) foot.push('送审 ' + esc(section.maxImpacts) + ' 条影响');
+    if (foot.length) html += '<div class="ai-foot" style="margin-top:10px">' + foot.join(' · ') + '</div>';
+    buttons = '<button class="btn btn-sm" data-ai-generate type="button"' + (busy ? ' disabled' : '') + '>' +
+      (busy ? '<span class="spinner"></span>生成中…' : icon('i-refresh') + '重新生成') + '</button>';
+  } else if (section && section.generated === false) {
+    if (sub) sub.textContent = '上一次生成失败';
+    // The stored failure is shown whatever the current configuration says: it is what happened to
+    // this report, and a user who has since switched the feature off still needs to know the
+    // section on screen is a failed attempt rather than an absent one.
+    html += '<div class="callout danger">' + icon('i-alert-circle') + '<div>' +
+      '<strong>AI 评审说明生成失败</strong><br/>' + esc(section.error || '模型没有返回可用的内容。') +
+      '<div class="ai-foot" style="margin-top:4px">静态分析结论不受影响；' +
+      (configured ? '可修正配置后重试。' : 'AI 审核当前未启用。') + '</div>' +
+      '</div></div>';
+    // Retrying is only offered while the feature is configured: the endpoint answers 400 when it is
+    // not, and a button that reliably fails reads as a broken page rather than a disabled feature.
+    buttons = configured
+      ? '<button class="btn btn-sm" data-ai-generate type="button"' + (busy ? ' disabled' : '') + '>' +
+        (busy ? '<span class="spinner"></span>生成中…' : icon('i-refresh') + '重试') + '</button>'
+      : '<button class="btn btn-sm" data-nav="settings" type="button">' + icon('i-settings') + '去设置</button>';
+  } else if (configured) {
+    if (sub) sub.textContent = '本次分析没有生成 AI 审核，可按需补生成';
+    html += '<div class="callout">' + icon('i-sparkles') + '<div>' +
+      '这次分析只包含静态分析事实。模型 ' + esc(ai.data.model || '') +
+      ' 可以基于这些事实写一份评审要点，发送内容仅限本页摘要。' +
+      '</div></div>';
+    buttons = '<button class="btn btn-sm btn-primary" data-ai-generate type="button"' + (busy ? ' disabled' : '') + '>' +
+      (busy ? '<span class="spinner"></span>生成中…' : icon('i-sparkles') + '生成 AI 评审') + '</button>';
+  } else {
+    if (sub) sub.textContent = '未启用';
+    html += '<div class="callout warning">' + icon('i-info') + '<div>' +
+      '<strong>AI 审核未启用</strong><br/>' +
+      '在「设置 → AI 审核」中配置接口地址与模型后，可以为这份报告生成评审说明。' +
+      '关闭状态下报告只包含静态分析结论。' +
+      '</div></div>';
+    buttons = '<button class="btn btn-sm" data-nav="settings" type="button">' + icon('i-settings') + '去设置</button>';
+  }
+
+  host.innerHTML = html;
+  actions.innerHTML = buttons;
+}
+
+/**
+ * Generates (or regenerates) the AI section of the report on screen.
+ *
+ * The server writes the result into report_json and returns the AI object itself, so the page is
+ * updated from that response rather than by refetching a multi-megabyte report: one small round
+ * trip, and the card cannot disagree with what was stored.
+ */
+async function generateAiReview() {
+  var ai = state.ai;
+  var id = state.analysisId;
+  if (!id || ai.generating != null) return;
+  if (!state.report) return;
+  ai.generating = id;
+  renderAnalysisAi(state.report);
+  try {
+    var result = await api('/analyses/' + id + '/ai-review', { method: 'POST' });
+    state.report.ai = result;
+    if (result && result.generated) toast('AI 评审说明已生成', 'success');
+    else toast('AI 评审说明生成失败：' + ((result && result.error) || '未知原因'), 'danger');
+  } catch (e) {
+    toast('生成失败：' + (e && e.message ? e.message : String(e)), 'danger');
+  } finally {
+    ai.generating = null;
+    if (state.report) renderAnalysisAi(state.report);
+  }
+}
+
+/**
+ * Size of the range. The server may trim report.commits for a very wide range while commitCount
+ * still holds the true total, so the larger of the two is the honest number.
+ */
+function commitTotal(report) {
+  if (!report) return 0;
+  return Math.max((report.commits || []).length, Number(report.commitCount) || 0);
+}
+
+/**
+ * The commit range a run covered, as a card above the change list.
+ *
+ * Hidden rather than emptied when the report has no commits: every mode other than COMMIT_RANGE
+ * leaves this empty, and a visible "提交范围 0 个" card would read as a failed range read on runs
+ * that never had a range.
+ */
+function renderAnalysisCommits(report) {
+  var host = $('an-commits');
+  var card = $('an-commits-card');
+  if (!host || !card) return;
+  var commits = (report && report.commits) || [];
+  card.classList.toggle('hidden', !commits.length);
+  if (!commits.length) {
+    host.innerHTML = '';
+    return;
+  }
+  var total = commitTotal(report);
+  var countEl = $('an-commit-count');
+  if (countEl) countEl.textContent = total + ' 个';
+  var subEl = $('an-commits-sub');
+  if (subEl) subEl.textContent = (report.rangeNote || '') || '本次分析包含的提交，新提交在前';
+
+  // A long range is scrolled, not truncated: the commit list is the evidence that the range the
+  // user picked is the range that ran, so dropping the tail would defeat its purpose.
+  host.innerHTML = '<div class="tr tr-commits head"><div class="cell">提交</div><div class="cell">说明</div>' +
+    '<div class="cell optional">作者</div><div class="cell optional">时间</div></div>' +
+    commits.map(function (c) {
+      var parents = c.parents || [];
+      return '<div class="tr tr-commits">' +
+        '<div class="cell mono">' + esc(c.shortSha || String(c.sha || '').slice(0, 8)) +
+          // A merge commit explains why the range's diff contains changes nobody wrote; the badge
+          // is inline and tiny so it cannot push the sha out of its column.
+          (parents.length > 1 ? '<span class="commit-merge" title="合并提交">合并</span>' : '') + '</div>' +
+        '<div class="cell wrap" title="' + esc(c.sha || '') + '">' + esc(c.subject || '') + '</div>' +
+        '<div class="cell optional">' + esc(c.author || '') + '</div>' +
+        '<div class="cell optional mono">' + esc(fmtTime(c.date)) + '</div>' +
+        '</div>';
+    }).join('');
 }
 
 /**
@@ -1831,9 +2380,13 @@ function renderTriage() {
 
   var host = $('tr-list');
   var decisions = decisionsFor(state.analysisId);
-  var high = impacts().filter(function (i) {
-    return !decisions[String(i.id)] && (i.riskLevel === 'HIGH' || i.riskLevel === 'CRITICAL');
-  }).sort(function (a, b) { return (b.riskScore || 0) - (a.riskScore || 0); });
+  // 沿用 sortedImpacts() 的风险分降序，只做一次 O(n) 过滤，不再重复排序。
+  var ordered = sortedImpacts();
+  var high = [];
+  for (var hi = 0; hi < ordered.length; hi++) {
+    var cand = ordered[hi];
+    if (!decisions[String(cand.id)] && (cand.riskLevel === 'HIGH' || cand.riskLevel === 'CRITICAL')) high.push(cand);
+  }
   setText('tr-high-count', high.length + ' 项');
   if (host) {
     host.innerHTML = high.length ? high.slice(0, 6).map(function (i) {
@@ -1855,13 +2408,12 @@ function renderTriage() {
 
   var advice = $('tr-advice');
   if (advice) {
-    var highConf = impacts().filter(function (i) { return i.confidence === 'HIGH'; }).length;
-    var programCount = {};
-    impacts().forEach(function (i) { programCount[impactProgram(i)] = 1; });
+    var stats = impactStats();
+    var highConf = stats.highConfidence;
     var contractCount = ((state.report && state.report.summary && state.report.summary.matchedContracts) || 0);
     advice.innerHTML = [
       adviceRow('i-target', '优先复核高置信度项', highConf + ' 项置信度为高的其他程序影响最可能真实发生，建议先看。'),
-      adviceRow('i-database', '涉及的程序', Object.keys(programCount).length + ' 个其他程序受到影响，需要分别通知负责人。'),
+      adviceRow('i-database', '涉及的程序', stats.programCount + ' 个其他程序受到影响，需要分别通知负责人。'),
       adviceRow('i-network', '契约命中', contractCount + ' 个跨程序契约命中，建议核对接口、表结构、配置与消息兼容性。')
     ].join('');
   }
@@ -2160,11 +2712,274 @@ async function renderSettings() {
     kvRow('数据目录', h.dataDir),
     kvRow('最大深度', h.maxDepth),
     kvRow('最大文件数', h.maxFiles),
-    kvRow('AI 解读', h.aiEnabled ? '已启用' : '未启用')
+    kvRow('AI 审核', aiHealthLabel(h))
   ].join('') : emptyBlock('无法读取服务状态', '请确认后端服务正在运行。');
   // Version info loads once per page load, not on every renderAll() tick.
   ensureUpdateLoaded();
+  renderAiSettings();
 }
+
+/**
+ * The health row's three states.
+ *
+ * "已启用" alone was the old label and it was wrong in the case that matters: a switch that is on
+ * with no endpoint or model produces nothing, and the row claimed it was working. The third state
+ * is the one that sends the user to the card below with a reason.
+ */
+function aiHealthLabel(h) {
+  if (!h) return '—';
+  if (h.aiReady === true) return '已启用';
+  if (h.aiEnabled === true) return '配置不完整';
+  return '未启用';
+}
+
+/* -------------------------------------------------------------- ai settings */
+
+/**
+ * The three presets only touch the endpoint and the model.
+ *
+ * Deliberately not touching the key: a preset is a typing shortcut for values a user can never
+ * remember exactly, and silently clearing a stored key would turn "pick Ollama to look at it" into
+ * a lost secret. Ollama needs no key at all, which is why the empty-key case has to work.
+ */
+var AI_PRESETS = {
+  deepseek: { baseUrl: 'https://api.deepseek.com/v1', model: 'deepseek-chat' },
+  openai: { baseUrl: 'https://api.openai.com/v1', model: 'gpt-4o-mini' },
+  ollama: { baseUrl: 'http://localhost:11434/v1', model: 'qwen2.5:7b' }
+};
+
+/**
+ * Loads GET /api/ai once per page load.
+ *
+ * Shared by the three surfaces that need to know whether AI is usable - the settings card, the run
+ * dialog and the analysis card - because they can each be the first one opened. A single cached
+ * fetch also means the analysis page cannot show "生成 AI 评审" while the run dialog says the
+ * feature is off: both read the same payload.
+ *
+ * A server that predates the endpoint answers 404; that is recorded once and rendered as a plain
+ * statement rather than thrown, because every caller has other work to do on the same page.
+ */
+async function ensureAiLoaded() {
+  var ai = state.ai;
+  if (ai.loaded || ai.loading) return ai.data;
+  ai.loading = true;
+  try {
+    ai.data = await api('/ai');
+    ai.error = null;
+    ai.loaded = true;
+  } catch (e) {
+    ai.error = e && e.message ? e.message : String(e);
+  } finally {
+    ai.loading = false;
+  }
+  return ai.data;
+}
+
+/**
+ * Loads GET /api/ai once per page load, then keeps the form in sync.
+ *
+ * renderSettings() is called on every renderAll() tick (a live analysis polls every 900 ms), so
+ * this has to be idempotent twice over: the fetch is guarded by `loaded`, and the form is written
+ * only on the first successful load or after an explicit save. Without the second guard, a poll
+ * tick would overwrite whatever the user is half-way through typing - the classic "my input
+ * disappeared while I was looking at it" bug.
+ */
+async function renderAiSettings() {
+  var ai = state.ai;
+  await ensureAiLoaded();
+  renderAiStatus();
+  renderAiTestResult();
+  if (ai.data && !ai.formFilled) fillAiForm(ai.data);
+  if (ai.error) showAiUnsupported(ai.error);
+}
+
+function renderAiStatus() {
+  var ai = state.ai;
+  var pillHost = $('ai-status');
+  var noteHost = $('ai-status-note');
+  if (!pillHost || !noteHost) return;
+  if (ai.error) {
+    pillHost.className = 'pill warning';
+    pillHost.textContent = '接口不可用';
+    noteHost.textContent = '当前服务端没有 /api/ai（' + ai.error + '），AI 审核只能通过 application.yml 配置。';
+    return;
+  }
+  var d = ai.data;
+  if (!d) {
+    pillHost.className = 'pill neutral';
+    pillHost.textContent = '读取中';
+    noteHost.textContent = '正在读取本机配置…';
+    return;
+  }
+  if (d.ready) {
+    pillHost.className = 'pill success';
+    pillHost.textContent = '已启用';
+    noteHost.textContent = '模型 ' + (d.model || '—') + ' · 每次最多送审 ' + d.maxImpacts + ' 条影响';
+  } else if (d.enabled) {
+    pillHost.className = 'pill warning';
+    pillHost.textContent = '配置不完整';
+    noteHost.textContent = (d.reason || '缺少必要配置') + '，补全后即可使用。';
+  } else {
+    pillHost.className = 'pill neutral';
+    pillHost.textContent = '未启用';
+    noteHost.textContent = '静态分析不依赖任何外部服务；启用后才会把分析摘要发送给模型。';
+  }
+  var fileHost = $('ai-settings-file');
+  if (fileHost) fileHost.textContent = d.settingsFile || '—';
+}
+
+/** One write of the whole form; only called on first load and after a successful save. */
+function fillAiForm(d) {
+  var ai = state.ai;
+  if ($('ai-enabled')) $('ai-enabled').checked = d.enabled === true;
+  if ($('ai-base-url')) $('ai-base-url').value = d.baseUrl || '';
+  if ($('ai-model')) $('ai-model').value = d.model || '';
+  if ($('ai-api-key')) {
+    // Never a value, only a statement about the stored one: the browser must not hold the secret.
+    $('ai-api-key').value = '';
+    $('ai-api-key').placeholder = d.apiKeySet ? ('已保存 ' + (d.apiKeyMasked || '') + ' · 留空保持不变') : '未设置';
+  }
+  if ($('ai-max-impacts')) $('ai-max-impacts').value = d.maxImpacts;
+  if ($('ai-timeout')) $('ai-timeout').value = d.timeoutSeconds;
+  if ($('ai-default-runs')) $('ai-default-runs').checked = d.defaultForRuns === true;
+  ai.formFilled = true;
+}
+
+/** The form as the API expects it, read fresh so unsaved edits can be tested. */
+function aiFormBody() {
+  var body = {
+    enabled: !!($('ai-enabled') && $('ai-enabled').checked),
+    baseUrl: $('ai-base-url') ? $('ai-base-url').value.trim() : '',
+    model: $('ai-model') ? $('ai-model').value.trim() : '',
+    maxImpacts: Number($('ai-max-impacts') ? $('ai-max-impacts').value : 0) || undefined,
+    timeoutSeconds: Number($('ai-timeout') ? $('ai-timeout').value : 0) || undefined,
+    defaultForRuns: !!($('ai-default-runs') && $('ai-default-runs').checked)
+  };
+  var key = $('ai-api-key') ? $('ai-api-key').value.trim() : '';
+  // An empty input means "keep the stored key", not "remove it": the field is never pre-filled,
+  // so a user who only edits the model must not lose their key by saving.
+  if (key) body.apiKey = key;
+  return body;
+}
+
+function showAiUnsupported(message) {
+  var host = $('ai-test-result');
+  if (!host) return;
+  host.innerHTML = '<div class="callout warning">' + icon('i-alert') + '<div>' +
+    '<strong>当前服务端不支持在线修改 AI 设置</strong><br/>' +
+    '请升级到包含该接口的版本，或直接编辑 <span class="mono">application.yml</span> 的 ' +
+    '<span class="mono">code-association.ai</span> 后重启服务。<br/>' +
+    '<span class="mono">' + esc(message) + '</span></div></div>';
+}
+
+/** Renders the last test result in its own host, so testing never rewrites the form. */
+function renderAiTestResult() {
+  var host = $('ai-test-result');
+  if (!host || state.ai.error) return;
+  var t = state.ai.test;
+  if (!t) { host.innerHTML = ''; return; }
+  var head = t.ok ? '连接正常' : '连接失败';
+  var details = [];
+  if (t.endpoint) details.push('<span class="mono">' + esc(t.endpoint) + '</span>');
+  if (t.latencyMs) details.push(esc(t.latencyMs) + ' ms');
+  if (t.sample) details.push('返回：<span class="mono">' + esc(t.sample) + '</span>');
+  host.innerHTML = '<div class="callout ' + (t.ok ? 'brand' : 'danger') + '">' +
+    icon(t.ok ? 'i-check-circle' : 'i-alert-circle') + '<div>' +
+    '<strong>' + head + '</strong>：' + esc(t.message || '') +
+    (details.length ? '<div class="ai-foot" style="margin-top:4px">' + details.join(' · ') + '</div>' : '') +
+    '</div></div>';
+}
+
+async function saveAiSettings() {
+  var ai = state.ai;
+  if (ai.saving || ai.error) return;
+  ai.saving = true;
+  setAiButtonsBusy(true, 'save');
+  try {
+    var data = await api('/ai', { method: 'PUT', body: JSON.stringify(aiFormBody()) });
+    if (data) ai.data = data;
+    ai.test = null;
+    ai.formFilled = false;
+    ai.loaded = true;
+    state.health = null; // the health row reads aiEnabled/aiReady; refetch it next render
+    toast('已保存', 'success');
+    renderAiStatus();
+    if (ai.data) fillAiForm(ai.data);
+    renderAiTestResult();
+    renderSettings();
+  } catch (e) {
+    toast(e && e.message ? e.message : String(e), 'danger');
+  } finally {
+    ai.saving = false;
+    setAiButtonsBusy(false, 'save');
+  }
+}
+
+async function testAiConnection() {
+  var ai = state.ai;
+  if (ai.testing || ai.error) return;
+  ai.testing = true;
+  setAiButtonsBusy(true, 'test');
+  try {
+    // The draft is sent as an override so the user can test before saving; blank fields fall back
+    // to the stored configuration on the server, including the key the browser never holds.
+    ai.test = await api('/ai/test', { method: 'POST', body: JSON.stringify(aiFormBody()) });
+  } catch (e) {
+    ai.test = { ok: false, message: e && e.message ? e.message : String(e), endpoint: '', latencyMs: 0, sample: '' };
+  } finally {
+    ai.testing = false;
+    setAiButtonsBusy(false, 'test');
+    renderAiTestResult();
+  }
+}
+
+function clearAiKey() {
+  var ai = state.ai;
+  if (ai.saving || ai.error) return;
+  // Clearing is a save in itself: an unsaved "clear" would leave the form claiming a key is gone
+  // while the server still holds it, and the next save would silently restore it.
+  ai.saving = true;
+  setAiButtonsBusy(true, 'save');
+  api('/ai', { method: 'PUT', body: JSON.stringify({ clearApiKey: true }) })
+    .then(function (data) {
+      if (data) ai.data = data;
+      ai.formFilled = false;
+      toast('已清除 API Key', 'success');
+      renderAiStatus();
+      if (ai.data) fillAiForm(ai.data);
+      renderSettings();
+    })
+    .catch(function (e) { toast(e && e.message ? e.message : String(e), 'danger'); })
+    .then(function () {
+      ai.saving = false;
+      setAiButtonsBusy(false, 'save');
+    });
+}
+
+function applyAiPreset(name) {
+  var preset = AI_PRESETS[name];
+  if (!preset) return;
+  if ($('ai-base-url')) $('ai-base-url').value = preset.baseUrl;
+  if ($('ai-model')) $('ai-model').value = preset.model;
+  var note = $('ai-status-note');
+  if (note) note.textContent = '已填入 ' + preset.baseUrl + ' 与 ' + preset.model + '，保存后生效。';
+}
+
+function setAiButtonsBusy(busy, which) {
+  var save = $('ai-save');
+  var test = $('ai-test');
+  if (save) {
+    save.disabled = busy;
+    save.innerHTML = busy && which === 'save'
+      ? '<span class="spinner"></span>保存中…' : icon('i-check') + '保存';
+  }
+  if (test) {
+    test.disabled = busy;
+    test.innerHTML = busy && which === 'test'
+      ? '<span class="spinner"></span>测试中…' : icon('i-zap') + '测试连接';
+  }
+}
+
 
 /* ------------------------------------------------------- version & updates */
 
@@ -2185,11 +3000,771 @@ function updateState() {
   if (!state.update) {
     state.update = {
       data: null, error: null, checking: false, busy: false, expanded: {}, pendingMsg: null,
+      // A settings save is its own in-flight state: the three switches must not accept a second
+      // click while a PUT is outstanding, or two writes would race on the server and the loser
+      // would leave the toggle showing a value the server never stored.
+      savingSettings: false,
       // The version ledger is a separate, lazily fetched resource: see loadUpdateHistory().
       history: { open: false, loaded: false, loading: false, error: null, data: null }
     };
   }
   return state.update;
+}
+
+/* -------------------------------------------------- restart / network view */
+
+/**
+ * The hot-restart poll. Held at module scope rather than on the update state because the settings
+ * card is re-rendered on every renderAll() tick: a timer started from inside a render would pile
+ * up a new chain per tick, and forty chains all polling and writing the same DOM is exactly the
+ * bug this variable exists to prevent. One id, cleared before a new chain starts.
+ */
+var restartPollTimer = null;
+var restartPollTicks = 0;
+var RESTART_POLL_INTERVAL_MS = 3000;
+var RESTART_POLL_MAX_TICKS = 40;
+
+/** The restart sub-object, or an empty one on a server that predates the field. */
+function restartInfo(d) {
+  return (d && d.restart) || {};
+}
+
+/** The network sub-object, or null when the server does not report one. */
+function networkInfo(d) {
+  return (d && d.network) || null;
+}
+
+function autoRestartEnabled(d) {
+  return !!(d && d.autoRestart === true);
+}
+
+/** Only a server that explicitly says supported === true may hide the manual commands. */
+function restartSupported(d) {
+  return restartInfo(d).supported === true;
+}
+
+function restartRunning(d) {
+  return restartInfo(d).running === true;
+}
+
+/** A failure the server already recorded, i.e. it tried and had to put the old jar back. */
+function restartFailed(d) {
+  var r = restartInfo(d);
+  return r.phase === 'failed' || r.phase === 'rolled-back' || r.rolledBack === true;
+}
+
+/**
+ * A restart the server says is happening, in any of its in-flight shapes.
+ *
+ * Derived strictly from the reported phase, never from the mere presence of a pending swap: a
+ * supervisor that declined to start (platform unsupported, another restart already running) leaves
+ * phase at 'idle' forever, and treating that as "in progress" would strand the card on a spinner
+ * that never resolves. The authoritative restart block from the apply response is what closes the
+ * gap right after a swap — see applyUpdate().
+ */
+function restartActive(d) {
+  var r = restartInfo(d);
+  if (restartRunning(d)) return true;
+  return r.phase === 'spawning' || r.phase === 'waiting';
+}
+
+/**
+ * Cancels the chain but deliberately keeps the tick count.
+ *
+ * The count has to survive a cancel: renderUpdateBody() stops and re-arms the chain on nearly
+ * every tick, and if stopping zeroed the counter the 40-tick budget would never be reached — the
+ * card would poll forever against a service that never comes back. Only a new applyUpdate() resets
+ * it, because that is the only moment a fresh budget is actually warranted.
+ */
+function stopRestartPoll() {
+  if (restartPollTimer) clearTimeout(restartPollTimer);
+  restartPollTimer = null;
+}
+
+/**
+ * Whether there is anything left to wait for.
+ *
+ * A terminal phase ends the wait regardless of what else is on the card: 'succeeded' and
+ * 'rolled-back' are answers, and continuing to poll them would keep a spinner alive over a
+ * result the user is supposed to read. The pendingMsg branch covers the window before the
+ * server has recorded a phase at all — right after apply, the old process is still answering.
+ */
+function restartPollNeeded(d) {
+  var s = updateState();
+  var r = restartInfo(d);
+  if (r.phase === 'succeeded' || r.phase === 'failed' || r.phase === 'rolled-back') return false;
+  // A timed-out watch is an answer too. Without this the render that shows the timeout callout
+  // would immediately re-arm the chain and the timeout would never be visible — the card would
+  // flip back to "正在重启…" one tick later, forever.
+  if (s.restartTimeout || s.restartFailure) return false;
+  if (restartRunning(d)) return true;
+  return !!s.pendingMsg && autoRestartEnabled(d);
+}
+
+/**
+ * Short poll while the service restarts. Every failure is swallowed on purpose: for the few
+ * seconds the JVM is down, api() rejects with a connection error, and that is the expected state,
+ * not something to paint red in the card.
+ */
+function startRestartPoll() {
+  if (restartPollTimer) return;
+  restartPollTimer = setTimeout(restartPollTick, RESTART_POLL_INTERVAL_MS);
+}
+
+async function restartPollTick() {
+  restartPollTimer = null;
+  var s = updateState();
+  restartPollTicks++;
+  var reached = false;
+  try {
+    // /update/restart is the light endpoint: the poll only needs the restart block, and pulling
+    // the whole release list every three seconds would be wasteful while the box is booting.
+    // Without a cached payload there is nothing to merge into, so the full read is the fallback.
+    if (s.data) {
+      var block = await api('/update/restart');
+      // Only merge something that actually looks like a restart block. A proxy, a stale server
+      // or an error page served at this path must not be able to overwrite the real state with
+      // an object whose every field reads as undefined.
+      if (block && (block.phase !== undefined || block.supported !== undefined)) {
+        s.data.restart = block;
+      }
+    } else {
+      s.data = await api('/update');
+    }
+    reached = true;
+  } catch (e) {
+    // Two very different failures land here. A 404/500 means the light endpoint is missing or
+    // broken (an older server), so fall back to the full payload instead of waiting out forty
+    // ticks against an endpoint that will never answer. Anything else is the JVM being down
+    // mid-restart, which is the expected state and must stay silent.
+    if (s.data && /^\d{3}\b/.test(e && e.message ? e.message : '')) {
+      try {
+        s.data = await api('/update');
+        reached = true;
+      } catch (ignored) { /* also unreachable: treat as still down */ }
+    }
+  }
+
+  if (reached) {
+    s.error = null;
+    state.updateLoaded = true;
+    renderUpdateNotice();
+    renderUpdateBody();
+    // renderUpdateBody() may itself restart the chain when a wait is still needed, so this is
+    // the only place that decides to stop. No fall-through scheduling below on this path.
+    if (!restartPollNeeded(s.data)) {
+      stopRestartPoll();
+      settleRestart(s.data);
+      return;
+    }
+    if (restartPollTicks >= RESTART_POLL_MAX_TICKS) {
+      stopRestartPoll();
+      s.restartTimeout = true;
+      renderUpdateBody();
+      return;
+    }
+    if (!restartPollTimer) restartPollTimer = setTimeout(restartPollTick, RESTART_POLL_INTERVAL_MS);
+    return;
+  }
+
+  // Unreachable so far: the process is still down. Keep waiting until the budget runs out.
+  if (restartPollTicks >= RESTART_POLL_MAX_TICKS) {
+    stopRestartPoll();
+    s.restartTimeout = true;
+    renderUpdateBody();
+    return;
+  }
+  restartPollTimer = setTimeout(restartPollTick, RESTART_POLL_INTERVAL_MS);
+}
+
+/**
+ * The moment the restart is over, one of two things happened, and they must not look alike.
+ *
+ * Success reloads the page: the browser is still running the old JS bundle and the old payload,
+ * and a stale card after a successful upgrade is worse than a flash. The 800ms delay exists so
+ * the toast is actually seen before the reload wipes it. A rollback never reloads — the point of
+ * the red callout is that the user reads the reason and the log path.
+ */
+async function settleRestart(d) {
+  var s = updateState();
+  var r = restartInfo(d);
+  if (restartFailed(d)) {
+    s.pendingMsg = null;
+    s.restartFailure = {
+      message: r.message || '',
+      logFile: r.logFile || '',
+      version: r.attemptedVersion || ''
+    };
+    renderUpdateBody();
+    renderUpdateNotice();
+    return;
+  }
+  if (r.phase === 'succeeded') {
+    var version = r.attemptedVersion || (s.pendingMsg && s.pendingMsg.version) || '';
+    s.pendingMsg = null;
+    s.restartFailure = null;
+    try { await loadUpdate(); } catch (ignored) { /* the reload below is the real refresh */ }
+    toast(version ? '已更新到 ' + version + ' 并完成重启' : '已更新并完成重启', 'success');
+    setTimeout(function () { location.reload(); }, 800);
+    return;
+  }
+  // Not running and not failed: the swap is on disk but this process never restarted, so the
+  // manual instruction is still the honest thing to show.
+  renderUpdateBody();
+  renderUpdateNotice();
+}
+
+/* -------------------------------------------- background update progress */
+
+/**
+ * Two polls, each a single module-level id, and deliberately not one chain.
+ *
+ *   progressPollTimer  — 2 s, armed only while progress.active, stopped the moment it ends;
+ *   progressWatchTimer — 15 s discovery, so a run the *server* started becomes visible at all.
+ *
+ * The second one is not redundant. Nothing else in this page polls /api/update: primeUpdateNotice()
+ * runs once at boot and renderSettings() loads the payload once per page load. An unattended
+ * download that begins ten minutes after the page opened would otherwise stay invisible until the
+ * next navigation — which is exactly the complaint this feature exists to fix. It is armed only
+ * when the payload says a background run is possible (autoDownload / autoApply), so an install
+ * with both switches off pays nothing for it. Both timers live at module scope for the same reason
+ * as restartPollTimer: renderUpdateBody() runs on every renderAll() tick, and a chain started from
+ * inside a render would pile up one chain per tick.
+ */
+var progressPollTimer = null;
+var progressWatchTimer = null;
+var PROGRESS_POLL_INTERVAL_MS = 2000;
+var PROGRESS_WATCH_INTERVAL_MS = 15000;
+/** Consecutive failures the fast poll tolerates before handing the job back to the watch. */
+var PROGRESS_POLL_MAX_FAILURES = 10;
+var progressPollFailures = 0;
+var progressPollInFlight = false;
+var progressWatchInFlight = false;
+/** Set once the server answers 404: it predates the endpoint, so stop asking forever. */
+var progressEndpointMissing = false;
+
+/** A finished run stays on screen this long, then fades out. */
+var PROGRESS_FADE_MS = 5000;
+var progressFadeTimer = null;
+var progressFadeKey = null;
+var progressFadedKey = null;
+
+/** The progress sub-object, or null on a server that predates it. */
+function progressInfo(d) {
+  var p = d && d.progress;
+  return p && typeof p === 'object' ? p : null;
+}
+
+/** Whether a pipeline is running right now; a missing block is never "active". */
+function progressActive(d) {
+  var p = progressInfo(d);
+  return !!(p && p.active === true);
+}
+
+/** Identity of one progress block, used to decide whether a repaint is worth it. */
+function progressKey(p) {
+  if (!p) return '';
+  return String(p.phase == null ? '' : p.phase) + '@' + (p.updatedAt == null ? '' : p.updatedAt);
+}
+
+function numOrNull(v) {
+  if (v == null) return null;
+  var n = Number(v);
+  return isNaN(n) ? null : n;
+}
+
+/** "12.4 MB / 39.1 MB", or just what arrived when the total is unknown. */
+function progressBytesText(bytes, total) {
+  if (total != null && total > 0) {
+    return fmtBytes(bytes == null ? 0 : bytes) + ' / ' + fmtBytes(total);
+  }
+  return bytes != null && bytes > 0 ? '已接收 ' + fmtBytes(bytes) : '';
+}
+
+function stopProgressPoll() {
+  if (progressPollTimer) clearTimeout(progressPollTimer);
+  progressPollTimer = null;
+  progressPollFailures = 0;
+}
+
+/**
+ * Arms the fast poll. A no-op while a chain is pending *or in flight*: the tick clears the id
+ * before it awaits, so without the in-flight guard a renderUpdateBody() landing inside that window
+ * would arm a second chain and both would keep polling.
+ */
+function startProgressPoll() {
+  if (progressPollTimer || progressPollInFlight || progressEndpointMissing) return;
+  progressPollTimer = setTimeout(progressPollTick, PROGRESS_POLL_INTERVAL_MS);
+}
+
+function stopProgressWatch() {
+  if (progressWatchTimer) clearTimeout(progressWatchTimer);
+  progressWatchTimer = null;
+}
+
+function startProgressWatch() {
+  if (progressWatchTimer || progressWatchInFlight || progressEndpointMissing) return;
+  progressWatchTimer = setTimeout(progressWatchTick, PROGRESS_WATCH_INTERVAL_MS);
+}
+
+/**
+ * Adopts one block from the light endpoint.
+ *
+ * Only an object that actually looks like a progress block is merged: a proxy, a stale server or
+ * an error page served at this path must not replace the real state with an object whose every
+ * field reads as undefined. A new run also clears the fade marker, so a later success is shown
+ * again without any state having to be reset elsewhere.
+ */
+function adoptProgress(block) {
+  var s = updateState();
+  if (!block || typeof block !== 'object') return false;
+  if (block.phase === undefined && block.active === undefined) return false;
+  if (!s.data) return false;
+  s.data.progress = block;
+  if (block.active === true) progressFadedKey = null;
+  return true;
+}
+
+/**
+ * The 2 s poll. Runs only while the pipeline is active and stops on the first terminal phase.
+ *
+ * Failures are mostly the JVM being down mid-restart, which the restart poll already owns, so they
+ * stay silent — but only for a bounded number of tries: a dead server must not keep a chain alive
+ * forever, and the slow watch is the one that survives that window.
+ */
+async function progressPollTick() {
+  progressPollTimer = null;
+  var s = updateState();
+  if (progressEndpointMissing || !s.data) return;
+  progressPollInFlight = true;
+  var block;
+  try {
+    block = await api('/update/progress');
+    progressPollFailures = 0;
+  } catch (e) {
+    progressPollInFlight = false;
+    // 404 means the endpoint does not exist on this server at all; retrying cannot change that.
+    if (/^404\b/.test(e && e.message ? e.message : '')) {
+      progressEndpointMissing = true;
+      stopProgressPoll();
+      return;
+    }
+    // Mostly the JVM being down mid-restart, which the restart poll owns. Silent, but bounded: a
+    // dead server must not keep a fast chain alive forever — the slow watch outlives that window.
+    progressPollFailures++;
+    if (progressPollFailures >= PROGRESS_POLL_MAX_FAILURES) {
+      progressPollFailures = 0;
+      stopProgressPoll();
+      startProgressWatch();
+      return;
+    }
+    startProgressPoll();
+    return;
+  }
+  // Cleared before the render below, which itself re-arms through syncProgressTimers(): every
+  // re-arm goes through startProgressPoll(), never through a direct setTimeout assignment, or the
+  // id from one of the two paths would be overwritten and the orphan would fire as a second chain.
+  progressPollInFlight = false;
+  adoptProgress(block);
+  renderUpdateNotice();
+  if (state.page === 'settings') renderUpdateProgress(s.data);
+  if (!progressActive(s.data)) {
+    stopProgressPoll();
+    // The run ended, so the pending jar and the release list just changed: one full refresh is
+    // what makes the card agree with the strip that just said "已下载 …".
+    try { await loadUpdate(); } catch (ignored) { /* the strip already says what happened */ }
+    startProgressWatch();
+    return;
+  }
+  startProgressPoll();
+}
+
+/**
+ * The discovery probe: 15 s, and it never decides anything except "a run started".
+ *
+ * It stands down as soon as it sees progress.active and lets the fast poll take over; when that
+ * one stops, it starts this probe again. A run that started and finished between two probes is
+ * still repainted once, because a background failure must not need a navigation to be noticed.
+ */
+async function progressWatchTick() {
+  progressWatchTimer = null;
+  var s = updateState();
+  // No cached payload yet (the boot fetch failed): nothing to merge into, and re-arming here would
+  // keep a timer alive forever. loadUpdate() re-arms through renderUpdateNotice() once it succeeds.
+  if (progressEndpointMissing || !s.data) return;
+  var before = progressKey(progressInfo(s.data));
+  progressWatchInFlight = true;
+  var block;
+  try {
+    block = await api('/update/progress');
+  } catch (e) {
+    progressWatchInFlight = false;
+    if (/^404\b/.test(e && e.message ? e.message : '')) {
+      progressEndpointMissing = true;
+      return;
+    }
+    // Offline, or restarting: keep probing, this is the only way a later run is ever noticed.
+    startProgressWatch();
+    return;
+  }
+  progressWatchInFlight = false;
+  var merged = adoptProgress(block);
+  if (progressActive(s.data)) {
+    stopProgressWatch();
+    renderUpdateNotice();
+    if (state.page === 'settings') renderUpdateProgress(s.data);
+    startProgressPoll();
+    return;
+  }
+  // Same rule as the fast poll: re-arm only through startProgressWatch(), so a render landing in
+  // this window cannot leave a second id behind.
+  startProgressWatch();
+  if (merged && progressKey(block) !== before) {
+    renderUpdateNotice();
+    if (state.page === 'settings') renderUpdateProgress(s.data);
+  }
+}
+
+/**
+ * Everything the progress UI needs, or null when there is nothing worth showing.
+ *
+ * Kept as data rather than markup because the same state is painted in two places — the banner and
+ * the settings strip — and they must not drift into saying different things.
+ */
+function progressView(d) {
+  var p = progressInfo(d);
+  if (!p) return null;
+  var phase = p.phase == null ? 'idle' : String(p.phase);
+  if (!phase || phase === 'idle') return null;
+  var key = progressKey(p);
+  if (phase === 'succeeded' && progressFadedKey === key) return null;
+  // While the supervisor is bringing the service back, renderUpdateRestart() already owns the
+  // strip with its own spinner; two spinners for one restart read as two operations.
+  if (phase === 'restarting' && restartActive(d)) return null;
+
+  var automatic = p.automatic === true;
+  var version = typeof p.version === 'string' ? p.version : '';
+  var bytes = numOrNull(p.bytes);
+  var total = numOrNull(p.totalBytes);
+  var percent = numOrNull(p.percent);
+  // -1 is the server's "total size unknown", not a percentage. Anything else is clamped, so a
+  // stray value from an older server cannot paint a bar wider than its track.
+  percent = percent == null || percent < 0 ? null : Math.max(0, Math.min(100, Math.round(percent)));
+  var bytesText = progressBytesText(bytes, total);
+  var prefix = automatic ? '后台自动更新 · ' : '';
+
+  var view = {
+    phase: phase, key: key, percent: percent, automatic: automatic, version: version,
+    // busy means "in flight, nothing on this banner is clickable". A terminal result and a stalled
+    // restart are not busy: the user has something to do about both.
+    busy: phase === 'downloading' || phase === 'verifying' || phase === 'applying',
+    spinner: false, tone: 'brand', icon: 'i-info', showBar: false, hint: '',
+    // The banner has three text slots and one tone class; filling them here rather than in
+    // renderUpdateNotice() keeps both surfaces saying the same sentence.
+    title: '', detail: bytesText, bannerClass: '',
+    bannerLead: '', bannerVersion: '', bannerTail: ''
+  };
+
+  if (phase === 'downloading') {
+    view.title = prefix + '正在下载' + (version ? ' ' + version : '');
+    view.spinner = true;
+    view.showBar = true;
+    view.bannerClass = 'updating';
+    view.detail = bytesText && percent != null ? bytesText + ' · ' + percent + '%' : bytesText;
+    view.bannerLead = prefix + '正在下载 ';
+    view.bannerVersion = version || '…';
+    view.bannerTail = view.detail ? '，' + view.detail : '';
+  } else if (phase === 'verifying') {
+    view.title = prefix + '正在校验文件' + (version ? ' ' + version : '');
+    view.spinner = true;
+    view.bannerClass = 'updating';
+    view.bannerLead = prefix + '正在校验文件 ';
+    view.bannerVersion = version || '…';
+  } else if (phase === 'applying') {
+    view.title = prefix + '正在替换 jar' + (version ? ' ' + version : '');
+    view.spinner = true;
+    view.bannerClass = 'updating';
+    view.bannerLead = prefix + '正在替换 jar ';
+    view.bannerVersion = version || '…';
+  } else if (phase === 'restarting') {
+    // The supervisor already owns this moment with its own spinner and its own timeout, and a
+    // second spinner for one restart reads as two operations — so when it is really running, the
+    // strip below is the only place that speaks.
+    if (restartActive(d)) return null;
+    // Nobody is going to bring the process back (the supervisor declined, or the platform cannot
+    // restart): a spinner here would be the "forever" state this codebase keeps having to remove.
+    // Say what is actually true instead, and leave the actions reachable.
+    view.title = prefix + '已替换 jar，需要手动重启' + (version ? ' ' + version : '');
+    view.tone = 'warning';
+    view.icon = 'i-alert';
+    view.hint = '自动重启没有执行，重启服务后新版本才会生效。';
+    view.bannerClass = '';
+    view.bannerLead = prefix + '已替换 jar，需要手动重启 ';
+    view.bannerVersion = version || '…';
+  } else if (phase === 'succeeded') {
+    // The server's sentence is more specific than anything assembled here ("已下载 0.6.0" versus
+    // "jar 已替换，需要手动重启服务"), so it wins when present.
+    view.title = (typeof p.message === 'string' && p.message) ||
+      (version ? '已下载 ' + version : '更新已完成');
+    view.tone = '';
+    view.icon = 'i-check-circle';
+    view.detail = bytesText;
+    view.bannerLead = view.title;
+  } else if (phase === 'failed') {
+    view.title = (typeof p.message === 'string' && p.message) ||
+      (automatic ? '后台自动更新失败' : '更新失败');
+    view.tone = 'danger';
+    view.icon = 'i-alert-circle';
+    view.bannerClass = 'failed';
+    view.detail = typeof p.error === 'string' && p.error ? p.error : '';
+    view.hint = '可在设置页重试，或查看日志。';
+    view.bannerLead = view.title + '：';
+    view.bannerTail = view.detail || '可在设置页重试，或查看日志。';
+  } else {
+    return null;
+  }
+  return view;
+}
+
+/** The shape of the strip. Text and bar are painted afterwards, so one code path fills both. */
+function progressHtml(view) {
+  return '<div class="callout ' + view.tone + '">' +
+    (view.spinner ? '<span class="spinner"></span>' : icon(view.icon)) +
+    '<div>' +
+      '<strong data-prog-title></strong>' +
+      '<div data-prog-detail style="margin-top:4px"></div>' +
+      (view.showBar
+        ? '<div class="progress thin" data-prog-bar role="progressbar" aria-valuemin="0" aria-valuemax="100"><span></span></div>'
+        : '') +
+      (view.hint ? '<div style="margin-top:4px">' + esc(view.hint) + '</div>' : '') +
+    '</div></div>';
+}
+
+function paintProgress(host, view) {
+  var title = host.querySelector('[data-prog-title]');
+  if (title) title.textContent = view.title;
+  var detail = host.querySelector('[data-prog-detail]');
+  if (detail) {
+    detail.textContent = view.detail || '';
+    detail.classList.toggle('hidden', !view.detail);
+  }
+  var bar = host.querySelector('[data-prog-bar]');
+  if (!bar) return;
+  var fill = bar.querySelector('span');
+  if (view.percent == null) {
+    // Unknown total size: announcing a percentage would be a lie, and a bar parked at 0% reads as
+    // "stuck". The indeterminate class lets the fill slide instead (see style.css).
+    bar.removeAttribute('aria-valuenow');
+    bar.classList.add('indeterminate');
+    if (fill) fill.style.width = '';
+  } else {
+    bar.setAttribute('aria-valuenow', String(view.percent));
+    bar.classList.remove('indeterminate');
+    if (fill) fill.style.width = view.percent + '%';
+  }
+}
+
+/**
+ * The download/apply progress strip above the card body.
+ *
+ * Same stable-node reasoning as renderUpdateRestart: #upd-body is rewritten wholesale on every
+ * renderAll() tick, and a spinner re-created there would restart its animation constantly. The host
+ * is static markup in index.html; this only rebuilds its contents when the *phase* changes and
+ * otherwise paints the text and the bar in place, so a two-second poll does not flicker.
+ */
+function clearUpdateProgress() {
+  var host = $('upd-progress');
+  if (!host) return;
+  if (host.dataset.phase) {
+    host.innerHTML = '';
+    delete host.dataset.phase;
+  }
+  host.classList.add('hidden');
+}
+
+function renderUpdateProgress(d) {
+  var host = $('upd-progress');
+  if (!host) return;
+  var view = progressView(d);
+  if (!view) {
+    clearUpdateProgress();
+    return;
+  }
+  host.classList.remove('hidden');
+  if (host.dataset.phase !== view.phase) {
+    host.dataset.phase = view.phase;
+    host.innerHTML = progressHtml(view);
+  }
+  paintProgress(host, view);
+  scheduleProgressFade(view);
+}
+
+/**
+ * Fades a finished run out after five seconds.
+ *
+ * Keyed on the block's own updatedAt instead of a boolean: the next run produces a new key, so a
+ * later success is shown again without anything having to reset a flag. Module-level like the
+ * timers, because the render that schedules it runs on every poll tick.
+ */
+function scheduleProgressFade(view) {
+  if (!view || view.phase !== 'succeeded') {
+    // A new run (or none at all) makes any pending fade irrelevant: the block it was counting
+    // down for is no longer the one on screen.
+    if (progressFadeTimer) clearTimeout(progressFadeTimer);
+    progressFadeTimer = null;
+    progressFadeKey = null;
+    return;
+  }
+  if (progressFadedKey === view.key) return;
+  if (progressFadeTimer && progressFadeKey === view.key) return;
+  if (progressFadeTimer) clearTimeout(progressFadeTimer);
+  progressFadeKey = view.key;
+  progressFadeTimer = setTimeout(function () {
+    progressFadeTimer = null;
+    progressFadedKey = progressFadeKey;
+    renderUpdateNotice();
+    renderUpdateProgress(updateState().data);
+  }, PROGRESS_FADE_MS);
+}
+
+/**
+ * The progress strip above the card body.
+ *
+ * It lives outside #upd-body on purpose: renderUpdateBody() rewrites that host wholesale on every
+ * poll tick, and a spinner re-created every three seconds restarts its animation each time, which
+ * reads as a stutter exactly when the user is watching it for reassurance.
+ */
+function renderUpdateRestart(d) {
+  var host = $('upd-restart');
+  if (!host) return;
+  var s = updateState();
+  var r = restartInfo(d);
+  var html = '';
+
+  if (s.restartFailure) {
+    var f = s.restartFailure;
+    html = '<div class="callout danger">' + icon('i-alert-circle') + '<div>' +
+      '<strong>升级失败，已回滚到原版本</strong>' +
+      (f.version ? '<div style="margin-top:4px">目标版本 ' + esc(f.version) + ' 未能启动。</div>' : '') +
+      (f.message ? '<div style="margin-top:4px">' + esc(f.message) + '</div>' : '') +
+      '<div style="margin-top:4px">当前仍在运行升级前的版本，服务可用。可以重新检查更新后再试一次。</div>' +
+      (f.logFile ? '<div class="restart-cmd mono">日志：<code>' + esc(f.logFile) + '</code></div>' : '') +
+      '</div></div>';
+  } else if (restartFailed(d)) {
+    var tried = r.attemptedVersion || (s.pendingMsg && s.pendingMsg.version) || '';
+    html = '<div class="callout danger">' + icon('i-alert-circle') + '<div>' +
+      '<strong>升级失败，已回滚到原版本</strong>' +
+      (tried ? '<div style="margin-top:4px">目标版本 ' + esc(tried) + ' 未能启动。</div>' : '') +
+      (r.message ? '<div style="margin-top:4px">' + esc(r.message) + '</div>' : '') +
+      (r.logFile ? '<div class="restart-cmd mono">日志：<code>' + esc(r.logFile) + '</code></div>' : '') +
+      '</div></div>';
+  } else if (restartActive(d)) {
+    // restartActive() is phase-driven, so a supervisor that never started (idle) falls through to
+    // the manual-command states below instead of leaving a spinner running forever.
+    var ver = r.attemptedVersion || (s.pendingMsg && s.pendingMsg.version) || '';
+    var timeout = d && d.restartTimeoutSeconds ? d.restartTimeoutSeconds : 90;
+    html = '<div class="callout brand">' +
+      '<span class="spinner"></span><div>' +
+      '<strong>' + (ver ? '正在重启到 ' + esc(ver) + '…' : '正在重启服务…') + '</strong>' +
+      (r.message ? '<div style="margin-top:4px">' + esc(r.message) + '</div>' : '') +
+      '<div style="margin-top:4px">预计 ' + esc(String(timeout)) +
+      ' 秒内完成，失败会自动回滚。这期间页面会短暂断开，恢复后自动刷新。</div>' +
+      (r.healthUrl ? '<div class="restart-cmd mono">健康检查：<code>' + esc(r.healthUrl) + '</code></div>' : '') +
+      '</div></div>';
+  } else if (s.restartTimeout) {
+    html = '<div class="callout warning">' + icon('i-alert') + '<div>' +
+      '<strong>重启后等待超时</strong>' +
+      '<div style="margin-top:4px">已经等了约 ' +
+      Math.round(RESTART_POLL_MAX_TICKS * RESTART_POLL_INTERVAL_MS / 1000) +
+      ' 秒仍未拿到服务响应。请确认服务是否已启动，或查看日志。</div>' +
+      '<div style="margin-top:8px"><button class="btn btn-sm" data-update-restart-retry>' +
+      icon('i-refresh') + '重新检查</button></div></div></div>';
+  }
+
+  host.innerHTML = html;
+  host.classList.toggle('hidden', !html);
+}
+
+/* ----------------------------------------------------- auto-update switches */
+
+/**
+ * One switch. Both the key and the value a click would write are in the DOM, so the click handler
+ * never has to infer what the button currently shows — it reads the intent the render baked in.
+ */
+function updateSwitch(key, on, label, hint, disabled, disabledReason) {
+  return '<div class="upd-setting-row">' +
+    '<div class="upd-setting-main">' +
+      '<div class="upd-setting-name">' + esc(label) + '</div>' +
+      '<div class="upd-setting-hint">' + esc(hint) + '</div>' +
+    '</div>' +
+    '<button type="button" class="upd-switch' + (on ? ' on' : '') + '"' +
+      ' data-update-setting="' + esc(key) + '"' +
+      ' data-update-setting-next="' + (on ? 'false' : 'true') + '"' +
+      ' role="switch" aria-checked="' + (on ? 'true' : 'false') + '"' +
+      ' aria-label="' + esc(label + '：' + (on ? '已开启' : '已关闭')) + '"' +
+      (disabled ? ' disabled title="' + esc(disabledReason || '暂不可用') + '"' : '') + '>' +
+      '<span class="upd-switch-knob" aria-hidden="true"></span>' +
+      '<span class="upd-switch-text">' + (on ? '开' : '关') + '</span>' +
+    '</button>' +
+    '</div>';
+}
+
+function renderAutoUpdateSettings(d) {
+  var s = updateState();
+  var busy = !!s.savingSettings;
+  var supported = restartSupported(d);
+  var unsupported = restartInfo(d).unsupportedReason;
+  // On a server that predates these fields, saying so once beats three switches that would PUT to
+  // an endpoint that does not exist.
+  if (d.autoDownload === undefined && d.autoApply === undefined && d.autoRestart === undefined) {
+    return '<div class="section-label">自动更新设置</div>' +
+      '<div class="callout warning">' + icon('i-alert') + '<div>' +
+      '当前服务端不支持在线修改自动更新设置。请在 <span class="mono">application.yml</span> 的 ' +
+      '<span class="mono">code-association.update</span> 下调整后重启服务。</div></div>';
+  }
+  return '<div class="section-label">自动更新设置</div>' +
+    '<div class="upd-settings">' +
+      updateSwitch('autoDownload', d.autoDownload === true, '自动下载',
+        '发现可安装的新版本时自动下载 jar，但不会替换当前运行的版本。', busy) +
+      updateSwitch('autoApply', d.autoApply === true, '自动应用并重启',
+        '下载完成后自动替换 jar 并重启服务。需要同时开启「应用后自动重启」。', busy) +
+      updateSwitch('autoRestart', d.autoRestart === true, '应用后自动重启',
+        supported
+          ? '替换 jar 后由服务自行重启，健康检查失败会自动回滚到原版本。'
+          : '当前环境不支持热重启，开启后仍需手动执行 stop/start 脚本。',
+        busy, unsupported) +
+    '</div>' +
+    (busy ? '<div class="upd-loading"><span class="spinner"></span>正在保存…</div>' : '');
+}
+
+/**
+ * Persists one switch. Only the changed key is sent, so two tabs toggling different switches
+ * cannot clobber each other's value.
+ *
+ * The server rejects autoApply without autoRestart (400 + message). That error is toasted and the
+ * switch simply re-renders from the unchanged payload: the rollback is a re-render, not an undo.
+ */
+async function saveUpdateSetting(key, next) {
+  var s = updateState();
+  if (s.savingSettings) return;
+  s.savingSettings = true;
+  renderUpdateBody();
+  var body = {};
+  body[key] = next;
+  try {
+    var data = await api('/update/settings', { method: 'PUT', body: JSON.stringify(body) });
+    // The response is a full payload, so every other number on the card stays in step with the
+    // save instead of going stale behind it.
+    if (data) s.data = data;
+    s.error = null;
+    toast('已保存', 'success');
+    renderUpdateNotice();
+  } catch (e) {
+    toast(e && e.message ? e.message : String(e), 'danger');
+  } finally {
+    s.savingSettings = false;
+    renderUpdateBody();
+  }
 }
 
 /* --------------------------------------------------------- update notice */
@@ -2238,33 +3813,112 @@ function renderUpdateNotice() {
   var notice = updateNotice();
   var pending = notice.kind !== 'none';
   var banner = $('update-banner');
+  // A restart outranks a version notice: for those few seconds the only thing worth saying at
+  // the top of the page is that the service is coming back. Every action button is hidden with
+  // it — "查看" and "忽略此版本" both describe a release the user cannot act on right now, and
+  // closing the strip would leave them staring at a page whose backend is gone.
+  var restarting = restartActive(d);
+  // A running download outranks the version notice too, and outranks the user's earlier "close":
+  // the notice says a release exists, while this says the machine is already fetching it. For the
+  // same reason as the restart case, the action buttons are hidden — none of them apply to a
+  // transfer the user did not start. A terminal result (failed / succeeded) keeps "查看" so the
+  // card can be reached, but is still dismissible by its own key.
+  var progress = progressView(d);
+  // Scheduled from here rather than only from renderUpdateProgress(): that one runs on the
+  // settings page alone, so a run that finished while the user was elsewhere would leave the
+  // banner saying "已下载 …" for the rest of the page load. Passing null clears a stale timer.
+  scheduleProgressFade(progress);
+  var progressBusy = !!(progress && progress.busy);
+  var progressDismissed = !!(progress && !progressBusy &&
+    state.updateBannerClosed === progress.key);
+  var showProgress = !!progress && !progressDismissed;
   if (banner) {
     // Shown on every page including settings: the banner is the one place that states the
     // version at a glance, and the settings card below it may be scrolled out of view.
-    var show = pending && notice.version !== state.updateBannerClosed;
+    var show = restarting || showProgress || (pending && notice.version !== state.updateBannerClosed);
     banner.classList.toggle('hidden', !show);
-    banner.classList.toggle('tag-only', notice.kind === 'tagOnly');
+    banner.classList.toggle('tag-only', !restarting && !showProgress && notice.kind === 'tagOnly');
+    banner.classList.toggle('restarting', restarting);
+    // The tone classes are exclusive: a failed download must not keep the brand fill it had while
+    // it was running, and a running one must not keep the red of the previous failure.
+    banner.classList.toggle('updating', !restarting && showProgress && progress.bannerClass === 'updating');
+    banner.classList.toggle('failed', !restarting && showProgress && progress.bannerClass === 'failed');
     if (show) {
       var ver = $('update-banner-version');
       var cur = $('update-banner-current');
       var lead = $('update-banner-lead');
       var tail = $('update-banner-tail');
       var view = banner.querySelector('[data-update-banner-view]');
-      if (ver) ver.textContent = notice.version;
-      if (cur) cur.textContent = d.currentVersion || '—';
-      // A tag-only notice is informational: no "查看" button, because the card cannot offer a
-      // download for it. The 忽略 action stays, so the notice can still be silenced.
-      if (lead) lead.textContent = notice.kind === 'tagOnly' ? '发现更新的标签 ' : '发现新版本 ';
-      if (tail) {
-        tail.textContent = notice.kind === 'tagOnly'
-          ? '，但该版本没有可下载的 jar'
-          : '（当前 ' + (d.currentVersion || '—') + '）';
+      var actions = $('update-banner-actions');
+      var iconHost = $('update-banner-icon');
+      var skip = banner.querySelector('[data-update-banner-skip]');
+      if (iconHost) {
+        // One spinner, never two: the strip below has no spinner while a restart is in flight
+        // (see renderUpdateRestart), and this is the single live region for it.
+        iconHost.innerHTML = (restarting || progressBusy)
+          ? '<span class="spinner"></span>'
+          : progress ? icon(progress.icon) : icon('i-arrow-up');
       }
-      if (view) view.classList.toggle('hidden', notice.kind !== 'installable');
+      if (actions) actions.classList.toggle('hidden', restarting || progressBusy);
+      // 忽略此版本 is about a release notice; on a progress banner it would silence the wrong thing.
+      if (skip) skip.classList.toggle('hidden', !!progress);
+      if (restarting) {
+        var target = restartInfo(d).attemptedVersion ||
+          (updateState().pendingMsg && updateState().pendingMsg.version) || '';
+        if (lead) lead.textContent = target ? '正在重启到 ' : '正在重启服务';
+        if (ver) ver.textContent = target || '…';
+        if (tail) tail.textContent = '，完成后页面会自动刷新';
+        if (cur) cur.textContent = '';
+      } else if (showProgress) {
+        if (lead) lead.textContent = progress.bannerLead;
+        if (ver) ver.textContent = progress.bannerVersion || '';
+        if (tail) tail.textContent = progress.bannerTail || '';
+        if (cur) cur.textContent = '';
+        if (view) view.classList.toggle('hidden', progress.phase !== 'failed' && progress.phase !== 'succeeded');
+      } else {
+        if (ver) ver.textContent = notice.version;
+        if (cur) cur.textContent = d.currentVersion || '—';
+        // A tag-only notice is informational: no "查看" button, because the card cannot offer a
+        // download for it. The 忽略 action stays, so the notice can still be silenced.
+        if (lead) lead.textContent = notice.kind === 'tagOnly' ? '发现更新的标签 ' : '发现新版本 ';
+        if (tail) {
+          tail.textContent = notice.kind === 'tagOnly'
+            ? '，但该版本没有可下载的 jar'
+            : '（当前 ' + (d.currentVersion || '—') + '）';
+        }
+        if (view) view.classList.toggle('hidden', notice.kind !== 'installable');
+      }
     }
   }
   var dot = $('rail-update-dot');
-  if (dot) dot.classList.toggle('hidden', !pending);
+  if (dot) dot.classList.toggle('hidden', !pending && !restarting && !showProgress);
+  syncProgressTimers(d);
+}
+
+/**
+ * Keeps exactly one of the two progress timers armed, from whatever render happens to run.
+ *
+ * Called from renderUpdateNotice() because that runs on every page (the banner is global), while
+ * renderUpdateBody() only runs on settings. Idempotent by construction: each start*() returns early
+ * when a chain is pending or in flight, so the many renderAll() ticks cannot stack chains.
+ */
+function syncProgressTimers(d) {
+  if (progressEndpointMissing) {
+    stopProgressPoll();
+    stopProgressWatch();
+    return;
+  }
+  if (progressActive(d)) {
+    stopProgressWatch();
+    startProgressPoll();
+    return;
+  }
+  stopProgressPoll();
+  // The discovery probe exists only for runs nobody asked for. With both automatic behaviours off,
+  // no background pipeline can start on its own, so probing would be pure noise — and an explicit
+  // download by the user already re-fetches the payload that carries the new progress block.
+  if (d && (d.autoDownload === true || d.autoApply === true)) startProgressWatch();
+  else stopProgressWatch();
 }
 
 /**
@@ -2286,6 +3940,15 @@ function showUpdateCard() {
 
 /** Closing is "not now" for this page load; only 忽略此版本 is remembered. */
 function closeUpdateBanner() {
+  // A terminal progress result is closed by its own key, so dismissing "已下载 0.6.0" cannot also
+  // silence the release notice for that version — they are two different messages with two
+  // different lifetimes.
+  var progress = progressView(updateState().data);
+  if (progress && !progress.busy) {
+    state.updateBannerClosed = progress.key;
+    renderUpdateNotice();
+    return;
+  }
   var notice = updateNotice();
   state.updateBannerClosed = notice.version || '';
   renderUpdateNotice();
@@ -2397,11 +4060,33 @@ function jarAsset(release) {
   return null;
 }
 
-/** Why the "应用更新" button is disabled, shown as tooltip and as an inline note. */
+/**
+ * Why the "应用更新" button is disabled, shown as tooltip and as an inline note.
+ *
+ * The server decides this now: it can see whether it was launched from a jar, from target/classes
+ * (mvn spring-boot:run, IDE) or some other way, so its reason is always more accurate than a guess
+ * made here. The old text guessed "possibly started in an IDE", which was wrong for the common
+ * case it was written for — someone who ran "mvn spring-boot:run" in a terminal, not an IDE. The
+ * local branches survive only as the fallback for a server that predates the field: a missing key
+ * must not blank out the callout.
+ */
 function applyBlockedReason(d) {
   if (!d) return '暂时无法判断当前环境是否支持自动应用。';
+  if (typeof d.applyUnsupportedReason === 'string' && d.applyUnsupportedReason.trim() !== '') {
+    return d.applyUnsupportedReason;
+  }
   if (d.runningFromJar) return '检测到无法替换运行中的 jar（Windows 文件锁或权限不足），请手动下载后替换。';
   return '当前不是以 java -jar 方式运行（可能是在 IDE 里启动），替换 jar 不会生效。';
+}
+
+/**
+ * The "what do I run instead" line under a blocked apply. The command comes from the server
+ * because only it knows the launch mode; rendering it as <code> rather than prose keeps it
+ * copy-pasteable. Absent on a supported install and on an older payload, so callers get ''.
+ */
+function applyHintHtml(d) {
+  if (!d || typeof d.applyHint !== 'string' || d.applyHint.trim() === '') return '';
+  return '<div class="restart-cmd mono">建议命令：<code>' + esc(d.applyHint) + '</code></div>';
 }
 
 /** The "current vs latest" summary block. */
@@ -2432,8 +4117,34 @@ function renderUpdateSummary(d) {
   }
   rows.push(kvRow('上次检查', d.checkedAt ? fmtTime(d.checkedAt) : '尚未检查'));
   rows.push(kvRow('检查来源', SOURCE_LABEL[d.source] || d.source || '—'));
+  // How this process was launched explains why auto-apply may be refused, so it belongs next to
+  // the version rather than only inside the warning text. Rendered only when the server sends a
+  // label: an older payload would otherwise produce a row reading "—", which looks like a broken
+  // install instead of a server that simply predates the field.
+  // Not kvRow(): its .v truncates to a single line with an ellipsis, and a launch label is a whole
+  // sentence ("开发模式（mvn spring-boot:run、IDE 或测试直接运行 target/classes）"), so the half
+  // that explains the refusal would be exactly the half cut off.
+  if (typeof d.launchModeLabel === 'string' && d.launchModeLabel.trim() !== '') {
+    rows.push('<div class="kv-row"><span class="k">启动方式</span>' +
+      '<span class="v kv-wrap">' + esc(d.launchModeLabel) + '</span></div>');
+  }
   if (d.repo) rows.push(kvRow('发布仓库', d.repo));
   if (d.checkIntervalMinutes) rows.push(kvRow('自动检查间隔', d.checkIntervalMinutes + ' 分钟'));
+  // Network resilience. Only rendered when the server actually reports the block: an older
+  // payload would otherwise grow five rows all reading "—", which looks like a broken config
+  // rather than a version that simply predates the feature.
+  var net = networkInfo(d);
+  if (net) {
+    rows.push(kvRow('下载镜像', net.downloadMirror ? net.downloadMirror : '直连 github.com'));
+    rows.push(kvRow('代理', net.proxyConfigured === true ? '已配置' : '未配置'));
+    rows.push(kvRow('失败重试', (net.retries == null ? 0 : net.retries) + ' 次'));
+    // The reset time is only meaningful while the gate is actually closed; a stale timestamp
+    // from an expired window would read as "limited right now" when it is not.
+    if (net.rateLimitedUntil) rows.push(kvRow('限流截止', fmtTime(net.rateLimitedUntil)));
+    var urls = net.apiBaseUrls || [];
+    if (urls.length > 1) rows.push(kvRow('备用 API 源', (urls.length - 1) + ' 个'));
+    if (net.activeApiBase && urls.length > 1) rows.push(kvRow('当前 API 源', net.activeApiBase));
+  }
 
   var html = '<div class="upd-hero">' +
     '<div class="upd-version"><div class="upd-version-num">' + esc(version) + '</div>' +
@@ -2475,6 +4186,9 @@ function renderUpdateSummary(d) {
   if (!d.applySupported) {
     html += '<div class="callout warning" style="margin-top:12px"><svg><use href="#i-alert"/></svg>' +
       '<div><strong>当前环境不支持自动应用</strong><br/>' + esc(applyBlockedReason(d)) +
+      // The reason alone leaves the user stuck ("so what do I do?"). The server also knows which
+      // command would make auto-apply possible, so show it as a copyable command line.
+      applyHintHtml(d) +
       '</div></div>';
   }
   return html;
@@ -2647,9 +4361,30 @@ function renderUpdateHistory() {
 
 /** Non-fatal problems from the source (e.g. the tag API failed): shown, but the card still works. */
 function renderUpdateWarnings(d) {
+  var html = '';
+  // Rate limiting comes first because it explains every other warning below it: a check that
+  // "failed" while the quota was exhausted did not really fail, it was told to wait.
+  var net = networkInfo(d);
+  if (net && net.rateLimitedUntil) {
+    html += '<div class="callout warning" style="margin-bottom:14px">' + icon('i-clock') + '<div>' +
+      '<strong>GitHub 已限流</strong>' +
+      '<div style="margin-top:4px">将于 ' + esc(fmtTime(net.rateLimitedUntil)) +
+      ' 恢复。配置 GitHub token 可以提高额度，或降低自动检查频率。</div>' +
+      (net.downloadBlocked
+        ? '<div style="margin-top:4px">下载通道当前不可用' +
+          (net.lastFailureHost ? '（' + esc(net.lastFailureHost) + '）' : '') + '。</div>'
+        : '') +
+      '</div></div>';
+  } else if (net && net.downloadBlocked) {
+    html += '<div class="callout warning" style="margin-bottom:14px">' + icon('i-alert') + '<div>' +
+      '<strong>下载通道不可用</strong>' +
+      '<div style="margin-top:4px">无法连接 ' +
+      esc(net.lastFailureHost || net.activeApiBase || 'GitHub') +
+      '。可以在配置中设置下载镜像或代理后重试。</div></div></div>';
+  }
   var warnings = (d && d.warnings) || [];
-  if (!warnings.length) return '';
-  return '<div class="callout warning" style="margin-bottom:14px">' + icon('i-alert') + '<div>' +
+  if (!warnings.length) return html;
+  return html + '<div class="callout warning" style="margin-bottom:14px">' + icon('i-alert') + '<div>' +
     '<strong>版本信息可能不完整</strong>' +
     '<ul class="upd-warn-list">' + warnings.map(function (w) {
       return '<li>' + esc(w) + '</li>';
@@ -2663,6 +4398,15 @@ function renderUpdateBody() {
   if (!host) return;
   var s = updateState();
   var d = s.data;
+
+  // The progress strips outlive the body rewrite below, so the early returns have to clear them
+  // explicitly — otherwise "正在重启…" would stay on screen over an error card.
+  var strip = $('upd-restart');
+  if (strip && (!d || d.enabled === false)) {
+    strip.innerHTML = '';
+    strip.classList.add('hidden');
+  }
+  if (!d || d.enabled === false) clearUpdateProgress();
 
   if (checkBtn) {
     checkBtn.disabled = s.checking;
@@ -2719,23 +4463,77 @@ function renderUpdateBody() {
       Number(d.startedAt) > Number(s.pendingMsg.swappedAt)) {
     s.pendingMsg = null;
   }
+  // Three cases, and the difference between them is the whole point of the restart supervisor:
+  //
+  //   auto restart available  — the service will bring itself back; show progress, never commands;
+  //   restart switched off    — keep the commands, plus a pointer at the switch that removes them;
+  //   restart not supported   — keep the commands, plus the server's reason.
+  //
+  // The manual commands stay in the last two cases because hiding them would strand anyone whose
+  // platform cannot hot-restart, which is the exact situation the fallback exists for.
+  var pendingCallout = '';
   if (s.pendingMsg) {
-    html += '<div class="callout brand" style="margin-bottom:14px">' + icon('i-check-circle') + '<div>' +
-      '<strong>' + (s.pendingMsg.kind === 'rollback' ? '已回滚到 ' : '已替换为 ') +
-      esc(s.pendingMsg.version || '目标版本') + '</strong>' +
-      '<div style="margin-top:4px">jar 已写入磁盘，但当前进程仍在用旧代码。重启服务后新版本才会生效。</div>' +
-      '<div class="restart-cmd mono">POSIX：<code>./stop.sh &amp;&amp; ./start.sh</code></div>' +
-      '<div class="restart-cmd mono">Windows：先运行 <code>stop.bat</code>，再运行 <code>start.bat</code></div>' +
-      '</div></div>';
+    var pVer = esc(s.pendingMsg.version || '目标版本');
+    var pKind = s.pendingMsg.kind === 'rollback';
+    var autoRestart = autoRestartEnabled(d);
+    var supported = restartSupported(d);
+    var head = '<strong>' + (pKind ? '已回滚到 ' : '已替换为 ') + pVer + '</strong>';
+    if (supported && autoRestart && restartActive(d)) {
+      // Deliberately empty: the progress strip above (renderUpdateRestart) already says
+      // "正在重启到 x…" with a spinner, and two spinners for one restart read as two operations.
+      // Saying "restart it yourself" here would be worse still — it would have people racing the
+      // process that is about to come back.
+      pendingCallout = '';
+    } else if (!supported) {
+      pendingCallout = '<div class="callout warning" style="margin-bottom:14px">' + icon('i-alert') + '<div>' +
+        head +
+        '<div style="margin-top:4px">jar 已写入磁盘，但当前进程仍在用旧代码，且当前环境不支持自动重启，需要手动重启服务。</div>' +
+        (restartInfo(d).unsupportedReason
+          ? '<div style="margin-top:4px">原因：' + esc(restartInfo(d).unsupportedReason) + '</div>' : '') +
+        '<div class="restart-cmd mono">POSIX：<code>./stop.sh &amp;&amp; ./start.sh</code></div>' +
+        '<div class="restart-cmd mono">Windows：先运行 <code>stop.bat</code>，再运行 <code>start.bat</code></div>' +
+        '</div></div>';
+    } else {
+      // autoRestart is on and the platform supports it, yet no restart is running: the supervisor
+      // declined this one (it already had a restart in flight, or it stopped after a failure).
+      // Telling the user to switch on a setting that is already on would be a dead end, so this
+      // variant says what is actually true and offers the retry.
+      var stalled = supported && autoRestart;
+      pendingCallout = '<div class="callout warning" style="margin-bottom:14px">' + icon('i-alert') + '<div>' +
+        head +
+        '<div style="margin-top:4px">jar 已写入磁盘，但当前进程仍在用旧代码。重启服务后新版本才会生效。</div>' +
+        (stalled
+          ? '<div style="margin-top:4px">自动重启本次没有执行' +
+            (restartInfo(d).message ? '：' + esc(restartInfo(d).message) : '') +
+            '，可以手动重启，或再应用一次。</div>'
+          : '<div style="margin-top:6px">可以在下方「自动更新设置」中开启「应用后自动重启」，之后就不需要手动执行这些命令。</div>') +
+        '<div class="restart-cmd mono">POSIX：<code>./stop.sh &amp;&amp; ./start.sh</code></div>' +
+        '<div class="restart-cmd mono">Windows：先运行 <code>stop.bat</code>，再运行 <code>start.bat</code></div>' +
+        '</div></div>';
+    }
   }
+  html += pendingCallout;
   html += renderUpdateWarnings(d);
   html += renderUpdateSummary(d);
+  html += renderAutoUpdateSettings(d);
   html += '<div class="section-label">历史版本</div>';
   html += releases.length
     ? '<div class="rel-list">' + releases.map(renderReleaseRow).join('') + '</div>'
     : emptyBlock('没有版本记录', '检查一次后这里会列出 GitHub 上发布的版本。');
   html += '<div class="section-label">本机版本记录</div>' + renderUpdateHistory();
   host.innerHTML = html;
+
+  // Both progress strips are separate, stable nodes (see renderUpdateProgress / renderUpdateRestart),
+  // so they are rendered outside the innerHTML assignment above.
+  renderUpdateRestart(d);
+  renderUpdateProgress(d);
+
+  // Polling is armed here, not only from applyUpdate(), so a page reloaded mid-restart picks the
+  // watch back up instead of sitting on a card that never moves. startRestartPoll() is a no-op
+  // while a timer is already pending, which is what keeps the many renderAll() ticks from
+  // stacking many chains; the tick budget itself lives in restartPollTicks and is not reset here.
+  if (restartPollNeeded(d)) startRestartPoll();
+  else if (restartPollTimer) stopRestartPoll();
 }
 
 /** First load only; renderAll() calls this on every tick, so keep it idempotent. */
@@ -2759,7 +4557,12 @@ async function loadUpdate() {
       if (s.history.open) loadUpdateHistory();
     }
   } catch (e) {
-    s.error = e && e.message ? e.message : String(e);
+    // While a restart is in flight, "connection refused" is the service being down on purpose.
+    // Storing it as an error would replace the progress card with a red failure the user cannot
+    // act on; the poll is already the thing that will recover the page.
+    if (!restartPollNeeded(s.data)) {
+      s.error = e && e.message ? e.message : String(e);
+    }
   }
   renderUpdateNotice();
   renderUpdateBody();
@@ -2818,6 +4621,10 @@ async function applyUpdate() {
   if (s.busy) return;
   s.busy = true;
   s.pendingMsg = null;
+  s.restartFailure = null;
+  s.restartTimeout = false;
+  stopRestartPoll();
+  restartPollTicks = 0;
   renderUpdateBody();
   try {
     var res = await api('/update/apply', { method: 'POST' });
@@ -2825,12 +4632,25 @@ async function applyUpdate() {
     // "not restarted yet" signal, see the guard in renderUpdateBody().
     s.pendingMsg = { kind: 'apply', version: res && res.version, backupPath: res && res.backupPath,
                      swappedAt: res && res.swappedAt };
-    toast('已替换 jar，请重启服务生效', 'success');
+    // The apply response carries the supervisor's own restart block, which is the authoritative
+    // answer to "did it actually start". Adopting it here removes the guesswork: a supervisor that
+    // declined (platform unsupported, another restart already running) reports phase=idle and the
+    // card goes straight to the manual-command state instead of showing a spinner that never ends.
+    if (s.data && res && res.restart && typeof res.restart === 'object') {
+      s.data.restart = res.restart;
+    }
+    var selfRestart = restartActive(s.data);
+    toast(selfRestart
+      ? '已替换 jar，正在重启服务…'
+      : '已替换 jar，请重启服务生效', 'success');
   } catch (e) {
     toast('应用更新失败：' + (e && e.message ? e.message : e), 'error');
   } finally {
     s.busy = false;
+    // loadUpdate() during a self-restart usually fails with "connection refused" once the old
+    // process exits; that is expected, and the poll below is what actually waits it out.
     try { await loadUpdate(); } catch (ignored) { renderUpdateBody(); }
+    if (restartPollNeeded(s.data)) startRestartPoll();
   }
 }
 
@@ -2855,6 +4675,8 @@ async function rollbackUpdate() {
 /* ------------------------------------------------------------- render master */
 
 function renderAll() {
+  // 全量渲染把每张页面都重画了，之前攒下的脏标自然作废。
+  state.stalePages = {};
   renderNavSources();
   renderNavCounts();
   renderOverview();
@@ -3296,12 +5118,55 @@ async function openRunModal() {
   $('mr-base').value = '';
   $('mr-pr').value = '';
   $('mr-mode').value = 'GIT_DIFF';
-  $('mr-pr-wrap').classList.add('hidden');
-  $('mr-base-wrap').classList.remove('hidden');
+  // Reset through the same switch the select uses, so labels, datalists and the preview cannot
+  // drift out of sync with the mode after a modal was left in range mode.
+  applyRunMode('GIT_DIFF');
   $('mr-error').style.display = 'none';
   openModal('modal-run');
   // Branches come from the repository itself; the pickers are suggestions, not free text.
-  await Promise.all([loadRefs(current.id), renderPeerPicker(current.id)]);
+  await Promise.all([loadRefs(current.id), renderPeerPicker(current.id), primeRunAiOption()]);
+}
+
+/**
+ * The run dialog's optional AI checkbox.
+ *
+ * Three outcomes, and the middle one is why this is a function rather than a template line: a
+ * configured installation gets the checkbox pre-set from `defaultForRuns` (still changeable for
+ * this run), an unconfigured one gets it disabled with the reason, and a server that does not know
+ * the endpoint at all hides the row - a dead checkbox in the dialog would look like a bug in the
+ * run form rather than an optional feature nobody enabled.
+ *
+ * A failure to read /api/ai must never block starting an analysis, so every error path ends in
+ * "hide the row".
+ */
+async function primeRunAiOption() {
+  var wrap = $('mr-ai-wrap');
+  var box = $('mr-ai');
+  var hint = $('mr-ai-hint');
+  if (!wrap || !box) return;
+  var ai = state.ai;
+  if (!ai.loaded) {
+    try {
+      ai.data = await api('/ai');
+      ai.loaded = true;
+      ai.error = null;
+    } catch (e) {
+      ai.error = e && e.message ? e.message : String(e);
+    }
+  }
+  if (ai.error || !ai.data) {
+    wrap.classList.add('hidden');
+    return;
+  }
+  var ready = ai.data.ready === true;
+  wrap.classList.remove('hidden');
+  box.disabled = !ready;
+  box.checked = ready && ai.data.defaultForRuns === true;
+  if (hint) {
+    hint.textContent = ready
+      ? '只发送本次分析摘要（变更、影响路径与原因、盲区），不发送源码全文。'
+      : 'AI 审核未配置完成：' + (ai.data.reason || '缺少接口地址或模型') + '。可在「设置 → AI 审核」中启用。';
+  }
 }
 
 /**
@@ -3353,6 +5218,159 @@ async function loadRefs(sourceId) {
     list.innerHTML = options.map(function (r) { return '<option value="' + esc(r) + '"></option>'; }).join('');
     if (refs.defaultRef && !$('mr-target').value) $('mr-target').value = refs.defaultRef;
   } catch (e) { /* refs are a convenience only */ }
+}
+
+/* ------------------------------------------------------------- commit range */
+
+/**
+ * Commit suggestions for the range pickers.
+ *
+ * The list is filled from the ref currently in the target box, because that is the branch the user
+ * is already thinking about; without it the picker would only offer the repository default and the
+ * user would have to type a sha from memory.
+ */
+async function loadCommits(sourceId) {
+  var list = $('mr-commits');
+  if (!list || !sourceId) return;
+  list.innerHTML = '';
+  // The branch the user is already pointed at, or the source default before anything is typed.
+  var ref = $('mr-target') ? $('mr-target').value.trim() : '';
+  if (!ref) {
+    var src = state.sources.filter(function (x) { return x.id === sourceId; })[0];
+    ref = (src && src.defaultRef) || '';
+  }
+  var query = '/sources/' + sourceId + '/commits?limit=30' + (ref ? '&ref=' + encodeURIComponent(ref) : '');
+  try {
+    var payload = await api(query);
+    var commits = (payload && payload.commits) || [];
+    list.innerHTML = commits.map(function (c) {
+      var sha = c.shortSha || String(c.sha || '').slice(0, 8);
+      return '<option value="' + esc(sha) + '" label="' + esc(c.subject || '') + '"></option>';
+    }).join('');
+  } catch (e) {
+    // Suggestions are a convenience; an unreadable repository must not block the modal. The
+    // preview area is where the user learns why, so nothing is reported here.
+  }
+}
+
+/**
+ * The commits the current range would analyse, shown before the run starts.
+ *
+ * Debounced because both inputs fire on every keystroke and each call shells out to git; a range
+ * half typed is also not worth a request, so it only runs once both ends are non-empty.
+ */
+var rangePreviewTimer = null;
+/** Bumped per request so a slow answer for an old range cannot overwrite a newer one. */
+var rangePreviewSeq = 0;
+
+function scheduleRangePreview() {
+  if (rangePreviewTimer) clearTimeout(rangePreviewTimer);
+  rangePreviewTimer = setTimeout(function () {
+    rangePreviewTimer = null;
+    loadRangePreview();
+  }, 300);
+}
+
+async function loadRangePreview() {
+  var host = $('mr-range-list');
+  var hint = $('mr-range-hint');
+  if (!host || !hint) return;
+  var base = $('mr-base').value.trim();
+  var target = $('mr-target').value.trim();
+  if (!base || !target) {
+    host.innerHTML = '';
+    hint.textContent = '两端都填好后，这里会列出范围内的提交。';
+    return;
+  }
+  var sourceId = Number($('mr-source').value);
+  if (!sourceId) {
+    host.innerHTML = '';
+    hint.textContent = '请先选择代码源。';
+    return;
+  }
+  var seq = ++rangePreviewSeq;
+  hint.textContent = '读取中…';
+  host.innerHTML = '';
+  try {
+    var payload = await api('/sources/' + sourceId + '/commits?base=' + encodeURIComponent(base) +
+      '&target=' + encodeURIComponent(target) + '&limit=100');
+    // A newer keystroke already asked for a different range; this answer is stale.
+    if (seq !== rangePreviewSeq) return;
+    renderRangePreview(payload || {});
+  } catch (e) {
+    if (seq !== rangePreviewSeq) return;
+    // One line, no toast: the server answers 200 with a note for the expected failures (not a
+    // repository, unknown ref), so a thrown error here is the unexpected path and still must not
+    // turn into an error dialog.
+    hint.textContent = '无法读取提交范围：' + e.message;
+    host.innerHTML = '';
+  }
+}
+
+function renderRangePreview(payload) {
+  var host = $('mr-range-list');
+  var hint = $('mr-range-hint');
+  if (!host || !hint) return;
+  var commits = payload.commits || [];
+  if (!commits.length) {
+    host.innerHTML = '';
+    hint.textContent = payload.note || '这个范围内没有提交。';
+    return;
+  }
+  var shown = commits.slice(0, 8);
+  hint.textContent = '共 ' + (payload.count != null ? payload.count : commits.length) + ' 个提交' +
+    (payload.note ? ' · ' + payload.note : '');
+  host.innerHTML = shown.map(function (c) {
+    return '<div class="commit-row">' +
+      '<span class="commit-sha">' + esc(c.shortSha || String(c.sha || '').slice(0, 8)) + '</span>' +
+      '<span class="commit-subject">' + esc(c.subject || '') + '</span>' +
+      '<span class="commit-meta">' + esc(c.author || '') + ' · ' + esc(fmtTime(c.date)) + '</span>' +
+      '</div>';
+  }).join('') + (commits.length > shown.length
+    ? '<div class="commit-more">还有 ' + (commits.length - shown.length) + ' 个提交未列出</div>'
+    : '');
+}
+
+/**
+ * Switches the modal between "pick a branch" and "pick a commit range".
+ *
+ * Labels, datalist and placeholder all change together: leaving the old label ("基线") above a
+ * commit-sha input would describe the wrong thing, since the start of a range is exclusive.
+ */
+function applyRunMode(mode) {
+  var range = mode === 'COMMIT_RANGE';
+  $('mr-pr-wrap').classList.toggle('hidden', mode !== 'PULL_REQUEST');
+  $('mr-base-wrap').classList.toggle('hidden', mode === 'WORKTREE_DIFF');
+  var preview = $('mr-range-preview');
+  if (preview) preview.classList.toggle('hidden', !range);
+
+  var baseLabel = $('mr-base-label');
+  var targetLabel = $('mr-target-label');
+  if (baseLabel) baseLabel.textContent = range ? '起始提交（不含）' : '基线';
+  if (targetLabel) targetLabel.textContent = range ? '结束提交（含）' : '目标';
+
+  $('mr-base').setAttribute('list', range ? 'mr-commits' : 'mr-refs');
+  $('mr-target').setAttribute('list', range ? 'mr-commits' : 'mr-refs');
+  if (range) {
+    $('mr-base').placeholder = 'abc1234 或 HEAD~3';
+    $('mr-target').placeholder = 'def5678 或 HEAD';
+  } else {
+    $('mr-base').placeholder = '留空 = 目标提交的父提交';
+    $('mr-target').placeholder = 'HEAD';
+  }
+
+  if (range) {
+    loadCommits(Number($('mr-source').value));
+    scheduleRangePreview();
+  } else {
+    if (rangePreviewTimer) { clearTimeout(rangePreviewTimer); rangePreviewTimer = null; }
+    // Invalidate any in-flight preview so its answer cannot land in a hidden, reused container.
+    rangePreviewSeq++;
+    var host = $('mr-range-list');
+    var hint = $('mr-range-hint');
+    if (host) host.innerHTML = '';
+    if (hint) hint.textContent = '两端都填好后，这里会列出范围内的提交。';
+  }
 }
 
 function showModalError(hostId, message) {
@@ -3570,6 +5588,12 @@ async function runAnalysisFromModal() {
     pullRequest: mode === 'PULL_REQUEST' ? Number($('mr-pr').value) || null : null,
     peerSourceIds: selectedPeerIds()
   };
+  // Sent only when the checkbox is actually usable: an unconfigured server would ignore it anyway,
+  // and leaving the field out keeps the request identical to what it was before the feature.
+  var aiBox = $('mr-ai');
+  if (aiBox && !aiBox.disabled && !$('mr-ai-wrap').classList.contains('hidden')) {
+    body.aiReview = !!aiBox.checked;
+  }
   if (!body.peerSourceIds.length) {
     showModalError('mr-error', '请至少选择一个要扫描的其他程序');
     return;
@@ -3577,6 +5601,12 @@ async function runAnalysisFromModal() {
   if (mode === 'PULL_REQUEST' && !body.pullRequest) {
     showModalError('mr-error', '请填写 PR / MR 编号');
     return;
+  }
+  // A range with one end missing would silently fall back to the whole history on the server, so
+  // both ends are required and the message names the one that is missing.
+  if (mode === 'COMMIT_RANGE') {
+    if (!body.baseRef) { showModalError('mr-error', '请填写起始提交（不含）'); return; }
+    if (!body.targetRef) { showModalError('mr-error', '请填写结束提交（含）'); return; }
   }
   var btn = $('mr-start');
   btn.disabled = true;
@@ -3680,8 +5710,16 @@ function openDecision(kind, impactId) {
 
 function bindEvents() {
   document.addEventListener('click', function (ev) {
-    var el = ev.target.closest('[data-nav],[data-impact-id],[data-analysis-id],[data-source-id],[data-module],[data-change-id],[data-confirm-impact],[data-dismiss-impact],[data-open-impact],[data-close],[data-open-run],[data-tab],[data-filter],[data-pick-dir],[data-pk-dir],[data-pk-root],[data-delete-source],[data-background-analysis],[data-update-check],[data-update-notes],[data-update-download],[data-update-apply],[data-update-rollback],[data-update-banner-view],[data-update-banner-skip],[data-update-banner-close],[data-update-history],[data-update-history-retry],[data-edit-source],[data-tag-add],[data-tag-remove],[data-tag-group-toggle],[data-tag-filter],[data-tag-filter-clear],[data-export],[data-import-file]');
+    var el = ev.target.closest('[data-nav],[data-impact-id],[data-analysis-id],[data-source-id],[data-module],[data-change-id],[data-confirm-impact],[data-dismiss-impact],[data-open-impact],[data-close],[data-open-run],[data-tab],[data-filter],[data-pick-dir],[data-pk-dir],[data-pk-root],[data-delete-source],[data-background-analysis],[data-update-check],[data-update-notes],[data-update-download],[data-update-apply],[data-update-rollback],[data-update-banner-view],[data-update-banner-skip],[data-update-banner-close],[data-update-history],[data-update-history-retry],[data-update-setting],[data-update-restart-retry],[data-edit-source],[data-tag-add],[data-tag-remove],[data-tag-group-toggle],[data-tag-filter],[data-tag-filter-clear],[data-export],[data-import-file],[data-review-page],[data-ai-save],[data-ai-test],[data-ai-clear-key],[data-ai-preset],[data-ai-generate]');
     if (!el) return;
+
+    // AI actions. Each one owns its own busy state and re-renders only its own region, so a save
+    // or a generation cannot leave the rest of the page showing a stale summary.
+    if (el.hasAttribute('data-ai-save')) { saveAiSettings(); return; }
+    if (el.hasAttribute('data-ai-test')) { testAiConnection(); return; }
+    if (el.hasAttribute('data-ai-clear-key')) { clearAiKey(); return; }
+    if (el.hasAttribute('data-ai-preset')) { applyAiPreset(el.getAttribute('data-ai-preset')); return; }
+    if (el.hasAttribute('data-ai-generate')) { generateAiReview(); return; }
 
     // Version & update actions live on the settings card; each one is a single async call
     // that re-renders the card itself, so no other page needs to be refreshed here.
@@ -3705,6 +5743,23 @@ function bindEvents() {
 
     if (el.hasAttribute('data-update-history')) { toggleUpdateHistory(); return; }
     if (el.hasAttribute('data-update-history-retry')) { loadUpdateHistory(); return; }
+
+    // A switch carries the value its click should write, so the handler never has to read the
+    // rendered state back out of the DOM (which would be wrong the moment a render is in flight).
+    if (el.hasAttribute('data-update-setting')) {
+      var setKey = el.getAttribute('data-update-setting');
+      var setNext = el.getAttribute('data-update-setting-next') === 'true';
+      saveUpdateSetting(setKey, setNext);
+      return;
+    }
+    // After a poll that timed out, this is how the user asks again without reloading the page.
+    if (el.hasAttribute('data-update-restart-retry')) {
+      updateState().restartTimeout = false;
+      restartPollTicks = 0;
+      startRestartPoll();
+      renderUpdateBody();
+      return;
+    }
 
     // Tag groups fold on their head; the head is the closest match, so this runs before any
     // ancestor-based handler could claim the click.
@@ -3763,7 +5818,16 @@ function bindEvents() {
     }
     if (el.hasAttribute('data-tab')) {
       state.reviewTab = el.getAttribute('data-tab');
+      // 换标签等于换了一份数据集，停在第 7 页只会让人以为列表空了。
+      state.reviewPage = 1;
       renderReview();
+      return;
+    }
+    // 分页控件是动态生成的，没有静态 id，靠这个属性识别；只重建列表区域，不动页头和证据面板。
+    if (el.hasAttribute('data-review-page')) {
+      state.reviewPage = Number(el.getAttribute('data-review-page')) || 1;
+      var pagedTab = state.reviewTab;
+      renderReviewList(reviewRows(pagedTab, decisionsFor(state.analysisId)), pagedTab);
       return;
     }
     if (el.hasAttribute('data-filter')) {
@@ -3815,7 +5879,10 @@ function bindEvents() {
         go('impact');
         renderImpact();
       } else {
-        renderReview();
+        // 选中只是"高亮一行 + 换右侧证据"，重建整页会让 50 行卡片全部重排，
+        // 切一行就卡一下。这里只改 .selected 类，再单独刷证据面板。
+        markSelectedReviewRow(state.selectedImpactId);
+        renderReviewEvidence();
       }
       return;
     }
@@ -3963,6 +6030,8 @@ function bindEvents() {
       if (id === 'rv-reset') {
         state.review[String(state.analysisId)] = {};
         persistReview();
+        // 复核状态整体清零后，停在第 9 页没有任何意义。
+        state.reviewPage = 1;
         renderAll();
         toast('已重置本地复核状态');
       }
@@ -4037,6 +6106,9 @@ function bindEvents() {
       mSave.disabled = true;
       try {
         var tags = tagBuffer('m').slice(); // keep a local copy while we close the modal
+        // resetSourceModal() clears state.editingSourceId before the toast is built, which made
+        // every save report "已保存修改" as "代码源已添加". Remember the mode up front instead.
+        var wasEditing = state.editingSourceId != null;
         await saveSourceForm(
           $('m-type').value, $('m-location').value.trim(),
           $('m-ref').value.trim(), $('m-token').value.trim(),
@@ -4046,7 +6118,7 @@ function bindEvents() {
         closeModal('modal-source');
         ['m-location', 'm-ref', 'm-token', 'm-name-preview'].forEach(function (f) { if ($(f)) $(f).value = ''; });
         resetRefSelect($('m-ref'), $('m-ref-hint'));
-        toast(state.editingSourceId ? '已保存修改' : '代码源已添加', 'success');
+        toast(wasEditing ? '已保存修改' : '代码源已添加', 'success');
       } catch (e) {
         showModalError('m-error', '保存失败：' + e.message);
       } finally {
@@ -4057,11 +6129,7 @@ function bindEvents() {
 
   var mode = $('mr-mode');
   if (mode) {
-    mode.addEventListener('change', function () {
-      var m = mode.value;
-      $('mr-pr-wrap').classList.toggle('hidden', m !== 'PULL_REQUEST');
-      $('mr-base-wrap').classList.toggle('hidden', m === 'WORKTREE_DIFF');
-    });
+    mode.addEventListener('change', function () { applyRunMode(mode.value); });
   }
   var mrSource = $('mr-source');
   if (mrSource) {
@@ -4070,11 +6138,30 @@ function bindEvents() {
       if (s) {
         $('mr-target').value = s.defaultRef || '';
         loadRefs(s.id);
+        // Commit suggestions belong to the repository, so they must be re-read for the new one;
+        // the range itself is now meaningless and is cleared rather than previewed.
+        if (mode && mode.value === 'COMMIT_RANGE') {
+          $('mr-base').value = '';
+          loadCommits(s.id);
+          scheduleRangePreview();
+        }
         // The peer list must not offer the program now being analysed.
         renderPeerPicker(s.id);
       }
     });
   }
+  // Both range inputs drive the preview; 'input' also catches a value picked from the datalist on
+  // browsers that do not fire 'change' for it.
+  ['mr-base', 'mr-target'].forEach(function (id) {
+    var el = $(id);
+    if (!el) return;
+    el.addEventListener('input', function () {
+      if (mode && mode.value === 'COMMIT_RANGE') scheduleRangePreview();
+    });
+    el.addEventListener('change', function () {
+      if (mode && mode.value === 'COMMIT_RANGE') scheduleRangePreview();
+    });
+  });
   var mrStart = $('mr-start');
   if (mrStart) mrStart.addEventListener('click', runAnalysisFromModal);
 
@@ -4089,9 +6176,11 @@ function bindEvents() {
         at: new Date().toISOString()
       });
       var kind = pendingDecision.kind;
+      var decidedId = pendingDecision.impactId;
       pendingDecision = null;
       closeModal('modal-decision');
-      renderAll();
+      // 只刷受决策影响的部分，不再整页 renderAll（详见 renderAfterDecision 的注释）。
+      renderAfterDecision(decidedId);
       toast(kind === 'confirmed' ? '已确认该影响' : '已忽略该发现', 'success');
     });
   }
@@ -4104,6 +6193,7 @@ function bindEvents() {
       if (counts.pending > 0) {
         toast('还有 ' + counts.pending + ' 项待复核，已为你定位到待审核标签', 'error');
         state.reviewTab = 'pending';
+        state.reviewPage = 1;
         renderReview();
         return;
       }
@@ -4134,6 +6224,7 @@ function bindEvents() {
     clear.addEventListener('click', function () {
       state.review = {};
       persistReview();
+      state.reviewPage = 1;
       renderAll();
       toast('已清除本地复核状态', 'success');
     });

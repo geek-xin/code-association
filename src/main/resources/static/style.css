@@ -335,6 +335,14 @@ button:focus:not(:focus-visible), input:focus:not(:focus-visible), select:focus:
 .mono { font-family: var(--mono); }
 .tabular { font-variant-numeric: tabular-nums; }
 
+/* An icon is <svg><use href="#i-…"/></svg> with no width/height, and an SVG
+   without an intrinsic size falls back to the replaced-element default of
+   300×150. Every component that owns an icon sets its own size (and still wins
+   here — same specificity, later in the file); this is the floor for the ones
+   that do not, such as the note rows in 结论说明, where three info glyphs used
+   to render 300px wide and push the text into a narrow column. */
+svg:not([width]) { width: 1em; height: 1em; flex: none; }
+
 /* ---------------------------------------------------------------- app shell */
 
 .app {
@@ -971,6 +979,23 @@ button:focus:not(:focus-visible), input:focus:not(:focus-visible), select:focus:
 .card-row.selected { border-color: var(--primary-100); background: var(--primary-50); }
 .card-row .row-title { font-size: 12.5px; }
 
+/* 发现列表分页条。控件由 app.js 动态插到 #rv-findings 之后，所以这里只按 .pager 选。
+   756 条发现一页 50 条，页码最多 7 个，靠 flex-wrap 在窄屏上折行而不是横向溢出。 */
+.pager {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+.pager-info { font-size: 11.5px; color: var(--text-3); font-variant-numeric: tabular-nums; }
+.pager-pages { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
+.pager-pages .btn { min-width: 30px; padding: 5px 8px; }
+.pager-gap { font-size: 11.5px; color: var(--text-3); padding: 0 2px; }
+
 .row-icon {
   width: 32px;
   height: 32px;
@@ -1063,6 +1088,9 @@ button:focus:not(:focus-visible), input:focus:not(:focus-visible), select:focus:
 .kv-row .k { color: var(--text-2); flex: none; }
 .kv-row .v { text-align: right; color: var(--text); font-weight: 500; min-width: 0; overflow: hidden; text-overflow: ellipsis; word-break: break-all; }
 .kv-row .v.mono { font-size: 11.5px; font-weight: 400; }
+/* Values that are a sentence rather than a token (e.g. 启动方式) must wrap: truncating them with
+   an ellipsis hides exactly the half that explains why a button is disabled. */
+.kv-row .v.kv-wrap { white-space: normal; overflow: visible; text-overflow: clip; word-break: normal; overflow-wrap: anywhere; text-align: right; }
 
 /* ---------------------------------------------------------------- stepper */
 
@@ -1230,6 +1258,10 @@ button:focus:not(:focus-visible), input:focus:not(:focus-visible), select:focus:
 .tr .row-delete svg { width: 13px; height: 13px; }
 .tr .sym { font-family: var(--mono); font-size: 11.5px; color: var(--text); }
 .tr .sub { font-size: 11px; color: var(--text-3); margin-top: 2px; }
+/* A .sub that carries a problem rather than metadata ("目录缺失", a clone
+   failure): the muted grey it inherits would read as ordinary detail and the
+   one line explaining why the source cannot be analysed would go unnoticed. */
+.tr .sub.danger-text { color: var(--danger-strong); }
 /* A failure reason is long and unbreakable (paths, URLs, ref names), so it clamps instead of
    pushing the other columns out of the row. The full text stays available as a title tooltip. */
 .tr-reason {
@@ -1245,6 +1277,13 @@ button:focus:not(:focus-visible), input:focus:not(:focus-visible), select:focus:
 .tr-impacts { grid-template-columns: 86px 104px minmax(0, 1fr) 130px 26px; }
 .tr-changes { grid-template-columns: 124px minmax(0, 1fr) 168px 26px; }
 .tr-history { grid-template-columns: 48px minmax(0, 1.4fr) 96px 150px 130px 58px; }
+/* Source rows: type · name+location · status · tags · last run · synced · actions.
+   A .tr without an explicit template falls back to a single implicit column, so every cell
+   stacks vertically — that is how the 最近导入 list grew to ~260px per row.
+   The actions track is 76px, not 58px: .cell.actions is justify-content: flex-end, so a track
+   narrower than edit 26 + delete 24 + arrow 14 + two 4px gaps (72px) does not clip — it spills
+   leftwards over the 同步时间 column, which is why the edit button looked missing. */
+.tr-sources { grid-template-columns: 76px minmax(0, 1.7fr) 96px 150px 128px 92px 76px; }
 
 /* ------------------------------------------------------------------ forms */
 
@@ -1394,6 +1433,61 @@ input[type="checkbox"] { width: 14px; height: 14px; accent-color: var(--primary)
 .peer-row .nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .peer-row .tags { margin-left: auto; flex: none; display: flex; gap: 5px; }
 .peer-empty { padding: 14px 10px; text-align: center; color: var(--text-3); font-size: 12px; }
+
+/* ---------------------------------------------------------- commit range */
+
+/* Range preview in the run modal. Scrolls instead of growing the modal: a wide range is common
+   and the dialog must stay usable without the preview pushing the run button off screen. */
+.commit-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 190px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 6px;
+  background: var(--surface-2);
+}
+.commit-list:empty { display: none; }
+.commit-row {
+  display: grid;
+  grid-template-columns: 68px minmax(0, 1fr) auto;
+  align-items: baseline;
+  gap: 8px;
+  padding: 5px 8px;
+  border-radius: 8px;
+  font-size: 11.5px;
+}
+.commit-row:hover { background: var(--surface-hover); }
+.commit-sha { font-family: var(--mono); font-size: 11px; color: var(--primary); flex: none; }
+.commit-subject { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
+.commit-meta { color: var(--text-3); font-size: 10.5px; flex: none; }
+.commit-more { padding: 5px 8px; color: var(--text-3); font-size: 10.5px; }
+
+/* Commit range card on the analysis page; the four columns mirror the change list above it. */
+/* A wide range can list hundreds of commits, which would push the change list far below the fold.
+   Scrolling keeps every row reachable instead of truncating the evidence. */
+#an-commits { max-height: 360px; overflow-y: auto; }
+.tr-commits { grid-template-columns: 116px minmax(0, 1fr) 130px 110px; cursor: default; }
+.tr-commits .cell.mono { font-family: var(--mono); font-size: 11px; color: var(--primary); }
+/* Merge marker: inline and small, so it shares the sha column instead of widening the table. */
+.commit-merge {
+  margin-left: 5px;
+  padding: 0 4px;
+  border-radius: 4px;
+  font-size: 9.5px;
+  line-height: 15px;
+  color: var(--text-2);
+  background: var(--surface-3);
+  border: 1px solid var(--border);
+  vertical-align: 1px;
+}
+
+@media (max-width: 720px) {
+  .commit-row { grid-template-columns: 64px minmax(0, 1fr); }
+  .commit-meta { display: none; }
+}
 
 /* ---------------------------------------------------------- folder picker */
 
@@ -1594,3 +1688,427 @@ body, .app, .rail, .sidenav, .card, .stat, .modal, .drawer, .toast, .code, .map 
 body.compact .card { padding: 15px; }
 body.compact .card-row { padding: 9px 11px; }
 body.compact .list-row { padding: 10px 11px; }
+
+/* ==========================================================================
+   Version & update card
+   ==========================================================================
+   Restored: this block (upd-hero / rel-* / release-notes / restart-cmd) was
+   dropped in 3256e56 while the markup kept using it, so the card rendered as
+   unstyled text. Every colour comes from the existing theme tokens, so both
+   palettes stay readable. */
+
+.upd-hero {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+  padding-bottom: 14px;
+  margin-bottom: 4px;
+  border-bottom: 1px solid var(--border);
+}
+.upd-version-num {
+  font-size: 30px;
+  line-height: 1.1;
+  font-weight: 600;
+  letter-spacing: -0.03em;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+.upd-version-cap { font-size: 11.5px; color: var(--text-3); margin-top: 5px; }
+.upd-hero-side { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.upd-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.upd-loading { display: flex; align-items: center; gap: 10px; font-size: 12.5px; color: var(--text-2); padding: 8px 0; }
+/* the shared .spinner is sized for the 14px icon slot; shrink it to fit a .btn-sm */
+.btn-sm .spinner { width: 11px; height: 11px; border-width: 1.5px; }
+
+.upd-nodl { display: inline-flex; align-items: center; }
+.upd-warn-list { margin: 6px 0 0; padding-left: 16px; }
+.upd-warn-list li { margin: 2px 0; }
+
+/* release list: one row per version, notes expand underneath */
+.rel-list { display: flex; flex-direction: column; }
+.rel-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+  flex-wrap: wrap;
+  padding: 11px 0;
+}
+.rel-row + .rel-row { border-top: 1px solid var(--border); }
+.rel-main { min-width: 0; flex: 1 1 260px; }
+.rel-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.rel-version {
+  font-family: var(--mono);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+.rel-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 11px;
+  color: var(--text-3);
+  margin-top: 4px;
+}
+.rel-meta .sep { width: 3px; height: 3px; border-radius: 50%; background: var(--border-strong); }
+.rel-actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.rel-note { font-size: 11.5px; color: var(--text-3); margin-top: 4px; }
+
+/* Release notes are untrusted markdown shown as escaped text, never rendered. */
+.release-notes {
+  margin: 4px 0 10px;
+  padding: 11px 13px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--inset-bg);
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 1.7;
+  color: var(--text-body);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 320px;
+  overflow-y: auto;
+}
+.release-notes .release-list { margin: 2px 0; padding-left: 16px; list-style: disc; }
+.release-notes .release-list li { margin: 1px 0; }
+.release-notes .release-gap { display: block; height: 6px; }
+.release-notes .release-h { font-weight: 600; color: var(--text); margin: 4px 0 2px; }
+.upd-notes-foot { font-size: 11.5px; margin: -4px 0 10px; }
+.upd-notes-foot a { color: var(--primary-700); text-decoration: none; }
+.upd-notes-foot a:hover { text-decoration: underline; }
+
+/* restart command hint shown after apply / rollback */
+.restart-cmd { margin-top: 6px; font-size: 11.5px; color: var(--text-body); overflow-wrap: anywhere; }
+.restart-cmd code {
+  font-family: var(--mono);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 1px 5px;
+  color: var(--text);
+}
+
+/* local version ledger */
+.upd-ledger-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.upd-ledger-count { font-size: 11px; color: var(--text-3); font-variant-numeric: tabular-nums; }
+.upd-ledger-body { margin-top: 8px; }
+.upd-ledger-scroll { overflow-x: auto; }
+.upd-ledger-scroll .table { min-width: 620px; }
+.upd-ledger-scroll .tr-ledger { grid-template-columns: 110px repeat(5, minmax(0, 1fr)); cursor: default; }
+.upd-ledger-scroll .tr-ledger .cell { font-size: 11.5px; color: var(--text-2); }
+.upd-ledger-scroll .tr-ledger .sym { color: var(--text); }
+.upd-ledger-foot {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+  margin-top: 8px;
+  font-size: 11px;
+  color: var(--text-3);
+}
+.upd-ledger-foot .mono { overflow-wrap: anywhere; }
+
+/* ==========================================================================
+   Restart progress + auto-update switches
+   ==========================================================================
+   The restart strip is a separate node above #upd-body so its spinner is not
+   re-created on every poll tick. The switches are drawn as two-state pills
+   rather than native checkboxes: a checkbox cannot show "saving…", and the
+   rendered value comes from the server, so the control must be able to show a
+   state the user did not just click. */
+
+.upd-restart { margin-bottom: 14px; }
+.upd-restart .callout { align-items: flex-start; }
+/* A callout carrying a spinner needs the same 15px slot the icons occupy, or the
+   first line of text shifts left by the icon width. */
+.upd-restart .callout > .spinner { margin-top: 1px; }
+
+/* Background download/apply strip. Same node discipline as .upd-restart above: it is
+   repainted in place on every poll tick, so nothing here may animate on re-creation. */
+.upd-progress { margin-bottom: 14px; }
+.upd-progress .callout { align-items: flex-start; }
+.upd-progress .callout > .spinner { margin-top: 1px; }
+.upd-progress .progress { margin-top: 8px; }
+
+/* Unknown total size (percent = -1): a sliding stripe rather than a bar parked at 0%,
+   which reads as "stuck". No number is invented, because a made-up percentage would
+   jump backwards the moment the real total arrives. */
+.progress.indeterminate > span {
+  width: 100%;
+  opacity: 0.55;
+  background: repeating-linear-gradient(90deg, var(--primary) 0 18px, transparent 18px 36px);
+  background-size: 72px 100%;
+  animation: progress-slide 1.1s linear infinite;
+}
+@keyframes progress-slide { to { background-position: 72px 0; } }
+@media (prefers-reduced-motion: reduce) {
+  /* The global reduced-motion rule shortens the animation to nothing, which would leave
+     the stripe mid-cycle. A static muted track says the same thing without moving. */
+  .progress.indeterminate > span { animation: none !important; background-position: 0 0; }
+}
+
+.upd-settings {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border);
+  border-radius: var(--r-control);
+  background: var(--surface-2);
+  overflow: hidden;
+}
+.upd-setting-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 11px 13px;
+  flex-wrap: wrap;
+}
+.upd-setting-row + .upd-setting-row { border-top: 1px solid var(--border); }
+.upd-setting-main { min-width: 0; flex: 1 1 240px; }
+.upd-setting-name { font-size: 12.5px; font-weight: 550; color: var(--text); }
+.upd-setting-hint { font-size: 11.5px; color: var(--text-3); margin-top: 3px; line-height: 1.5; }
+
+.upd-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 3px 10px 3px 4px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-pill);
+  background: var(--surface);
+  color: var(--text-2);
+  font: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  flex: none;
+  transition: background var(--t-fast) var(--ease), border-color var(--t-fast) var(--ease),
+    color var(--t-fast) var(--ease);
+}
+.upd-switch:hover:not(:disabled) { border-color: var(--primary-100); background: var(--primary-50); }
+.upd-switch:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+.upd-switch:disabled { opacity: 0.55; cursor: not-allowed; }
+.upd-switch-knob {
+  width: 26px;
+  height: 15px;
+  border-radius: var(--r-pill);
+  background: var(--border-strong);
+  position: relative;
+  flex: none;
+  transition: background var(--t-fast) var(--ease);
+}
+.upd-switch-knob::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  background: var(--surface);
+  box-shadow: var(--shadow-soft);
+  transition: transform var(--t-fast) var(--ease);
+}
+.upd-switch.on { background: var(--primary-50); border-color: var(--primary-100); color: var(--primary-700); }
+.upd-switch.on .upd-switch-knob { background: var(--primary); }
+.upd-switch.on .upd-switch-knob::after { transform: translateX(11px); }
+.upd-switch-text { min-width: 12px; text-align: center; }
+
+/* ==========================================================================
+   Global update banner
+   ==========================================================================
+   Sits at the top of the workspace and doubles as the restart progress line
+   (see renderUpdateNotice). Only the restarting variant shows a spinner; the
+   notice variant stays quiet so it does not compete with the risk colours on
+   the page below. */
+
+.upd-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 18px;
+  padding: 10px 14px;
+  border: 1px solid var(--primary-100);
+  border-radius: var(--r-control);
+  background: var(--primary-50);
+  color: var(--primary-700);
+  font-size: 12.5px;
+  box-shadow: var(--shadow-soft);
+}
+.upd-banner-icon { display: inline-grid; place-items: center; flex: none; }
+.upd-banner-icon svg { width: 15px; height: 15px; display: block; }
+.upd-banner-icon .spinner { width: 14px; height: 14px; border-width: 2px; }
+.upd-banner-text { min-width: 0; flex: 1 1 260px; overflow-wrap: anywhere; }
+.upd-banner-text b { font-variant-numeric: tabular-nums; }
+.upd-banner-actions { display: flex; align-items: center; gap: 8px; margin-left: auto; flex: none; }
+/* A tag-only notice is informational: quieter border, no brand fill. */
+.upd-banner.tag-only { background: var(--surface-2); border-color: var(--border); color: var(--text-2); }
+.upd-banner.restarting { border-color: var(--primary-100); background: var(--primary-50); color: var(--primary-700); }
+/* A background transfer is in flight (see progressView). Same brand fill as restarting —
+   it is the same kind of message: the machine is busy, nothing for you to click. */
+.upd-banner.updating { border-color: var(--primary-100); background: var(--primary-50); color: var(--primary-700); }
+/* A background transfer failed. Red is warranted here: unlike the notice variant, this
+   banner reports something that already went wrong and will not retry on its own. */
+.upd-banner.failed { border-color: var(--danger-line); background: var(--danger-bg); color: var(--danger-strong); }
+
+@media (max-width: 1024px) {
+  .upd-version-num { font-size: 25px; }
+  .rel-row { flex-direction: column; align-items: stretch; gap: 8px; }
+  .rel-main { flex: 0 0 auto; }
+  .rel-actions { justify-content: flex-start; }
+}
+@media (max-width: 720px) {
+  .upd-banner-actions { margin-left: 0; width: 100%; }
+  .upd-setting-row { gap: 8px; }
+  .upd-switch { margin-left: auto; }
+}
+
+
+/* ==========================================================================
+   Responsive
+   ==========================================================================
+   Restored: commit 3256e56 rewrote the tail of this file and dropped this whole
+   block while the layouts it guards kept their fixed widths. The shell then
+   stayed 1180px wide inside a 1024px window and `body { overflow: hidden }`
+   silently cut off the right-hand column — cards, tables and page actions were
+   unreachable with no scrollbar to reach them. Each breakpoint below is the
+   counterpart of a fixed dimension above, so they have to change together. */
+
+@media (max-width: 1400px) {
+  .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .grid-2 { grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr); }
+}
+
+@media (max-width: 1180px) {
+  /* `min-width: 0` is the load-bearing part: without it the shell keeps its
+     1180px floor and the clipped-column bug comes straight back. The menu
+     narrows through --nav-w so collapsing it still works (.app.nav-collapsed). */
+  .app {
+    --nav-w: 220px;
+    grid-template-columns: var(--rail-w) var(--nav-w) minmax(0, 1fr);
+    min-width: 0;
+  }
+  .workspace { padding: 20px 20px 40px; }
+  .grid-2, .grid-2-even, .grid-3 { grid-template-columns: minmax(0, 1fr); }
+  .flow { grid-template-columns: minmax(0, 1fr); }
+  .page-title { font-size: 22px; }
+  /* Fixed columns shrink before the flexible one does: at this width the shell
+     lost ~50px, and a template whose fixed tracks add up to more than the card
+     forces a horizontal scrollbar for the sake of two dates. */
+  .tr-history { grid-template-columns: 44px minmax(0, 1.4fr) 84px 112px 92px 48px; }
+  /* The source list drops its two least important columns (tags, sync time) here
+     rather than squeezing all seven: with every track kept, the name column fell
+     to ~97px and every repository name and URL was cut to "geek-xin/code-ç". */
+  .tr-sources { grid-template-columns: 52px minmax(0, 1fr) 84px 100px 76px; }
+  .tr-sources .cell:nth-child(4),
+  .tr-sources .cell:nth-child(6) { display: none; }
+  /* Whatever still does not fit scrolls inside its own card instead of being
+     clipped by the shell, which has no scrollbar of its own. */
+  .card.flush > .table { overflow-x: auto; }
+}
+
+@media (max-width: 860px) {
+  #an-progress-card .stepper { grid-auto-flow: row; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px 10px; }
+  /* Narrow screens start folded (see initNav) but can still be expanded on demand. */
+  .app { --nav-w: 216px; grid-template-columns: var(--rail-w) var(--nav-w) minmax(0, 1fr); }
+  .app.nav-collapsed { grid-template-columns: var(--rail-w) 0 minmax(0, 1fr); }
+  .stats { grid-template-columns: minmax(0, 1fr); }
+  /* The middle columns are marked .optional and hidden here, because at this
+     width each would be a few characters wide and unreadable. Each template
+     below therefore has exactly as many tracks as the row has cells left —
+     a template written for the full row would push the trailing cells onto a
+     second grid row and make every record two lines tall. */
+  .tr .cell.optional { display: none; }
+  .tr-changes { grid-template-columns: 96px minmax(0, 1fr) 26px; }
+  /* The run's status stays: "失败" is the reason anyone opens this list, so it
+     is not one of the details that may be dropped to save width. */
+  .tr-history { grid-template-columns: 40px minmax(0, 1fr) 84px 58px; }
+  .tr-history .cell:nth-child(3) { display: block; }
+  .tr-commits { grid-template-columns: 96px minmax(0, 1fr); }
+  /* The version ledger keeps all six of its columns and scrolls sideways instead:
+     its dates are the whole point of the table, and dropping them would leave
+     six values in a two-column grid. */
+  .upd-ledger-scroll .tr-ledger { grid-template-columns: 96px repeat(5, minmax(90px, 1fr)); }
+  /* Source rows keep type · name+location · status · actions. Tags, the last
+     run summary and the sync time are .optional and already hidden above, so the
+     template must have exactly as many tracks as there are cells left — a
+     leftover track would push the action buttons into an empty column. */
+  .tr-sources { grid-template-columns: 52px minmax(0, 1fr) 84px 76px; }
+  .tr-sources .cell:nth-child(3) { display: block; }
+}
+
+/* Compact density: row and tile paddings belong to the same preference as
+   .card, so they cannot be dropped while the setting still offers 紧凑. */
+body.compact .tr { padding: 7px 12px; }
+body.compact .stat { padding: 11px 14px; }
+body.compact .row-desc { -webkit-line-clamp: 1; }
+
+/* ==========================================================================
+   AI review (optional)
+   ==========================================================================
+   Two surfaces share these rules: the settings card, which is a form, and the
+   analysis card, which is generated prose. They are kept together because the
+   one thing they must agree on is the "AI 生成 · 待验证" label - if the label
+   looked like an ordinary section heading, a reader would take the model's
+   wording for an analysis fact.
+   ========================================================================== */
+
+.ai-status-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 12px;
+}
+.ai-status-note { font-size: 11.5px; color: var(--text-2); line-height: 1.5; min-width: 0; }
+
+/* Quick-fill buttons. Deliberately plain .btn-sm: they are a typing shortcut,
+   not a decision, so they must not read as a primary action next to 保存. */
+.ai-presets { display: inline-flex; gap: 6px; flex-wrap: wrap; }
+
+/* Generated prose. pre-wrap because the model answers in numbered lines and
+   collapsing them would run four review points into one paragraph. Line height
+   follows the reading-copy range (1.7) - this is the longest text block on the
+   analysis page, and tight leading makes a misread likely. */
+.ai-text {
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 12.5px;
+  line-height: 1.7;
+  color: var(--text-body);
+}
+
+/* Provenance line. --text-3 is correct here and only here: it is metadata
+   (model, time), not something the reader has to act on. */
+.ai-foot { font-size: 11px; color: var(--text-3); line-height: 1.6; }
+
+.ai-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
+
+/* The label sits inside the card head, next to the title, so the "待验证"
+   warning travels with the content instead of living in a footnote nobody reads. */
+.ai-verified-note {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  font-size: 11px;
+  color: var(--warning-fg);
+  background: var(--warning-bg);
+  border: 1px solid var(--warning-line);
+  border-radius: var(--r-control);
+  padding: 7px 10px;
+  line-height: 1.55;
+  margin-bottom: 12px;
+}
+.ai-verified-note svg { width: 13px; height: 13px; flex: none; margin-top: 1px; }
+
+@media (max-width: 860px) {
+  .ai-presets { width: 100%; }
+}
+

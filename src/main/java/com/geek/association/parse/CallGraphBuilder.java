@@ -69,6 +69,13 @@ public class CallGraphBuilder {
     private final Map<String, CompilationUnit> units;
     private final TypeResolver resolver;
     private final Map<String, List<TypeInfo>> implCache = new HashMap<>();
+    /** type key -> TypeInfo; built once so implementationsOf does not rescan every type. */
+    private Map<String, TypeInfo> typesByKey;
+    /**
+     * method name -> 静态候选类型。原来每个 receiver 解析失败的调用点都重扫一遍全部类型，
+     * 而候选只取决于方法名，同一个名字在一个仓库里会重复出现成千上万次。
+     */
+    private final Map<String, List<TypeInfo>> globalCache = new HashMap<>();
     /** Optional per-file progress; null when the caller does not report it. */
     private final FileProgress onFile;
     /** Every method name declared anywhere in the project - used to tell a real blind spot from a JDK call. */
@@ -214,19 +221,128 @@ public class CallGraphBuilder {
         if (block == null) {
             return;
         }
-        for (VariableDeclarator v : block.findAll(VariableDeclarator.class)) {
-            scope.vars.put(v.getNameAsString(), v.getType().asString());
-        }
-        for (MethodCallExpr call : block.findAll(MethodCallExpr.class)) {
+        // 原来这里对方法体做了 4 次 findAll，refineUsage 里又做 ~9 次，合计十来次全树遍历。
+        // 改成一次遍历把需要的东西都收集齐：BodyScan 的访问顺序就是 findAll 的深度优先顺序，
+        // 所以变量表 / 调用点 / 创建点 / 方法引用的处理顺序与之前完全一致。
+        BodyScan scan = new BodyScan();
+        scan.run(block);
+        scope.vars.putAll(scan.vars);
+        for (MethodCallExpr call : scan.calls) {
             resolveCall(call, scope, methodSym);
         }
-        for (ObjectCreationExpr oce : block.findAll(ObjectCreationExpr.class)) {
+        for (ObjectCreationExpr oce : scan.creations) {
             resolveCreation(oce, scope, methodSym);
         }
-        for (MethodReferenceExpr ref : block.findAll(MethodReferenceExpr.class)) {
+        for (MethodReferenceExpr ref : scan.references) {
             resolveMethodReference(ref, scope, methodSym);
         }
-        refineUsage(block, methodSym);
+        refineUsage(scan, methodSym);
+    }
+
+    /**
+     * 一次遍历收集方法体里后续要用到的全部信息。
+     *
+     * 原实现对「每个调用点」和「每个条件子树」分别 findAll，等于把同一棵树反复走十几遍。
+     * 这里只走一遍：
+     *   - 进入调用点时把它压栈，之后遇到的每个名字都同时记进栈上所有调用点的集合，
+     *     等价于对每个调用点做 findAll(NameExpr)；
+     *   - 条件子树用一个深度计数标记，进入条件表达式后遇到的名字并进 conditionVars，
+     *     等价于对每个 IfStmt/WhileStmt/DoStmt/ForStmt/ConditionalExpr/SwitchStmt 的条件做 findAll。
+     */
+    private static final class BodyScan {
+        final Map<String, String> vars = new LinkedHashMap<>();
+        final List<MethodCallExpr> calls = new ArrayList<>();
+        final List<ObjectCreationExpr> creations = new ArrayList<>();
+        final List<MethodReferenceExpr> references = new ArrayList<>();
+        /** 所有分支/循环条件里出现过的名字（markFlowsIntoCondition 用的那一份）。 */
+        final Set<String> conditionVars = new LinkedHashSet<>();
+        /** 调用点 -> 它子树里出现过的名字（refineUsage 判断「结果是否只喂给日志」用的那一份）。 */
+        final Map<MethodCallExpr, Set<String>> callNames = new HashMap<>();
+        private final List<Set<String>> callStack = new ArrayList<>();
+        private int conditionDepth;
+
+        /**
+         * 显式递归而不是 Node.walk：walk 只有「进入」一个回调，而这里需要在离开调用点时把它
+         * 出栈。getChildNodes() 的顺序就是 findAll 的深度优先顺序，所以遍历结果与原来一致。
+         *
+         * 「是不是条件根」只判一次，进入/离开共用同一个结论 —— 每个节点都查一遍父节点太浪费。
+         */
+        void run(Node body) {
+            boolean conditionRoot = isConditionRoot(body);
+            enter(body, conditionRoot);
+            for (Node child : body.getChildNodes()) {
+                run(child);
+            }
+            exit(body, conditionRoot);
+        }
+
+        private void enter(Node node, boolean conditionRoot) {
+            // 先判条件根：条件本身可能就是一个 NameExpr（if (flag)），那时它自己也算「条件里出现的名字」。
+            if (conditionRoot) {
+                conditionDepth++;
+            }
+            if (node instanceof NameExpr ne) {
+                String name = ne.getNameAsString();
+                for (Set<String> names : callStack) {
+                    names.add(name);
+                }
+                if (conditionDepth > 0) {
+                    conditionVars.add(name);
+                }
+                return;
+            }
+            if (node instanceof VariableDeclarator v) {
+                vars.put(v.getNameAsString(), v.getType().asString());
+            } else if (node instanceof MethodCallExpr call) {
+                calls.add(call);
+                Set<String> names = new LinkedHashSet<>();
+                callNames.put(call, names);
+                callStack.add(names);
+            } else if (node instanceof ObjectCreationExpr oce) {
+                creations.add(oce);
+            } else if (node instanceof MethodReferenceExpr ref) {
+                references.add(ref);
+            }
+        }
+
+        private void exit(Node node, boolean conditionRoot) {
+            if (node instanceof MethodCallExpr) {
+                callStack.remove(callStack.size() - 1);
+            }
+            if (conditionRoot) {
+                conditionDepth--;
+            }
+        }
+    }
+
+    /**
+     * 该节点是不是某个分支/循环语句（或三元表达式）的条件表达式本身。
+     *
+     * 只有条件表达式本身算，then/else 分支不算 —— 否则「变量出现在 if 的某个分支里」也会被当成
+     * 「变量参与了条件」，把一堆 CALLS 边误标成 CONDITION。
+     */
+    private static boolean isConditionRoot(Node node) {
+        return node.getParentNode().map(parent -> {
+            if (parent instanceof IfStmt s) {
+                return s.getCondition() == node;
+            }
+            if (parent instanceof WhileStmt s) {
+                return s.getCondition() == node;
+            }
+            if (parent instanceof DoStmt s) {
+                return s.getCondition() == node;
+            }
+            if (parent instanceof ForStmt s) {
+                return s.getCompare().map(c -> c == node).orElse(false);
+            }
+            if (parent instanceof ConditionalExpr s) {
+                return s.getCondition() == node;
+            }
+            if (parent instanceof SwitchStmt s) {
+                return s.getSelector() == node;
+            }
+            return false;
+        }).orElse(false);
     }
 
     // ------------------------------------------------------------------ calls
@@ -568,6 +684,13 @@ public class CallGraphBuilder {
         if (cached != null) {
             return cached;
         }
+        if (typesByKey == null) {
+            Map<String, TypeInfo> byKey = new HashMap<>();
+            for (TypeInfo t : index.types.values()) {
+                byKey.put(t.key, t);
+            }
+            typesByKey = byKey;
+        }
         List<TypeInfo> out = new ArrayList<>();
         for (Edge e : index.incoming.getOrDefault(methodKey, List.of())) {
             if (!"OVERRIDES".equals(e.relation)) {
@@ -577,11 +700,9 @@ public class CallGraphBuilder {
             if (impl == null || impl.ownerKey == null) {
                 continue;
             }
-            for (TypeInfo t : index.types.values()) {
-                if (t.key.equals(impl.ownerKey)) {
-                    out.add(t);
-                    break;
-                }
+            TypeInfo owner = typesByKey.get(impl.ownerKey);
+            if (owner != null) {
+                out.add(owner);
             }
         }
         implCache.put(methodKey, out);
@@ -589,6 +710,10 @@ public class CallGraphBuilder {
     }
 
     private List<TypeInfo> globalCandidates(String name) {
+        List<TypeInfo> cached = globalCache.get(name);
+        if (cached != null) {
+            return cached;
+        }
         List<TypeInfo> out = new ArrayList<>();
         for (TypeInfo t : index.types.values()) {
             List<TypeInfo.MethodInfo> ms = t.methods.get(name);
@@ -596,7 +721,11 @@ public class CallGraphBuilder {
                 out.add(t);
             }
         }
-        return out.size() > 3 ? List.of() : out;
+        // 结果只取决于方法名（类型表在 build 期间不再变化），所以可以整表缓存。
+        // 调用方只遍历返回的列表，共享同一份是安全的。
+        List<TypeInfo> result = out.size() > 3 ? List.of() : out;
+        globalCache.put(name, result);
+        return result;
     }
 
     // ------------------------------------------------------------------ usage
@@ -723,11 +852,11 @@ public class CallGraphBuilder {
      *  - assigned to a variable that only ends up in a logging call        -> LOG_ONLY (weak impact)
      *  - assigned to a variable that is otherwise unused                   -> IGNORED
      */
-    private void refineUsage(BlockStmt block, Sym caller) {
+    private void refineUsage(BodyScan scan, Sym caller) {
         Set<String> logVars = new LinkedHashSet<>();
         Set<String> usedVars = new LinkedHashSet<>();
-        for (MethodCallExpr call : block.findAll(MethodCallExpr.class)) {
-            Set<String> names = nameUsages(call);
+        for (MethodCallExpr call : scan.calls) {
+            Set<String> names = scan.callNames.getOrDefault(call, Set.of());
             if (isLogging(call)) {
                 logVars.addAll(names);
             } else {
@@ -747,7 +876,7 @@ public class CallGraphBuilder {
             e.usage = "LOG_ONLY";
             e.returnValueUsed = false;
         }
-        markFlowsIntoCondition(block, caller);
+        markFlowsIntoCondition(scan, caller);
     }
 
     /**
@@ -755,47 +884,17 @@ public class CallGraphBuilder {
      * condition, the call carries a control dependency: a behaviour change of the callee can
      * change which branch the caller takes.
      */
-    private void markFlowsIntoCondition(BlockStmt block, Sym caller) {
-        Set<String> conditionVars = new LinkedHashSet<>();
-        for (IfStmt ifStmt : block.findAll(IfStmt.class)) {
-            conditionVars.addAll(nameUsages(ifStmt.getCondition()));
-        }
-        for (WhileStmt w : block.findAll(WhileStmt.class)) {
-            conditionVars.addAll(nameUsages(w.getCondition()));
-        }
-        for (DoStmt d : block.findAll(DoStmt.class)) {
-            conditionVars.addAll(nameUsages(d.getCondition()));
-        }
-        for (ForStmt f : block.findAll(ForStmt.class)) {
-            f.getCompare().ifPresent(c -> conditionVars.addAll(nameUsages(c)));
-        }
-        for (ConditionalExpr ce : block.findAll(ConditionalExpr.class)) {
-            conditionVars.addAll(nameUsages(ce.getCondition()));
-        }
-        for (SwitchStmt sw : block.findAll(SwitchStmt.class)) {
-            conditionVars.addAll(nameUsages(sw.getSelector()));
-        }
+    private void markFlowsIntoCondition(BodyScan scan, Sym caller) {
         for (Edge e : index.outgoing.getOrDefault(caller.key, List.of())) {
             if (!"CALLS".equals(e.relation) || e.assignedVar == null) {
                 continue;
             }
-            if (conditionVars.contains(e.assignedVar)) {
+            if (scan.conditionVars.contains(e.assignedVar)) {
                 e.flowsIntoCondition = true;
                 e.usage = "CONDITION";
                 e.returnValueUsed = true;
             }
         }
-    }
-
-    private Set<String> nameUsages(Node node) {
-        Set<String> out = new LinkedHashSet<>();
-        if (node == null) {
-            return out;
-        }
-        for (NameExpr n : node.findAll(NameExpr.class)) {
-            out.add(n.getNameAsString());
-        }
-        return out;
     }
 
     /**

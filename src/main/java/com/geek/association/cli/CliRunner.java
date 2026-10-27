@@ -11,6 +11,7 @@ import com.geek.association.model.PeerImpact;
 import com.geek.association.model.RepoSource;
 import com.geek.association.source.SourceNames;
 import com.geek.association.parse.CodeIndexer;
+import com.geek.association.report.AiExplainer;
 import com.geek.association.report.ImpactReport;
 import com.geek.association.report.MarkdownReport;
 import com.geek.association.report.ReportBuilder;
@@ -44,11 +45,13 @@ public class CliRunner implements ApplicationRunner, ExitCodeGenerator {
 
     private final AppProperties properties;
     private final RepositoryPreparer preparer;
+    private final AiExplainer aiExplainer;
     private int exitCode = 0;
 
-    public CliRunner(AppProperties properties, RepositoryPreparer preparer) {
+    public CliRunner(AppProperties properties, RepositoryPreparer preparer, AiExplainer aiExplainer) {
         this.properties = properties;
         this.preparer = preparer;
+        this.aiExplainer = aiExplainer;
     }
 
     private List<String> rawArgs = List.of();
@@ -85,8 +88,38 @@ public class CliRunner implements ApplicationRunner, ExitCodeGenerator {
             request.pullRequest = Integer.parseInt(pr);
             request.mode = "PULL_REQUEST";
         }
+        // --range a..b is the same thing --base/--target spell in two options. It exists because
+        // pasting a range from a review tool or a CI variable ("$BASE..$HEAD") is the common case,
+        // and splitting it by hand is where the two ends get swapped.
+        String range = first(args, "range");
+        if (range != null) {
+            int sep = range.indexOf("..");
+            if (sep < 0) {
+                System.err.println("--range needs the form <base>..<target>, e.g. origin/main..HEAD");
+                exitCode = 2;
+                return;
+            }
+            request.mode = "COMMIT_RANGE";
+            request.baseRef = range.substring(0, sep).strip();
+            request.targetRef = range.substring(sep + 2).strip();
+            if (request.baseRef.isEmpty() || request.targetRef.isEmpty()) {
+                System.err.println("--range needs both ends, e.g. origin/main..HEAD");
+                exitCode = 2;
+                return;
+            }
+        }
 
-        RevisionPair revisions = preparer.prepare(request);
+        RevisionPair revisions;
+        try {
+            revisions = preparer.prepare(request);
+        } catch (java.io.IOException e) {
+            // A pipeline gates on the exit code, so a range that cannot be resolved has to end as
+            // "2 + one sentence", not as a stack trace that the job log buries the reason in. The
+            // messages are written for a person: "起始提交 x 不在 y 的历史里" says what to fix.
+            System.err.println("cannot prepare the revision range: " + e.getMessage());
+            exitCode = 2;
+            return;
+        }
         FileDiffCollector collector = new FileDiffCollector(revisions.base, revisions.head);
         List<FileChange> files = collector.collect();
         Map<String, String> diffs = collector.unifiedDiffs(files, 50, 160);
@@ -115,6 +148,19 @@ public class CliRunner implements ApplicationRunner, ExitCodeGenerator {
         report.peersNote = peers.isEmpty()
                 ? "选中的其他程序都无法读取，本次没有可比对的结果"
                 : null;
+        // --ai is opt-in rather than following defaultForRuns: a pipeline's output has to be
+        // reproducible, and silently adding a network call (and its cost) to every job would make
+        // the same commit produce different reports on different days.
+        if (args.containsOption("ai")) {
+            if (aiExplainer.ready()) {
+                report.ai = aiExplainer.explain(report, properties.getAi().getMaxImpacts());
+            } else {
+                // One line, and the exit code is untouched: an unconfigured or unreachable model
+                // must never fail a build gate that is about the static analysis.
+                System.out.println("AI 评审说明已跳过：AI 审核未配置完成（"
+                        + aiExplainer.notReadyReason() + "）");
+            }
+        }
 
         String out = first(args, "out");
         String format = first(args, "format") == null ? "json" : first(args, "format").toLowerCase();
@@ -152,6 +198,13 @@ public class CliRunner implements ApplicationRunner, ExitCodeGenerator {
     private void printSummary(ImpactReport report) {
         System.out.println("mode            : " + report.mode
                 + (report.pullRequest == null ? "" : " #" + report.pullRequest));
+        if (report.commitCount > 0) {
+            System.out.println("commits         : " + report.commitCount
+                    + (report.rangeNote == null || report.rangeNote.isBlank() ? "" : " (" + report.rangeNote + ")"));
+            for (com.geek.association.model.CommitInfo commit : report.commits) {
+                System.out.printf("  %-10s %s%n", commit.shortSha, commit.subject);
+            }
+        }
         System.out.println("changed modules : " + report.summary.changedModules);
         System.out.println("changed symbols : " + report.summary.changedSymbols);
         System.out.println("impacted modules: " + report.summary.impactedModules);

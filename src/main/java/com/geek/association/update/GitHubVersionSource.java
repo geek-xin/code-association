@@ -22,6 +22,7 @@ import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -40,6 +41,15 @@ import java.util.Map;
  * and assets, and a maintainer sometimes pushes the tag first and writes the release later (or
  * never), so releases alone silently hide part of the history. Only the releases request is
  * load-bearing - see {@link #withTags} for why a tags failure is downgraded to a warning.
+ *
+ * <h2>Why there is more than one host</h2>
+ *
+ * {@code api.github.com} is not reachable from every network this application runs in, and the
+ * failure is indistinguishable from "the project has no releases" unless something retries. The
+ * configured hosts are tried in order, and a host that fails at the transport level or answers 5xx
+ * hands over to the next one. What must <i>not</i> happen is a fallback on a 404 or a 401: those
+ * mean "this repository does not exist" and "this token is wrong", which no mirror can fix, and
+ * silently asking another host would only hide the real problem.
  */
 @Component
 public class GitHubVersionSource implements VersionSource {
@@ -68,8 +78,10 @@ public class GitHubVersionSource implements VersionSource {
 
     private final AppProperties properties;
     private final HttpClient client;
-    /** REST base without a trailing slash, e.g. {@code https://api.github.com}. */
-    private final String apiBase;
+    /** REST bases without a trailing slash, in the order they are tried. */
+    private final List<String> apiBases;
+    /** Shared "we are out of quota" latch; see {@link RateLimitGate}. */
+    private final RateLimitGate rateLimitGate;
 
     /**
      * Problems of the last {@link #fetch()} that did not make its answer unusable.
@@ -78,33 +90,69 @@ public class GitHubVersionSource implements VersionSource {
      */
     private volatile List<String> warnings = List.of();
 
+    /** The base that answered the last successful fetch, for the status payload. */
+    private volatile String activeApiBase;
+
     /**
-     * The production constructor. Marked {@code @Autowired} because the class has a second one for
-     * tests: with more than one constructor Spring does not guess, it looks for a no-arg one and
-     * fails to start the context when there is none.
+     * The last host that failed, or null when the last attempt succeeded.
+     *
+     * Reported separately from the error text because the UI wants to say <i>where</i> it failed
+     * next to <i>why</i>, and parsing a host back out of a localised message would be a bug waiting
+     * for the first message edit.
+     */
+    private volatile String lastFailureHost;
+
+    /**
+     * The production constructor. Marked {@code @Autowired} because the class has other
+     * constructors for tests: with more than one constructor Spring does not guess, it looks for a
+     * no-arg one and fails to start the context when there is none.
      */
     @Autowired
     public GitHubVersionSource(AppProperties properties) {
-        this(properties, HttpClient.newBuilder().connectTimeout(CONNECT_TIMEOUT).build(), DEFAULT_API_BASE);
+        this(properties, GitHubNetwork.client(properties.getUpdate()),
+                properties.getUpdate().getApiBaseUrls(), new RateLimitGate());
     }
 
     /** Visible for tests that need to assert the request shape without reaching GitHub. */
     GitHubVersionSource(AppProperties properties, HttpClient client) {
-        this(properties, client, DEFAULT_API_BASE);
+        this(properties, client, List.of(DEFAULT_API_BASE), new RateLimitGate());
     }
 
     /**
-     * Full form: a pinned client and a different API host.
+     * Full form: a pinned client, an explicit list of hosts and a shared gate.
      *
-     * The host is a parameter rather than a constant because the request building (headers, token,
-     * timeout, status handling) is worth testing against a loopback server, and because a GitHub
-     * Enterprise installation would serve exactly the same paths under another host.
+     * The host list is a parameter rather than a constant because the request building (headers,
+     * token, timeout, status handling) is worth testing against a loopback server, and because a
+     * GitHub Enterprise installation or a mirror would serve exactly the same paths under another
+     * host.
      */
     public GitHubVersionSource(AppProperties properties, HttpClient client, String apiBase) {
+        this(properties, client, List.of(apiBase), new RateLimitGate());
+    }
+
+    /**
+     * The full form used by the production constructor and by tests that need a shared gate.
+     *
+     * Blank entries are dropped and duplicates collapsed: a settings file that repeats the default
+     * host would otherwise cost a second round trip for the same answer, and an empty string would
+     * turn every path into a relative URI that cannot be requested at all.
+     */
+    public GitHubVersionSource(AppProperties properties, HttpClient client, List<String> apiBaseUrls,
+                               RateLimitGate rateLimitGate) {
         this.properties = properties;
         this.client = client;
-        String base = Texts.trim(apiBase);
-        this.apiBase = stripTrailingSlash(base.isEmpty() ? DEFAULT_API_BASE : base);
+        this.rateLimitGate = rateLimitGate == null ? new RateLimitGate() : rateLimitGate;
+        LinkedHashSet<String> bases = new LinkedHashSet<>();
+        if (apiBaseUrls != null) {
+            for (String base : apiBaseUrls) {
+                String trimmed = Texts.trim(base);
+                if (!trimmed.isEmpty()) {
+                    bases.add(stripTrailingSlash(trimmed));
+                }
+            }
+        }
+        this.apiBases = List.copyOf(bases.isEmpty() ? List.of(DEFAULT_API_BASE) : bases);
+        this.activeApiBase = this.apiBases.get(0);
     }
 
     @Override
@@ -118,19 +166,109 @@ public class GitHubVersionSource implements VersionSource {
         // Warnings describe this attempt only; a stale line from the previous check would be read
         // as if the current one had the same problem.
         warnings = List.of();
+        return fetchFromAnyBase(repo, perPage, update);
+    }
+
+    /**
+     * Tries each configured host until one answers.
+     *
+     * The last failure is what the user sees, because it is the one that describes why every host
+     * failed; earlier ones are folded into a warning so the fallback stays visible without burying
+     * the final reason. A host-level failure (transport error, 5xx, exhausted quota) moves on; a
+     * content-level one (404, 401) ends the search, because the next host would answer the same.
+     */
+    private List<ReleaseInfo> fetchFromAnyBase(String repo, int perPage, AppProperties.Update update) {
+        List<String> failures = new ArrayList<>();
+        UpdateException last = null;
+        for (String base : apiBases) {
+            try {
+                List<ReleaseInfo> releases = fetchFrom(base, repo, perPage, update);
+                activeApiBase = base;
+                lastFailureHost = null;
+                if (!failures.isEmpty()) {
+                    warnings = appendWarning("主 API 源不可用，已改用 " + base + "：" + failures.get(0));
+                }
+                return releases;
+            } catch (UpdateException e) {
+                if (!isHostLevelFailure(e)) {
+                    // A missing repository or a rejected token is the same answer everywhere.
+                    throw e;
+                }
+                log.warn("update source {} failed: {}", base, e.getMessage());
+                failures.add(base + " → " + e.getMessage());
+                lastFailureHost = base;
+                last = e;
+            }
+        }
+        // Every host failed, so the per-host trail is the only thing that explains what was tried.
+        // It goes into warnings rather than into the message: the message stays one actionable
+        // sentence, and the card already renders warnings as a list under it.
+        if (!failures.isEmpty()) {
+            warnings = List.copyOf(failures);
+        }
+        StringBuilder message = new StringBuilder();
+        if (last != null) {
+            message.append(last.getMessage());
+        }
+        if (apiBases.size() > 1) {
+            message.append("（已尝试 ").append(apiBases.size()).append(" 个 API 源）");
+        }
+        throw new UpdateException(message.toString(), last);
+    }
+
+    /**
+     * Whether a failure says something about <i>this host</i> rather than about the repository.
+     *
+     * The distinction is carried by the message because {@link UpdateException} is the one type the
+     * source contract allows, and it is written for the user rather than tagged for the caller. The
+     * two content-level cases are spelled out positively so a new message can never silently turn
+     * into a fallback.
+     */
+    private static boolean isHostLevelFailure(UpdateException e) {
+        String message = e.getMessage() == null ? "" : e.getMessage();
+        return !(message.startsWith("仓库不存在") || message.startsWith("GitHub token 无效"));
+    }
+
+    private List<ReleaseInfo> fetchFrom(String base, String repo, int perPage, AppProperties.Update update) {
         // The releases request carries what an update needs (notes, assets), so its failure stays
         // fatal: a half-known answer here would be reported as "no update" and hide a real one.
-        List<ReleaseInfo> releases = parseReleases(get(releasesUri(repo, perPage), repo, update), repo);
+        List<ReleaseInfo> releases = parseReleases(get(base, releasesPath(repo, perPage), repo, update), repo);
         if (!update.isIncludeTags()) {
             // Tags were never asked for, so there is nothing that could be missing.
             return select(releases, update);
         }
-        return withTags(releases, repo, perPage, update);
+        return withTags(base, releases, repo, perPage, update);
     }
 
     @Override
     public List<String> warnings() {
         return warnings;
+    }
+
+    /** The base that answered last, or the first configured one before any success. */
+    public String activeApiBase() {
+        return activeApiBase;
+    }
+
+    /** The hosts this source will try, in order; reported to the UI so a fallback is explainable. */
+    public List<String> apiBases() {
+        return apiBases;
+    }
+
+    /** The host that failed last, or null when the last fetch succeeded. */
+    public String lastFailureHost() {
+        return lastFailureHost;
+    }
+
+    /** The shared quota latch, so the download path consults the same deadline as the check. */
+    public RateLimitGate rateLimitGate() {
+        return rateLimitGate;
+    }
+
+    private List<String> appendWarning(String warning) {
+        List<String> out = new ArrayList<>(warnings);
+        out.add(warning);
+        return List.copyOf(out);
     }
 
     /**
@@ -141,29 +279,29 @@ public class GitHubVersionSource implements VersionSource {
      * may be incomplete. A nested UpdateException would instead blank the card and, worse, reset
      * "is there an update" to false.
      */
-    private List<ReleaseInfo> withTags(List<ReleaseInfo> releases, String repo, int perPage,
+    private List<ReleaseInfo> withTags(String base, List<ReleaseInfo> releases, String repo, int perPage,
                                        AppProperties.Update update) {
         List<ReleaseInfo> tags;
         try {
-            tags = parseTags(get(tagsUri(repo, perPage), repo, update), repo);
+            tags = parseTags(get(base, tagsPath(repo, perPage), repo, update), repo);
         } catch (UpdateException e) {
             if (Thread.currentThread().isInterrupted()) {
                 // An interrupt is a request to stop, not a degraded answer: it must end the fetch.
                 throw e;
             }
             log.warn("tags request failed, serving releases only: {}", e.getMessage());
-            warnings = List.of("读取标签列表失败，本次仅显示 releases：" + e.getMessage());
+            warnings = appendWarning("读取标签列表失败，本次仅显示 releases：" + e.getMessage());
             return select(releases, update);
         }
         return select(merge(releases, tags), update);
     }
 
-    private URI releasesUri(String repo, int perPage) {
-        return URI.create(apiBase + "/repos/" + repo + "/releases?per_page=" + perPage);
+    private static String releasesPath(String repo, int perPage) {
+        return "/repos/" + repo + "/releases?per_page=" + perPage;
     }
 
-    private URI tagsUri(String repo, int perPage) {
-        return URI.create(apiBase + "/repos/" + repo + "/tags?per_page=" + perPage);
+    private static String tagsPath(String repo, int perPage) {
+        return "/repos/" + repo + "/tags?per_page=" + perPage;
     }
 
     /**
@@ -171,8 +309,65 @@ public class GitHubVersionSource implements VersionSource {
      *
      * Both endpoints are authenticated the same way; building the request twice would let the token
      * (or the mandatory User-Agent) drift out of one of them unnoticed.
+     *
+     * Retries live here rather than in the caller because they are a property of "how to reach this
+     * host", not of what the answer is used for. A 401 or a 404 is returned immediately: retrying a
+     * rejection only spends quota.
      */
-    private String get(URI uri, String repo, AppProperties.Update update) {
+    private String get(String base, String path, String repo, AppProperties.Update update) {
+        URI uri = URI.create(base + path);
+        // One attempt per host while the quota is known to be gone, and the configured number
+        // otherwise. The single attempt is deliberate: a mirror may answer from a different IP with
+        // its own quota, so refusing to ask it would disable the fallback in precisely the case it
+        // exists for. What is never done is a retry loop against a host that just said "no quota".
+        int attempts = rateLimitGate.isBlocked()
+                ? 1 : Math.max(1, 1 + Math.max(0, update.getRetries()));
+        UpdateException last = null;
+        for (int attempt = 1; attempt <= attempts; attempt++) {
+            HttpRequest request = request(uri, update);
+            HttpResponse<String> response;
+            try {
+                response = client.send(request, HttpResponse.BodyHandlers.ofString());
+            } catch (HttpTimeoutException e) {
+                last = new UpdateException("无法连接 GitHub（" + CONNECT_TIMEOUT.toSeconds() + " 秒超时）", e);
+                if (attempt < attempts) {
+                    sleepBeforeRetry(attempt, update);
+                    continue;
+                }
+                throw last;
+            } catch (IOException e) {
+                last = new UpdateException("无法连接 GitHub：" + GitHubNetwork.describe(e), e);
+                if (attempt < attempts) {
+                    sleepBeforeRetry(attempt, update);
+                    continue;
+                }
+                throw last;
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new UpdateException("版本检查被中断", e);
+            }
+            int status = response.statusCode();
+            if (status < 300) {
+                rateLimitGate.noteSuccess();
+                return response.body();
+            }
+            noteRateLimit(response, update);
+            // Retrying is pointless once this host has published a quota deadline: every further
+            // request pushes the reset time out. Falling through to checkStatus() turns the answer
+            // into an UpdateException the caller treats as a host-level failure, which is what
+            // hands the request to the next configured host instead of ending the fetch.
+            if (GitHubNetwork.isRetryableStatus(status) && attempt < attempts && !rateLimitGate.isBlocked()) {
+                log.debug("retrying {} after HTTP {}", uri, status);
+                sleepBeforeRetry(attempt, update);
+                continue;
+            }
+            checkStatus(response, repo, update);
+        }
+        // The loop either returns or throws; reaching here would mean attempts < 1.
+        throw last == null ? new UpdateException("检查更新失败") : last;
+    }
+
+    private HttpRequest request(URI uri, AppProperties.Update update) {
         HttpRequest.Builder builder = HttpRequest.newBuilder(uri)
                 .timeout(REQUEST_TIMEOUT)
                 .header("Accept", "application/vnd.github+json")
@@ -183,19 +378,57 @@ public class GitHubVersionSource implements VersionSource {
         if (!Texts.isBlank(update.getToken())) {
             builder.header("Authorization", "Bearer " + update.getToken().strip());
         }
-        HttpResponse<String> response;
+        return builder.build();
+    }
+
+    /**
+     * Waits out the backoff, restoring the interrupt flag instead of swallowing it.
+     *
+     * A thread that is interrupted during the pause is about to be asked to stop; continuing the
+     * retry loop would ignore that, so the flag is set and the next gate check ends the request.
+     */
+    private static void sleepBeforeRetry(int attempt, AppProperties.Update update) {
+        long delay = GitHubNetwork.backoffMillis(attempt, update.getRetryBaseDelayMs());
+        if (delay <= 0) {
+            return;
+        }
         try {
-            response = client.send(builder.build(), HttpResponse.BodyHandlers.ofString());
-        } catch (HttpTimeoutException e) {
-            throw new UpdateException("无法连接 GitHub（" + CONNECT_TIMEOUT.toSeconds() + " 秒超时）", e);
-        } catch (IOException e) {
-            throw new UpdateException("无法连接 GitHub：" + describe(e), e);
+            Thread.sleep(delay);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            throw new UpdateException("版本检查被中断", e);
         }
-        checkStatus(response, repo, update);
-        return response.body();
+    }
+
+    /**
+     * Records the quota deadline when this response says the quota is gone.
+     *
+     * Both the 403 and the 429 case carry it, and reading the header once here is what lets the
+     * caller, the scheduler and the download path share one deadline instead of three guesses.
+     */
+    private void noteRateLimit(HttpResponse<String> response, AppProperties.Update update) {
+        if (!update.isRespectRateLimit()) {
+            return;
+        }
+        int status = response.statusCode();
+        if (status != 403 && status != 429) {
+            return;
+        }
+        String remaining = header(response, "x-ratelimit-remaining");
+        if (status == 429 || "0".equals(remaining)) {
+            rateLimitGate.noteRateLimited(GitHubNetwork.rateLimitReset(response));
+        }
+    }
+
+    private String blockedMessage() {
+        Instant until = rateLimitGate.blockedUntil();
+        StringBuilder message = new StringBuilder("GitHub API 已限流，暂时不再请求");
+        if (until != null) {
+            message.append("，将于 ")
+                    .append(RESET_FORMAT.format(until.atZone(ZoneId.systemDefault())))
+                    .append(" 恢复");
+        }
+        message.append("；配置 token 可提高额度至每小时 5000 次");
+        return message.toString();
     }
 
     /** Drops trailing slashes without eating the "//" of the scheme itself. */
@@ -244,28 +477,17 @@ public class GitHubVersionSource implements VersionSource {
         if (Texts.isBlank(update.getToken())) {
             message.append("，配置 token 可提高额度至每小时 5000 次");
         }
-        String reset = header(response, "x-ratelimit-reset");
-        if (!Texts.isBlank(reset)) {
-            try {
-                Instant at = Instant.ofEpochSecond(Long.parseLong(reset.strip()));
-                message.append("；额度将在 ")
-                        .append(RESET_FORMAT.format(at.atZone(ZoneId.systemDefault())))
-                        .append(" 重置");
-            } catch (NumberFormatException e) {
-                // A malformed header only costs the exact reset time; the message stays useful.
-                log.debug("unreadable X-RateLimit-Reset: {}", reset, e);
-            }
+        Instant reset = GitHubNetwork.rateLimitReset(response);
+        if (reset != null) {
+            message.append("；额度将在 ")
+                    .append(RESET_FORMAT.format(reset.atZone(ZoneId.systemDefault())))
+                    .append(" 重置");
         }
         return message.toString();
     }
 
     private static String header(HttpResponse<String> response, String name) {
         return response.headers().firstValue(name).orElse(null);
-    }
-
-    private static String describe(IOException e) {
-        String message = e.getMessage();
-        return message == null || message.isBlank() ? e.getClass().getSimpleName() : message;
     }
 
     /**

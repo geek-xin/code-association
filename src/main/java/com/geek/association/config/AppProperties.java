@@ -3,6 +3,8 @@ package com.geek.association.config;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
 
 @ConfigurationProperties(prefix = "code-association")
 public class AppProperties {
@@ -208,6 +210,67 @@ public class AppProperties {
          * whatever this is set to.
          */
         private boolean autoDownload = false;
+        /**
+         * Replace the running jar and bring the process back without anyone running stop.sh/start.sh.
+         *
+         * On by default because it is the whole point of the feature: an update that ends with
+         * "now restart it yourself" is not an update, it is a notification. The supervisor it
+         * starts health-checks the new process and puts the previous jar back when the new build
+         * does not come up, so the failure mode is a short outage rather than a dead installation.
+         * Turning it off restores the old behaviour (apply, then restart by hand).
+         */
+        private boolean autoRestart = true;
+        /**
+         * Do the whole thing unattended: download, apply and restart as soon as a newer installable
+         * version appears. Off by default - restarting a service is disruptive, and the operator
+         * should be the one who decides that nobody is watching. Applies only when a jar asset
+         * exists; a tags-only version is never installed automatically.
+         */
+        private boolean autoApply = false;
+        /**
+         * How long the supervisor waits for the new process to answer its health check before it
+         * restores the backup and starts the old jar again.
+         */
+        private int restartTimeoutSeconds = 90;
+        /**
+         * GitHub API hosts tried in order. The first is the canonical one; the rest are mirrors
+         * used only when it cannot be reached (a blocked or rate-limited network).
+         *
+         * A mirror must speak the GitHub REST API under the same paths, so it is a proxy or a
+         * self-hosted replica - not a release page.
+         */
+        private List<String> apiBaseUrls = new ArrayList<>(List.of("https://api.github.com"));
+        /**
+         * Prefix prepended to asset download URLs to route them through a mirror, e.g.
+         * {@code https://ghfast.top}. Empty means "download straight from github.com".
+         *
+         * Release assets are served from a CDN that is blocked in some networks while the API
+         * itself is reachable, so this is separate from {@link #apiBaseUrls}.
+         */
+        private String downloadMirror = "";
+        /**
+         * Optional proxy for update traffic, as {@code host:port} or
+         * {@code http://user:password@host:port}. Empty means "use the JVM's own proxy settings",
+         * which is what {@code -Dhttps.proxyHost} and {@code HTTPS_PROXY} end up as.
+         *
+         * Read explicitly rather than relying on the JVM alone because a value in application.yml
+         * is far easier to keep next to the rest of the update settings than a JVM flag in a
+         * start script.
+         */
+        private String proxy = "";
+        /** Extra attempts per request after the first failure; 0 means "try once". */
+        private int retries = 2;
+        /** Base delay of the exponential backoff between attempts, milliseconds. */
+        private long retryBaseDelayMs = 500;
+        /**
+         * Never retry before GitHub's rate-limit reset once the quota is exhausted.
+         *
+         * Without it a retry loop turns "wait until 14:05" into "hammer a dead endpoint and stay
+         * limited for the rest of the hour".
+         */
+        private boolean respectRateLimit = true;
+        /** Run one check shortly after startup instead of waiting for the first cron boundary. */
+        private boolean checkOnStartup = true;
 
         public boolean isEnabled() {
             return enabled;
@@ -280,13 +343,161 @@ public class AppProperties {
         public void setAutoDownload(boolean autoDownload) {
             this.autoDownload = autoDownload;
         }
+
+        public boolean isAutoRestart() {
+            return autoRestart;
+        }
+
+        public void setAutoRestart(boolean autoRestart) {
+            this.autoRestart = autoRestart;
+        }
+
+        public boolean isAutoApply() {
+            return autoApply;
+        }
+
+        public void setAutoApply(boolean autoApply) {
+            this.autoApply = autoApply;
+        }
+
+        public int getRestartTimeoutSeconds() {
+            return restartTimeoutSeconds;
+        }
+
+        public void setRestartTimeoutSeconds(int restartTimeoutSeconds) {
+            this.restartTimeoutSeconds = restartTimeoutSeconds;
+        }
+
+        /**
+         * Configured hosts, always with the canonical API first.
+         *
+         * A configured list that starts with the canonical host would otherwise make the caller
+         * deduplicate; doing it here means "which hosts, in which order" is answered once.
+         */
+        public List<String> getApiBaseUrls() {
+            return apiBaseUrls;
+        }
+
+        public void setApiBaseUrls(List<String> apiBaseUrls) {
+            this.apiBaseUrls = apiBaseUrls;
+        }
+
+        public String getDownloadMirror() {
+            return downloadMirror;
+        }
+
+        public void setDownloadMirror(String downloadMirror) {
+            this.downloadMirror = downloadMirror;
+        }
+
+        public String getProxy() {
+            return proxy;
+        }
+
+        public void setProxy(String proxy) {
+            this.proxy = proxy;
+        }
+
+        public int getRetries() {
+            return retries;
+        }
+
+        public void setRetries(int retries) {
+            this.retries = retries;
+        }
+
+        public long getRetryBaseDelayMs() {
+            return retryBaseDelayMs;
+        }
+
+        public void setRetryBaseDelayMs(long retryBaseDelayMs) {
+            this.retryBaseDelayMs = retryBaseDelayMs;
+        }
+
+        public boolean isRespectRateLimit() {
+            return respectRateLimit;
+        }
+
+        public void setRespectRateLimit(boolean respectRateLimit) {
+            this.respectRateLimit = respectRateLimit;
+        }
+
+        public boolean isCheckOnStartup() {
+            return checkOnStartup;
+        }
+
+        public void setCheckOnStartup(boolean checkOnStartup) {
+            this.checkOnStartup = checkOnStartup;
+        }
     }
 
+    /**
+     * Optional LLM review layer.
+     *
+     * Off by default and kept to facts the analyser already proved: the model never sees the
+     * repository, so an answer can only restate the change, its propagation and the blind spots.
+     * The settings page can override every field below through {@code {dataDir}/ai-settings.json},
+     * which is why nothing here validates eagerly - a half-written file must not stop startup.
+     */
     public static class Ai {
         private boolean enabled = false;
         private String baseUrl = "";
         private String apiKey = "";
         private String model = "";
+        /**
+         * How many impact rows are handed to the model per call.
+         *
+         * The prompt is what costs money and latency, and the first dozen findings carry almost all
+         * of the review value; past that the model repeats itself. Capped at 50 because a larger
+         * prompt tends to be truncated by the provider rather than answered.
+         */
+        private int maxImpacts = 12;
+        /**
+         * Wall-clock limit of one model request.
+         *
+         * A reasoning model can legitimately take a minute, but a run must not hang on a dead
+         * endpoint: the analysis itself is already finished by the time this request is made.
+         */
+        private int timeoutSeconds = 60;
+        /**
+         * Whether a new analysis generates the AI review without being asked.
+         *
+         * Only a default, not a policy: it decides the checkbox state in the run dialog, and each
+         * run can still say no. Meaningless while {@link #enabled} is false.
+         */
+        private boolean defaultForRuns = true;
+
+        /**
+         * Whether this configuration can actually call a model.
+         *
+         * The single definition of "ready" for the whole backend: the settings page, the health
+         * endpoint, the run dialog and the补生成 endpoint all ask this instead of re-deriving the
+         * three conditions, so they cannot disagree about what "配置完成" means.
+         */
+        public boolean ready() {
+            return enabled
+                    && baseUrl != null && !baseUrl.isBlank()
+                    && model != null && !model.isBlank();
+        }
+
+        /**
+         * Why {@link #ready()} is false, in one sentence for the UI; empty when it is ready.
+         *
+         * Lives here rather than in the web layer because the same sentence is shown in three
+         * places (settings card, 400 body of the补生成 endpoint, CLI hint) and they must match.
+         */
+        public String notReadyReason() {
+            if (!enabled) {
+                return "总开关未打开";
+            }
+            if (baseUrl == null || baseUrl.isBlank()) {
+                return "已启用但未填写接口地址";
+            }
+            if (model == null || model.isBlank()) {
+                return "已启用但未填写模型";
+            }
+            return "";
+        }
 
         public boolean isEnabled() {
             return enabled;
@@ -318,6 +529,30 @@ public class AppProperties {
 
         public void setModel(String model) {
             this.model = model;
+        }
+
+        public int getMaxImpacts() {
+            return maxImpacts;
+        }
+
+        public void setMaxImpacts(int maxImpacts) {
+            this.maxImpacts = maxImpacts;
+        }
+
+        public int getTimeoutSeconds() {
+            return timeoutSeconds;
+        }
+
+        public void setTimeoutSeconds(int timeoutSeconds) {
+            this.timeoutSeconds = timeoutSeconds;
+        }
+
+        public boolean isDefaultForRuns() {
+            return defaultForRuns;
+        }
+
+        public void setDefaultForRuns(boolean defaultForRuns) {
+            this.defaultForRuns = defaultForRuns;
         }
     }
 }

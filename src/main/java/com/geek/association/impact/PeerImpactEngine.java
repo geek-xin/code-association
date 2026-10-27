@@ -1,6 +1,7 @@
 package com.geek.association.impact;
 
 import com.geek.association.config.AppProperties;
+import com.geek.association.diff.ChangeDetector;
 import com.geek.association.model.ChangeRecord;
 import com.geek.association.model.CodeIndex;
 import com.geek.association.model.Edge;
@@ -72,6 +73,7 @@ public class PeerImpactEngine {
         }
         collectArtifactMatches(ownHead, peer, matches, seen);
         out.matches = matches;
+        collectColumnBlindSpots(changes, ownHead, peer, out);
 
         if (matches.isEmpty()) {
             return out;
@@ -79,6 +81,10 @@ public class PeerImpactEngine {
 
         // Propagate inside the peer from every matched consumer, reusing the normal engine so a
         // cross-program impact is scored and explained exactly like a local one.
+        Map<Long, ChangeRecord> byId = new LinkedHashMap<>();
+        for (ChangeRecord change : changes) {
+            byId.put(change.id, change);
+        }
         List<ChangeRecord> synthetic = new ArrayList<>();
         for (PeerImpact.ContractMatch match : matches) {
             if (match.contractSymbolKey == null) {
@@ -99,7 +105,10 @@ public class PeerImpactEngine {
                     ? peerConsumer.modulePath : match.peerModule;
             cr.filePath = match.peerFile;
             cr.startLine = match.peerLine;
-            cr.riskSeed = 0.9;
+            // Carry the origin change's severity into the peer analysis: a dropped column and an
+            // added one are both "a database contract changed", but they are not equally risky.
+            ChangeRecord origin = byId.get(match.changeRecordId);
+            cr.riskSeed = Math.max(0.5, origin == null ? 0.9 : origin.riskSeed);
             cr.tags.add("CROSS_PROGRAM");
             cr.extra.put("directImpact", "true");
             synthetic.add(cr);
@@ -161,57 +170,268 @@ public class PeerImpactEngine {
     }
 
     /**
-     * Database contracts.
+     * Database contracts, matched on the column and not on the table.
      *
-     * A change record points at the SQL statement, not at the table: changing {@code insert into
-     * orders(...)} alters the {@code orders} contract without touching the table symbol. The
-     * tables a statement touches are read back from its own metadata, so a changed query still
-     * matches the other program that reads the same table.
+     * A shared table is not a contract: two programs routinely read different columns of the same
+     * table, and one of them selecting an extra column is invisible to the other. What they do share
+     * is a column - its existence, its type and its meaning - so a database delta is expressed as
+     * {@code table.column}, and only three kinds of edit produce one:
+     *
+     * <ul>
+     *   <li>a schema change (DDL) touching a column - read and write sides both break;</li>
+     *   <li>a change of the set of columns this program <em>writes</em> - only the other side's
+     *       readers see different values;</li>
+     *   <li>a change of an entity's column mapping - the field itself moved.</li>
+     * </ul>
+     *
+     * Reading an extra column is deliberately absent: how many columns this program selects is its
+     * own business, and treating it as a contract change is what used to flood the review queue.
      */
     private void collectSqlMatches(ChangeRecord change, CodeIndex ownHead, CodeIndex peer,
                                    List<PeerImpact.ContractMatch> out, Set<String> seen) {
-        Set<String> tableKeys = new LinkedHashSet<>();
-        if (change.symbolKey != null && change.symbolKey.startsWith("db:table:")) {
-            tableKeys.add(change.symbolKey);
-        } else if (change.symbolKey != null && change.symbolKey.startsWith("db:column:")) {
-            String column = change.symbolKey.substring("db:column:".length());
-            int dot = column.indexOf('.');
-            if (dot > 0) {
-                tableKeys.add("db:table:" + column.substring(0, dot));
-            }
-        } else if (change.symbolKey != null && change.symbolKey.startsWith("sql:")) {
-            Sym statement = ownHead.symbol(change.symbolKey);
-            if (statement != null) {
-                for (String table : splitTables(statement.meta.get("readsTables"))) {
-                    tableKeys.add("db:table:" + table);
-                }
-                for (String table : splitTables(statement.meta.get("writesTables"))) {
-                    tableKeys.add("db:table:" + table);
-                }
-            }
-        }
-        for (String tableKey : tableKeys) {
-            Sym shared = peer.symbol(tableKey);
+        for (ColumnDelta delta : columnDeltas(change, ownHead)) {
+            Sym shared = peer.symbol(delta.symbolKey);
             if (shared == null) {
                 continue;
             }
             for (Edge e : peer.incoming.getOrDefault(shared.key, List.of())) {
                 String relation = e.relation == null ? "" : e.relation;
-                if (!relation.contains("TABLE")) {
+                if (!delta.accepts(relation)) {
                     continue;
                 }
-                String usage = relation.startsWith("WRITES") ? "writer" : "reader";
-                add(out, seen, "DB_TABLE", shared.qualifiedName, change,
-                        shared.key, e.from, peer, e, usage, 0.75);
+                add(out, seen, delta.kind, delta.contract, change, shared.key, e.from, peer, e, delta.usageOf(relation),
+                        delta.confidence);
             }
         }
     }
 
-    private static List<String> splitTables(String csv) {
-        if (csv == null || csv.isBlank()) {
-            return List.of();
+    /** One database delta this program introduced: either a column or a whole table. */
+    private static final class ColumnDelta {
+        String symbolKey;
+        String contract;
+        String kind;
+        /** Which relations on the peer side count as a use of this delta. */
+        boolean hitsReaders = true;
+        boolean hitsWriters = true;
+        boolean hitsMappings = true;
+        double confidence = 0.85;
+
+        boolean accepts(String relation) {
+            return switch (relation) {
+                case "READS_COLUMN" -> hitsReaders;
+                case "WRITES_COLUMN" -> hitsWriters;
+                case "MAPS_COLUMN" -> hitsMappings;
+                case "READS_TABLE", "WRITES_TABLE", "USES_TABLE" -> "DB_TABLE".equals(kind);
+                default -> false;
+            };
         }
-        List<String> out = new ArrayList<>();
+
+        String usageOf(String relation) {
+            return switch (relation) {
+                case "WRITES_COLUMN", "WRITES_TABLE" -> "writer";
+                case "MAPS_COLUMN", "USES_TABLE" -> "mapping";
+                default -> "reader";
+            };
+        }
+    }
+
+    /**
+     * The database deltas carried by one change record.
+     *
+     * A change record points at the SQL statement, never at the column: the columns have to be read
+     * back from the statement's own metadata (and from the base metadata, for the "which write
+     * columns disappeared" comparison).
+     */
+    private List<ColumnDelta> columnDeltas(ChangeRecord change, CodeIndex ownHead) {
+        List<ColumnDelta> deltas = new ArrayList<>();
+        Set<String> seenDeltas = new LinkedHashSet<>();
+        if (change.symbolKey == null) {
+            return deltas;
+        }
+        if (change.symbolKey.startsWith("db:column:")) {
+            String column = change.symbolKey.substring("db:column:".length());
+            addColumnDelta(deltas, seenDeltas, column, true, true, true);
+            return deltas;
+        }
+        if (change.symbolKey.startsWith("db:table:")) {
+            addTableDelta(deltas, seenDeltas, change.symbolKey.substring("db:table:".length()));
+            return deltas;
+        }
+        // An entity field mapped onto a column: the mapping is the contract.
+        if (ChangeDetector.FIELD_REMOVED.equals(change.changeType)
+                || ChangeDetector.FIELD_ADDED.equals(change.changeType)
+                || ChangeDetector.FIELD_TYPE_CHANGED.equals(change.changeType)) {
+            // The detector captured the mapping, because a removed field only exists in the base
+            // index and its edges are gone from the head graph the peer analysis runs against.
+            for (String column : splitColumns(str(change.extra.get("mappedColumns")))) {
+                addColumnDelta(deltas, seenDeltas, column, true, true, true);
+            }
+            for (Edge e : ownHead.outgoing.getOrDefault(change.symbolKey, List.of())) {
+                if (!"MAPS_COLUMN".equals(e.relation) || !e.to.startsWith("db:column:")) {
+                    continue;
+                }
+                addColumnDelta(deltas, seenDeltas, e.to.substring("db:column:".length()), true, true, true);
+            }
+            if (!deltas.isEmpty()) {
+                return deltas;
+            }
+        }
+        if (!change.symbolKey.startsWith("sql:")) {
+            return deltas;
+        }
+        if (ChangeDetector.DDL_CHANGED.equals(change.changeType)) {
+            String table = str(change.extra.get("table"));
+            String column = str(change.extra.get("column"));
+            String kind = str(change.extra.get("ddl"));
+            if (!column.isBlank() && !table.isBlank()) {
+                // A column whose shape moved: whoever reads or writes it is affected.
+                addColumnDelta(deltas, seenDeltas, table + "." + column, true, true, true);
+            } else if (!table.isBlank()) {
+                // CREATE / DROP TABLE: no column to name, so the table itself is the contract.
+                addTableDelta(deltas, seenDeltas, table);
+            }
+            if (!deltas.isEmpty()) {
+                return deltas;
+            }
+        }
+        // A plain statement edit: only the columns this program writes can reach the other side.
+        for (String column : changedWriteColumns(change)) {
+            addColumnDelta(deltas, seenDeltas, column, true, false, false);
+        }
+        for (String table : changedWriteTables(change)) {
+            // The statement started or stopped writing a whole table and named no column: this is a
+            // table-level change of the write contract, and readers of the table see new rows.
+            addTableDelta(deltas, seenDeltas, table);
+        }
+        return deltas;
+    }
+
+    /**
+     * Counts peer statements that touch a changed table but name no column.
+     *
+     * Column-level matching needs a column. {@code SELECT *} and dynamically built SQL have none,
+     * so they can neither match nor be ruled out - the report says how many there are and where,
+     * because an empty match list would otherwise read as "nothing to check here".
+     */
+    private void collectColumnBlindSpots(List<ChangeRecord> changes, CodeIndex ownHead, CodeIndex peer,
+                                         PeerImpact out) {
+        Set<String> tables = new LinkedHashSet<>();
+        for (ChangeRecord change : changes) {
+            for (ColumnDelta delta : columnDeltas(change, ownHead)) {
+                if (delta.symbolKey.startsWith("db:table:")) {
+                    tables.add(delta.symbolKey.substring("db:table:".length()));
+                } else if (delta.symbolKey.startsWith("db:column:")) {
+                    String column = delta.symbolKey.substring("db:column:".length());
+                    int dot = column.indexOf('.');
+                    if (dot > 0) {
+                        tables.add(column.substring(0, dot));
+                    }
+                }
+            }
+        }
+        if (tables.isEmpty()) {
+            return;
+        }
+        int count = 0;
+        Set<String> files = new LinkedHashSet<>();
+        for (Sym sym : peer.symbols.values()) {
+            if (!"SQL_STATEMENT".equals(sym.type)) {
+                continue;
+            }
+            Set<String> statementTables = splitColumns(sym.meta.get("readsTables"));
+            statementTables.addAll(splitColumns(sym.meta.get("writesTables")));
+            statementTables.retainAll(tables);
+            if (statementTables.isEmpty() || !splitColumns(sym.meta.get("readsColumns")).isEmpty()) {
+                continue;
+            }
+            count++;
+            if (files.size() < 10) {
+                files.add((sym.filePath == null ? "" : sym.filePath) + ":" + sym.startLine);
+            }
+        }
+        out.unparsedColumnStatements = count;
+        out.unparsedColumnFiles = new ArrayList<>(files);
+    }
+
+    private void addColumnDelta(List<ColumnDelta> out, Set<String> seen, String contract,
+                                boolean readers, boolean writers, boolean mappings) {
+        if (contract == null || contract.isBlank() || !contract.contains(".")) {
+            return;
+        }
+        String key = "db:column:" + contract;
+        if (!seen.add(key)) {
+            return;
+        }
+        ColumnDelta d = new ColumnDelta();
+        d.symbolKey = key;
+        d.contract = contract;
+        d.kind = "DB_COLUMN";
+        d.hitsReaders = readers;
+        d.hitsWriters = writers;
+        d.hitsMappings = mappings;
+        d.confidence = 0.85;
+        out.add(d);
+    }
+
+    private void addTableDelta(List<ColumnDelta> out, Set<String> seen, String table) {
+        if (table == null || table.isBlank()) {
+            return;
+        }
+        String key = "db:table:" + table;
+        if (!seen.add(key)) {
+            return;
+        }
+        ColumnDelta d = new ColumnDelta();
+        d.symbolKey = key;
+        d.contract = table;
+        d.kind = "DB_TABLE";
+        d.confidence = 0.75;
+        out.add(d);
+    }
+
+    /** Columns this program started or stopped writing, as {@code table.column}. */
+    private Set<String> changedWriteColumns(ChangeRecord change) {
+        Set<String> before = splitColumns(str(change.extra.get("oldWritesColumns")));
+        Set<String> after = splitColumns(str(change.extra.get("newWritesColumns")));
+        Set<String> out = new LinkedHashSet<>(after);
+        out.removeAll(before);
+        Set<String> removed = new LinkedHashSet<>(before);
+        removed.removeAll(after);
+        out.addAll(removed);
+        return out;
+    }
+
+    /**
+     * Tables whose write contract appeared or disappeared, for statements that name no column.
+     *
+     * When the columns are known they are the contract, and the table-level fallback would drag in
+     * every reader of the table - exactly the noise column matching exists to remove. The fallback
+     * is only for a write with no column list at all ({@code insert into t values (...)}), where the
+     * statement genuinely moved at table granularity.
+     */
+    private Set<String> changedWriteTables(ChangeRecord change) {
+        if (!splitColumns(str(change.extra.get("newWritesColumns"))).isEmpty()) {
+            return Set.of();
+        }
+        Set<String> after = splitColumns(str(change.extra.get("newWritesTables")));
+        if (after.isEmpty()) {
+            return Set.of();
+        }
+        Set<String> before = splitColumns(str(change.extra.get("oldWritesTables")));
+        Set<String> out = new LinkedHashSet<>(after);
+        out.removeAll(before);
+        return out;
+    }
+
+    private static String str(Object value) {
+        return value == null ? "" : String.valueOf(value);
+    }
+
+    private static Set<String> splitColumns(String csv) {
+        Set<String> out = new LinkedHashSet<>();
+        if (csv == null || csv.isBlank()) {
+            return out;
+        }
         for (String part : csv.split(",")) {
             String value = part.trim();
             if (!value.isEmpty()) {

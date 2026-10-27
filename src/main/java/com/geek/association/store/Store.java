@@ -125,6 +125,13 @@ public class Store {
         // Tag classification arrived with 0.5.0; older registries have no column for it.
         List<String> sourceColumns = columnsOf(st, "repo_source");
         addColumnIfMissing(st, "repo_source", sourceColumns, "tags", "TEXT");
+
+        // analysesOfSource() filters on source_id and orders by id, and the UI runs it on every
+        // source click (plus once per program per scheduled tick). Without an index SQLite scans
+        // the whole analysis table - reading every row, including its summary_json - to answer a
+        // question about one program. Indexing (source_id, id) also satisfies the ORDER BY id DESC
+        // from the index itself, so the sort disappears too. Idempotent, like the columns above.
+        st.executeUpdate("CREATE INDEX IF NOT EXISTS idx_analysis_source_id ON analysis(source_id, id)");
     }
 
     private List<String> columnsOf(Statement st, String table) throws SQLException {
@@ -199,6 +206,30 @@ public class Store {
         }
     }
 
+    /**
+     * Writes back only what a finished analysis learned about its source.
+     *
+     * The run holds the copy read at submit time, and an analysis takes minutes: the user may
+     * rename the program, retag it or point it at another branch meanwhile. Handing that copy to
+     * {@link #saveSource} would rewrite every column and silently revert those edits. So only the
+     * three fields this run actually produces are set, and every other column keeps whatever the
+     * user last wrote.
+     */
+    public void updateSourceSyncState(long id, String status, String message, String lastSyncedAt) {
+        init();
+        try (Connection c = connection(); PreparedStatement ps = c.prepareStatement("""
+                UPDATE repo_source SET status=?, message=?, last_synced_at=? WHERE id=?
+                """)) {
+            ps.setString(1, status);
+            ps.setString(2, message);
+            ps.setString(3, lastSyncedAt);
+            ps.setLong(4, id);
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            throw new IllegalStateException("update source sync state failed", e);
+        }
+    }
+
     public List<RepoSource> sources() {
         init();
         List<RepoSource> out = new ArrayList<>();
@@ -240,11 +271,7 @@ public class Store {
         init();
         List<Analysis> out = new ArrayList<>();
         try (Connection c = connection(); PreparedStatement ps = c.prepareStatement(
-                "SELECT id, source_id, source_name, source_type, mode, base_ref, target_ref, "
-                        + "base_commit, head_commit, status, message, created_at, finished_at, duration_ms, "
-                        + "progress_stage, progress_percent, progress_label, progress_detail, "
-                        + "progress_completed, progress_skipped, summary_json "
-                        + "FROM analysis WHERE source_id=? ORDER BY id DESC")) {
+                "SELECT " + ANALYSIS_COLUMNS + " FROM analysis WHERE source_id=? ORDER BY id DESC")) {
             ps.setLong(1, sourceId);
             try (ResultSet rs = ps.executeQuery()) {
                 while (rs.next()) {
@@ -367,6 +394,19 @@ public class Store {
     }
 
     // ----------------------------------------------------------------- analyses
+
+    /**
+     * Every column except the report blob.
+     *
+     * Spelled out instead of {@code SELECT *} because report_json is megabytes on a large review
+     * queue, and a reader that only wants status or progress must not pay for streaming it. Every
+     * analysis query goes through this list; only {@link #analysisWithReport} adds the blob.
+     */
+    private static final String ANALYSIS_COLUMNS =
+            "id, source_id, source_name, source_type, mode, base_ref, target_ref, "
+                    + "base_commit, head_commit, status, message, created_at, finished_at, duration_ms, "
+                    + "progress_stage, progress_percent, progress_label, progress_detail, "
+                    + "progress_completed, progress_skipped, summary_json";
 
     public Analysis createAnalysis(Analysis analysis) {
         init();
@@ -495,17 +535,36 @@ public class Store {
         }
     }
 
+    /**
+     * Rewrites only the report blob of a finished analysis.
+     *
+     * Exists for the AI补生成 endpoint: {@link #finishAnalysis} takes the status, the timestamps and
+     * the progress lists as well, so using it to attach one optional section would re-stamp a run
+     * that finished hours ago ("分析完成" again, a new duration) just to add a paragraph. Touching a
+     * single column is the narrow write, and the caller is responsible for the matching cache
+     * invalidation.
+     *
+     * @return false when the row does not exist
+     */
+    public boolean updateReportJson(long id, Object report) {
+        init();
+        try (Connection c = connection(); PreparedStatement ps = c.prepareStatement(
+                "UPDATE analysis SET report_json=? WHERE id=?")) {
+            ps.setString(1, report == null ? null : Json.write(report));
+            ps.setLong(2, id);
+            return ps.executeUpdate() > 0;
+        } catch (SQLException e) {
+            throw new IllegalStateException("update analysis report failed", e);
+        }
+    }
+
     public List<Analysis> analyses(int limit) {
         init();
         List<Analysis> out = new ArrayList<>();
         // Explicit columns: report_json can be megabytes, and SELECT * would stream every blob
         // even though the list view never reads it.
         try (Connection c = connection(); PreparedStatement ps = c.prepareStatement(
-                "SELECT id, source_id, source_name, source_type, mode, base_ref, target_ref, "
-                        + "base_commit, head_commit, status, message, created_at, finished_at, duration_ms, "
-                        + "progress_stage, progress_percent, progress_label, progress_detail, "
-                        + "progress_completed, progress_skipped, summary_json "
-                        + "FROM analysis ORDER BY id DESC LIMIT ?")) {
+                "SELECT " + ANALYSIS_COLUMNS + " FROM analysis ORDER BY id DESC LIMIT ?")) {
             ps.setInt(1, limit);
             try (ResultSet rs = ps.executeQuery()) {
                 while (rs.next()) {
@@ -551,9 +610,37 @@ public class Store {
         }
     }
 
+    /**
+     * One analysis row, <em>without</em> its report.
+     *
+     * This is the default read on purpose: status polling, delete checks and the detail page all
+     * need the row but not the megabytes of report_json behind it, and {@code SELECT *} made every
+     * one of them stream the whole blob out of SQLite. Callers that really need the report must say
+     * so by calling {@link #analysisWithReport}.
+     */
     public Analysis analysis(long id) {
         init();
-        try (Connection c = connection(); PreparedStatement ps = c.prepareStatement("SELECT * FROM analysis WHERE id=?")) {
+        try (Connection c = connection(); PreparedStatement ps = c.prepareStatement(
+                "SELECT " + ANALYSIS_COLUMNS + " FROM analysis WHERE id=?")) {
+            ps.setLong(1, id);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? readAnalysis(rs, false) : null;
+            }
+        } catch (SQLException e) {
+            throw new IllegalStateException("read analysis failed", e);
+        }
+    }
+
+    /**
+     * One analysis row together with its stored report JSON, for the callers that serve the report.
+     *
+     * Kept as a separate method rather than a flag on {@link #analysis}: a boolean parameter at
+     * every call site is exactly how the blob started being read by readers that never used it.
+     */
+    public Analysis analysisWithReport(long id) {
+        init();
+        try (Connection c = connection(); PreparedStatement ps = c.prepareStatement(
+                "SELECT " + ANALYSIS_COLUMNS + ", report_json FROM analysis WHERE id=?")) {
             ps.setLong(1, id);
             try (ResultSet rs = ps.executeQuery()) {
                 return rs.next() ? readAnalysis(rs, true) : null;

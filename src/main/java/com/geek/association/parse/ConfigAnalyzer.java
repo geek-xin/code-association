@@ -31,6 +31,8 @@ public class ConfigAnalyzer {
     private final FileSource source;
     private final CodeIndex index;
     private final MavenParser maven;
+    /** 同一文件的按方法片段都从这里取行数组，避免每个方法重新切分整个文件。 */
+    private final SourceLines lines = new SourceLines();
     public final Map<String, String> declaredKeys = new LinkedHashMap<>();
     public final Map<String, String> keyValues = new LinkedHashMap<>();
 
@@ -151,7 +153,7 @@ public class ConfigAnalyzer {
             }
             for (Map.Entry<String, List<TypeInfo.MethodInfo>> e : t.methods.entrySet()) {
                 for (TypeInfo.MethodInfo m : e.getValue()) {
-                    Matcher matcher = valuePattern.matcher(snippet(content, m.line, 12));
+                    Matcher matcher = valuePattern.matcher(snippet(t.filePath, content, m.line, 12));
                     while (matcher.find()) {
                         for (String key : placeholders(matcher.group(1))) {
                             linkKey(m.key, key, t.filePath, m.line, "@Value");
@@ -162,7 +164,7 @@ public class ConfigAnalyzer {
             // @Value on a field is at least as common as on a constructor parameter, and the
             // field is what the code reads later; skipping it hid whole consumers from the graph.
             for (TypeInfo.FieldInfo f : t.fields.values()) {
-                Matcher matcher = valuePattern.matcher(snippet(content, f.line, 4));
+                Matcher matcher = valuePattern.matcher(snippet(t.filePath, content, f.line, 4));
                 while (matcher.find()) {
                     for (String key : placeholders(matcher.group(1))) {
                         linkKey(f.key == null ? t.key : f.key, key, t.filePath, f.line, "@Value");
@@ -170,7 +172,7 @@ public class ConfigAnalyzer {
                 }
             }
             if (t.annotations.contains("ConfigurationProperties")) {
-                String prefix = prefixOf(content, t.startLine);
+                String prefix = prefixOf(t.filePath, content, t.startLine);
                 if (prefix != null) {
                     String normalized = prefix.toLowerCase(Locale.ROOT);
                     for (String key : declaredKeys.keySet()) {
@@ -205,9 +207,9 @@ public class ConfigAnalyzer {
                 }
             }
             if (t.annotations.contains("ConditionalOnProperty")) {
-                String name = firstAttribute(content, "ConditionalOnProperty", "name", t.startLine);
+                String name = firstAttribute(t.filePath, content, "ConditionalOnProperty", "name", t.startLine);
                 if (name == null) {
-                    name = firstAttribute(content, "ConditionalOnProperty", "value", t.startLine);
+                    name = firstAttribute(t.filePath, content, "ConditionalOnProperty", "value", t.startLine);
                 }
                 if (name != null) {
                     linkKey(t.key, name, t.filePath, t.startLine, "@ConditionalOnProperty");
@@ -258,9 +260,9 @@ public class ConfigAnalyzer {
         return out;
     }
 
-    private String prefixOf(String content, int line) {
+    private String prefixOf(String filePath, String content, int line) {
         Matcher m = Pattern.compile("@ConfigurationProperties\\s*\\(([^)]*)\\)")
-                .matcher(snippet(content, line, 8));
+                .matcher(snippet(filePath, content, line, 8));
         if (!m.find()) {
             return null;
         }
@@ -268,9 +270,9 @@ public class ConfigAnalyzer {
         return value.find() ? value.group(1) : null;
     }
 
-    private String firstAttribute(String content, String annotation, String attribute, int line) {
+    private String firstAttribute(String filePath, String content, String annotation, String attribute, int line) {
         Matcher m = Pattern.compile("@" + annotation + "\\s*\\(([^)]*)\\)")
-                .matcher(snippet(content, line, 8));
+                .matcher(snippet(filePath, content, line, 8));
         if (!m.find()) {
             return null;
         }
@@ -279,11 +281,18 @@ public class ConfigAnalyzer {
         return value.find() ? value.group(1) : null;
     }
 
-    private String snippet(String content, int line, int window) {
-        String[] lines = content.split("\\R", -1);
+    /**
+     * 注解附近的代码片段。
+     *
+     * 行数组按文件缓存（{@link SourceLines}）：@Value / @ConfigurationProperties /
+     * @ConditionalOnProperty 都是按方法、按字段调用的，原先每次调用都把整个文件 split 一遍，
+     * 单个大文件里就是 O(方法数 × 文件大小)。
+     */
+    private String snippet(String filePath, String content, int line, int window) {
+        String[] fileLines = lines.lines(filePath, content);
         int from = Math.max(0, line - 3);
-        int to = Math.min(lines.length, line + window);
-        return String.join("\n", java.util.Arrays.copyOfRange(lines, from, to));
+        int to = Math.min(fileLines.length, line + window);
+        return String.join("\n", java.util.Arrays.copyOfRange(fileLines, from, to));
     }
 
     private int lineOf(String content, int offset) {

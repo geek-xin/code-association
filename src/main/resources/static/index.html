@@ -165,14 +165,19 @@
 
     <!-- Global update notice. The settings card alone was too easy to miss: an available
          release also has to be visible from wherever the user already is. role="status" keeps
-         the announcement non-interrupting; the text is written by renderUpdateNotice(). -->
+         the announcement non-interrupting; the text is written by renderUpdateNotice().
+
+         The same strip doubles as the restart progress line (see renderUpdateNotice): while a
+         hot restart is in flight it shows "正在重启到 x.y.z…" and hides all three buttons,
+         because none of them mean anything while the server is coming back up. The icon is
+         swapped rather than duplicated so there is exactly one live region on screen. -->
     <div class="upd-banner hidden" id="update-banner" role="status">
-      <svg aria-hidden="true"><use href="#i-arrow-up"/></svg>
+      <span class="upd-banner-icon" id="update-banner-icon" aria-hidden="true"><svg><use href="#i-arrow-up"/></svg></span>
       <div class="upd-banner-text">
         <span id="update-banner-lead">发现新版本 </span><b id="update-banner-version">—</b><span
           id="update-banner-tail">（当前 <span id="update-banner-current">—</span>）</span>
       </div>
-      <div class="upd-banner-actions">
+      <div class="upd-banner-actions" id="update-banner-actions">
         <button class="btn btn-sm btn-primary" type="button" data-update-banner-view>查看</button>
         <button class="btn btn-sm btn-ghost" type="button" data-update-banner-skip>忽略此版本</button>
         <button class="icon-btn" type="button" data-update-banner-close
@@ -679,6 +684,21 @@
       <div id="an-body">
       <div class="stats" id="an-stats"></div>
 
+      <!-- AI review card. Lives inside #an-body because it is part of the report:
+           without a report there is nothing to explain, and the whole body is hidden then.
+           Rendered by renderAnalysisAi(); kept hidden entirely while AI is not configured,
+           so an installation that never enables it sees no new element on this page. -->
+      <div class="card hidden" id="an-ai-card" style="margin-bottom:16px">
+        <div class="card-head">
+          <div>
+            <div class="card-title">AI 审核</div>
+            <div class="card-sub" id="an-ai-sub">基于本页静态分析事实生成的评审要点</div>
+          </div>
+          <div class="card-head-actions" id="an-ai-actions"></div>
+        </div>
+        <div id="an-ai-body"></div>
+      </div>
+
       <div class="grid grid-2" style="margin-bottom:16px">
         <div class="card">
           <div class="card-head">
@@ -707,6 +727,19 @@
           </div>
           <div class="list" id="an-modules"></div>
         </div>
+      </div>
+
+      <!-- Commit range card. Hidden unless the report carries commits: every other mode has no
+           range to show, and an empty card would read as a failed range read. -->
+      <div class="card flush hidden" id="an-commits-card" style="margin-bottom:16px">
+        <div class="card-head" style="padding:18px 18px 0;margin-bottom:10px">
+          <div>
+            <div class="card-title">提交范围</div>
+            <div class="card-sub" id="an-commits-sub">本次分析包含的提交，新提交在前</div>
+          </div>
+          <div class="card-head-actions"><span class="pill neutral" id="an-commit-count">0 个</span></div>
+        </div>
+        <div class="table" style="padding:0 8px 10px" id="an-commits"></div>
       </div>
 
       <div class="card flush" style="margin-bottom:16px">
@@ -914,6 +947,97 @@
             <button class="btn btn-sm" id="set-clear" style="align-self:flex-start">清除本地复核状态</button>
           </div>
         </div>
+        <div class="card" id="card-ai" style="grid-column:1/-1">
+          <div class="card-head">
+            <div>
+              <div class="card-title">AI 审核（可选）</div>
+              <div class="card-sub">来自 /api/ai · 只有启用后才会把分析摘要发送给模型服务</div>
+            </div>
+            <div class="card-head-actions">
+              <button class="btn btn-sm" id="ai-test" data-ai-test type="button"
+                      title="用当前填写的内容试发一次最小请求" aria-label="测试模型连接">
+                <svg><use href="#i-zap"/></svg>测试连接
+              </button>
+              <button class="btn btn-sm btn-primary" id="ai-save" data-ai-save type="button"
+                      title="保存并立即生效，无需重启" aria-label="保存 AI 审核设置">
+                <svg><use href="#i-check"/></svg>保存
+              </button>
+            </div>
+          </div>
+
+          <!-- Static skeleton, filled by fillAiForm() rather than re-rendered per poll tick:
+               renderSettings() runs on every refresh, and rewriting the inputs would wipe
+               whatever the user is half-way through typing. Only the status line is live. -->
+          <div class="ai-status-row">
+            <span class="pill neutral" id="ai-status">读取中</span>
+            <span class="ai-status-note" id="ai-status-note">—</span>
+          </div>
+
+          <div class="stack" style="gap:14px;margin-top:14px">
+            <label class="checkbox"><input type="checkbox" id="ai-enabled"/> 启用 AI 审核</label>
+
+            <div class="field-row">
+              <div class="field">
+                <label for="ai-base-url">接口地址</label>
+                <input id="ai-base-url" class="mono" placeholder="https://api.deepseek.com/v1" autocomplete="off" spellcheck="false"/>
+                <div class="hint">任意 OpenAI 兼容端点；填到 <span class="mono">/v1</span> 为止，路径由服务端补齐。</div>
+              </div>
+              <div class="field">
+                <label for="ai-model">模型</label>
+                <input id="ai-model" class="mono" placeholder="deepseek-chat" autocomplete="off" spellcheck="false"/>
+                <div class="hint">必须与接口地址所属服务商的模型名一致。</div>
+              </div>
+            </div>
+
+            <div class="field">
+              <label for="ai-api-key">API Key</label>
+              <div class="path-field">
+                <input id="ai-api-key" type="password" placeholder="未设置" autocomplete="new-password" spellcheck="false"/>
+                <button class="btn btn-sm" type="button" id="ai-clear-key" data-ai-clear-key
+                        title="清除已保存的 Key" aria-label="清除已保存的 API Key">清除</button>
+              </div>
+              <div class="hint">保存在本机数据目录，不写入浏览器；留空表示保持已保存的值。本地模型可留空。</div>
+            </div>
+
+            <div class="field">
+              <label>常用端点</label>
+              <div class="ai-presets">
+                <button class="btn btn-sm" type="button" data-ai-preset="deepseek">DeepSeek</button>
+                <button class="btn btn-sm" type="button" data-ai-preset="openai">OpenAI</button>
+                <button class="btn btn-sm" type="button" data-ai-preset="ollama">Ollama 本地</button>
+              </div>
+              <div class="hint">只填入接口地址与模型，不改动 Key。</div>
+            </div>
+
+            <div class="field-row">
+              <div class="field">
+                <label for="ai-max-impacts">每条分析最多送审影响</label>
+                <input id="ai-max-impacts" type="number" min="1" max="50" step="1" placeholder="12"/>
+                <div class="hint">1–50 条。条目越多提示词越长，费用与耗时也越高。</div>
+              </div>
+              <div class="field">
+                <label for="ai-timeout">请求超时（秒）</label>
+                <input id="ai-timeout" type="number" min="5" max="300" step="5" placeholder="60"/>
+                <div class="hint">5–300 秒。推理模型通常需要更长时间。</div>
+              </div>
+            </div>
+
+            <label class="checkbox"><input type="checkbox" id="ai-default-runs"/> 默认在每次分析时生成 AI 审核</label>
+
+            <div class="callout" id="ai-privacy">
+              <svg><use href="#i-shield"/></svg>
+              <div>只发送分析摘要：变更清单、影响路径与原因、盲区与统计。不发送源码全文，也不发送仓库地址。
+                生成结果标注为「AI 生成 · 待验证」，与静态分析结论分开存放。</div>
+            </div>
+
+            <div class="ai-foot">配置保存在 <span class="mono" id="ai-settings-file">—</span></div>
+            <div class="hint">也可在 <span class="mono">application.yml</span> 的
+              <span class="mono">code-association.ai.*</span> 与 <span class="mono">AI_API_KEY</span>
+              环境变量中配置；此处保存的快照会覆盖文件里的同名项。</div>
+          </div>
+
+          <div id="ai-test-result" style="margin-top:12px"></div>
+        </div>
         <div class="card" id="card-transfer" style="grid-column:1/-1">
           <div class="card-head">
             <div>
@@ -947,6 +1071,16 @@
               </button>
             </div>
           </div>
+          <!-- The two progress strips sit outside #upd-body on purpose: renderUpdateBody() rewrites
+               that host wholesale on every poll tick, and a progress line that is re-created
+               forty times would restart its spinner animation each time. Keeping them as stable
+               nodes lets renderUpdateProgress() / renderUpdateRestart() update text in place.
+
+               #upd-progress covers the background pipeline (download / verify / apply); the
+               restart strip below it covers the supervised restart that follows. They are separate
+               because a run can fail at the download and never reach the restart at all. -->
+          <div class="upd-progress hidden" id="upd-progress" aria-live="polite"></div>
+          <div class="upd-restart hidden" id="upd-restart" aria-live="polite"></div>
           <div id="upd-body"></div>
         </div>
       </div>
@@ -1048,19 +1182,28 @@
           <option value="GIT_DIFF">提交 / 分支对比</option>
           <option value="WORKTREE_DIFF">本地未提交改动</option>
           <option value="PULL_REQUEST">PR / MR</option>
+          <option value="COMMIT_RANGE">提交范围</option>
         </select>
       </div>
       <div class="field-row">
         <div class="field" id="mr-base-wrap">
-          <label for="mr-base">基线</label>
+          <label for="mr-base" id="mr-base-label">基线</label>
           <input id="mr-base" list="mr-refs" placeholder="留空 = 目标提交的父提交"/>
         </div>
         <div class="field">
-          <label for="mr-target">目标</label>
+          <label for="mr-target" id="mr-target-label">目标</label>
           <input id="mr-target" list="mr-refs" placeholder="HEAD"/>
         </div>
       </div>
       <datalist id="mr-refs"></datalist>
+      <datalist id="mr-commits"></datalist>
+      <!-- Commit range preview. Hidden for every other mode: it is the answer to "which commits am
+           I actually about to analyse", a question only the range mode asks. -->
+      <div class="field hidden" id="mr-range-preview">
+        <label>本次包含的提交</label>
+        <div class="hint" id="mr-range-hint">两端都填好后，这里会列出范围内的提交。</div>
+        <div class="commit-list" id="mr-range-list"></div>
+      </div>
       <div class="field hidden" id="mr-pr-wrap">
         <label for="mr-pr">PR / MR 编号</label>
         <input id="mr-pr" type="number" min="1" placeholder="42"/>
@@ -1074,6 +1217,15 @@
           对它们造成的影响，不分析本程序内部影响。
         </div>
         <div class="peer-picker" id="mr-peers"></div>
+      </div>
+
+      <!-- Optional AI review for this run. Hidden until GET /api/ai says the
+           feature is configured: a checkbox that is always disabled would suggest a
+           broken feature rather than an unused one, and the hint belongs next to the
+           switch in 设置, not in a dialog the user opens to start a scan. -->
+      <div class="field hidden" id="mr-ai-wrap">
+        <label class="checkbox"><input type="checkbox" id="mr-ai"/> 同时生成 AI 评审说明（可选）</label>
+        <div class="hint" id="mr-ai-hint">只发送本次分析摘要，不发送源码全文。</div>
       </div>
 
       <div class="callout" id="mr-error" style="display:none">

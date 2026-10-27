@@ -177,21 +177,30 @@ public final class SourceTransfer {
 
         if (!isUpdate) {
             target.createdAt = RepoSource.now();
-            markAvailability(target);
+            markAvailability(target, "导入时");
         }
         sink.save(target);
         return isUpdate;
     }
 
     /**
-     * Records whether an imported local source is readable right now.
+     * Records whether a source's location is usable right now.
      *
      * The whole point of an export is to carry a registry to another machine, where the paths
      * will not exist yet. Failing the import would defeat that; silently claiming OK would leave
      * the user staring at a source that cannot be analysed with no explanation. So the row is
      * stored with an explicit status the list view can render.
+     *
+     * The same judgement is needed when a source is edited: a row imported on this machine and
+     * since pointed at the right directory still carries the verdict of the import, and the list
+     * would keep calling it 目录缺失. Both callers share this method so the two paths cannot drift
+     * into disagreeing about what counts as usable.
+     *
+     * @param moment when the check happened ("导入时", "编辑时"). It is a parameter rather than a
+     *               constant because the stored sentence is shown to the user, and one that names
+     *               an import on an edit describes an event that never took place.
      */
-    private static void markAvailability(RepoSource source) {
+    public static void markAvailability(RepoSource source, String moment) {
         boolean local = "LOCAL_DIR".equals(source.type) || "LOCAL_GIT".equals(source.type);
         if (!local) {
             source.status = "OK";
@@ -205,11 +214,11 @@ public final class SourceTransfer {
                 source.message = null;
             } else {
                 source.status = "MISSING";
-                source.message = "导入时目录不存在：" + path;
+                source.message = moment + "目录不存在：" + path;
             }
         } catch (RuntimeException e) {
             source.status = "MISSING";
-            source.message = "导入时目录不可用：" + source.location;
+            source.message = moment + "目录不可用：" + source.location;
         }
     }
 

@@ -34,6 +34,13 @@ public final class MarkdownReport {
                 .append(report.pullRequest == null ? "" : " #" + report.pullRequest).append(" |\n");
         sb.append("| 基线 → 目标 | ").append(shortCommit(report.baseCommit)).append(" → ")
                 .append(shortCommit(report.headCommit)).append(" |\n");
+        if (report.commitCount > 0) {
+            // The commit count is the size of the review, which the file list alone cannot convey:
+            // "3 files" is a very different ask when it spans forty commits.
+            sb.append("| 提交数 | ").append(report.commitCount)
+                    .append(report.rangeNote == null || report.rangeNote.isBlank()
+                            ? "" : "（" + report.rangeNote + "）").append(" |\n");
+        }
         sb.append("| 对比程序 / 命中契约 | ").append(report.summary.comparedPrograms).append(" / ")
                 .append(report.summary.matchedContracts).append(" |\n");
         sb.append("| 变更模块 / 符号 | ").append(report.summary.changedModules).append(" / ")
@@ -45,6 +52,21 @@ public final class MarkdownReport {
         sb.append("| 接口 / SQL / 配置变化 | ").append(report.summary.apiChanges).append(" / ")
                 .append(report.summary.sqlChanges).append(" / ").append(report.summary.configChanges)
                 .append(" · 消息契约 ").append(report.summary.messageChanges).append(" |\n\n");
+
+        if (!report.commits.isEmpty()) {
+            // Commits come before the impact tables on purpose: a reviewer reads "what am I
+            // approving" before "what does it break".
+            sb.append("### 本次提交范围\n\n");
+            for (com.geek.association.model.CommitInfo commit : report.commits) {
+                sb.append("- ").append(code(commit.shortSha)).append(' ')
+                        .append(commit.subject == null ? "" : commit.subject);
+                if (commit.author != null && !commit.author.isBlank()) {
+                    sb.append(" — ").append(commit.author);
+                }
+                sb.append('\n');
+            }
+            sb.append('\n');
+        }
 
         if (!report.moduleImpacts.isEmpty()) {
             sb.append("### 其他程序的模块影响\n\n");
@@ -98,6 +120,8 @@ public final class MarkdownReport {
         }
         sb.append('\n');
 
+        appendAi(sb, report);
+
         if (!report.notes.isEmpty()) {
             sb.append("### 分析边界\n\n");
             for (String note : report.notes) {
@@ -107,6 +131,31 @@ public final class MarkdownReport {
         }
         sb.append("<sub>由 code-association 生成 · 风险与置信度独立 · 静态分析结论需人工确认关键项</sub>\n");
         return sb.toString();
+    }
+
+    /**
+     * The optional AI section, printed only when a model actually produced something.
+     *
+     * Placed after the evidence and before the analysis boundaries so the reading order stays
+     * "facts, then interpretation, then what was not checked". A failed or absent generation prints
+     * nothing at all: a PR comment that says "AI 生成失败" on every pipeline run of an unconfigured
+     * installation is noise, and the exit code must not change either way.
+     */
+    private static void appendAi(StringBuilder sb, ImpactReport report) {
+        if (report.ai == null || !Boolean.TRUE.equals(report.ai.get("generated"))) {
+            return;
+        }
+        Object text = report.ai.get("text");
+        sb.append("### AI 评审说明（待验证）\n\n");
+        sb.append("> AI 生成内容，仅基于下列静态分析事实，不是已验证的结论。\n\n");
+        sb.append(text == null ? "" : text.toString().strip()).append("\n\n");
+        String model = report.ai.get("model") == null ? "" : report.ai.get("model").toString();
+        Object generatedAt = report.ai.get("generatedAt");
+        sb.append("<sub>模型 ").append(model);
+        if (generatedAt != null) {
+            sb.append(" · 生成于 ").append(generatedAt);
+        }
+        sb.append("</sub>\n\n");
     }
 
     private static String code(String value) {

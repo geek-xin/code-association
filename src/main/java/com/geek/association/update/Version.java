@@ -130,21 +130,29 @@ public final class Version implements Comparable<Version> {
     /**
      * The version this process is running.
      *
-     * Read from the manifest of the jar that loaded this class. In an IDE or a test there is no
-     * such jar, and a fabricated number would be worse than an obviously development-looking one,
-     * so the caller sees {@code 0.0.0-dev} and every version from GitHub counts as newer.
+     * Two sources, in order: the manifest of the jar that loaded this class (a packaged
+     * installation), then {@code META-INF/build-info.properties} written by the Maven build. The
+     * second one is what makes {@code mvn spring-boot:run} and an IDE run report the real version
+     * instead of {@code 0.0.0-dev} - the pom version is already known at build time, so there was
+     * never a reason to hide it.
+     *
+     * {@code 0.0.0-dev} stays as the last resort for a run with no build metadata at all (a bare
+     * {@code javac} output, a trimmed classpath), where a fabricated number would be worse than an
+     * obviously development-looking one: it keeps every real release looking newer, which is the
+     * safe direction to be wrong in.
      */
     public static Version running() {
         return RUNNING;
     }
 
     private static Version resolveRunning() {
-        String fromManifest = JarLocation.manifestVersion();
-        Version parsed = fromManifest == null ? null : tryParse(fromManifest);
+        Version parsed = tryParse(JarLocation.manifestVersion());
         if (parsed == null) {
-            // A label is better than a lie: 0.0.0-dev makes every real release look newer, which is
-            // the safe direction to be wrong in for an installation that has no build number.
-            log.debug("no implementation version in the running jar, reporting {}", DEV_VERSION);
+            parsed = tryParse(JarLocation.buildInfoVersion());
+        }
+        if (parsed == null) {
+            log.debug("no implementation version in the running jar or build-info, reporting {}",
+                    DEV_VERSION);
         }
         return parsed != null ? parsed : parse(DEV_VERSION);
     }

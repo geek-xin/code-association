@@ -371,6 +371,7 @@ public class ChangeDetector {
                         "字段类型变化：" + before.returnType + " → " + now.returnType);
                 cr.oldValue = before.returnType;
                 cr.newValue = now.returnType;
+                mappedColumns(cr, now, before);
                 return cr;
             }
             if (!Objects.equals(before.bodyHash, now.bodyHash) && now.bodyHash != null) {
@@ -382,18 +383,14 @@ public class ChangeDetector {
             return null;
         }
         if ("SQL_STATEMENT".equals(type)) {
+            // A schema change is a different event than a statement edit: the first one breaks every
+            // program that touches the column, the second one only matters when the write set moved.
+            ChangeRecord ddl = ddlChange(now, before, 1.0);
+            if (ddl != null) {
+                return ddl;
+            }
             if (!Objects.equals(before.bodyHash, now.bodyHash)) {
-                ChangeRecord cr = baseRecord(SQL_CHANGED, "SQL_STATEMENT", now.filePath, now.qualifiedName,
-                        now.startLine, now.endLine);
-                cr.modulePath = now.modulePath;
-                cr.symbolKey = now.key;
-                cr.oldValue = before.meta.get("sql");
-                cr.newValue = now.meta.get("sql");
-                cr.semanticSummary = "SQL 语句发生变化：" + now.qualifiedName;
-                cr.riskSeed = 0.7;
-                cr.tags.add("DATA");
-                cr.extra.put("sqlKind", now.meta.get("sqlKind"));
-                return cr;
+                return sqlChange(SQL_CHANGED, now, before, 0.7, "SQL 语句发生变化：" + now.qualifiedName);
             }
             return null;
         }
@@ -424,8 +421,10 @@ public class ChangeDetector {
                     s.modulePath, s.key, s.signature, "", 0.2, "新增方法：" + s.display());
         }
         if ("FIELD".equals(s.type)) {
-            return baseRecord(FIELD_ADDED, s.type, s.filePath, s.qualifiedName, s.startLine, s.endLine,
+            ChangeRecord cr = baseRecord(FIELD_ADDED, s.type, s.filePath, s.qualifiedName, s.startLine, s.endLine,
                     s.modulePath, s.key, s.signature, "", 0.2, "新增字段：" + s.qualifiedName);
+            mappedColumns(cr, s, null);
+            return cr;
         }
         if ("ENUM_CONSTANT".equals(s.type)) {
             ChangeRecord cr = baseRecord(ENUM_CONSTANT_ADDED, s.type, s.filePath, s.qualifiedName, s.startLine,
@@ -438,9 +437,18 @@ public class ChangeDetector {
                     s.modulePath, s.key, "", "", 0.15, "新增类型：" + s.qualifiedName);
         }
         if ("SQL_STATEMENT".equals(s.type)) {
+            // A brand new script that alters a table is a schema change, not a new query: the other
+            // program cares about the column, not about the file that introduced it.
+            if (s.meta.get("ddl") != null) {
+                ChangeRecord ddl = ddlChange(s, new Sym(), 1.0);
+                if (ddl != null) {
+                    return ddl;
+                }
+            }
             ChangeRecord cr = baseRecord(SQL_ADDED, s.type, s.filePath, s.qualifiedName, s.startLine, s.endLine,
                     s.modulePath, s.key, "", s.meta.get("sql"), 0.4, "新增 SQL 语句：" + s.qualifiedName);
             cr.tags.add("DATA");
+            columnExtras(cr, null, s);
             return cr;
         }
         return null;
@@ -458,6 +466,9 @@ public class ChangeDetector {
                     s.endLine, s.modulePath, s.key, s.signature, "", 0.85, "删除字段：" + s.qualifiedName);
             cr.tags.add("COMPILE");
             cr.tags.add("CONTRACT");
+            // The removed field only exists in the base index, so its column mapping has to be
+            // captured here; the peer engine cannot look it up afterwards.
+            mappedColumns(cr, null, s);
             return cr;
         }
         if ("ENUM_CONSTANT".equals(s.type)) {
@@ -474,9 +485,18 @@ public class ChangeDetector {
             return cr;
         }
         if ("SQL_STATEMENT".equals(s.type)) {
+            // Removing the script that added a column removes the column: report the schema change
+            // rather than "a query disappeared", which no other program can act on.
+            if (s.meta.get("ddl") != null) {
+                ChangeRecord ddl = ddlChange(new Sym(), s, 1.0);
+                if (ddl != null) {
+                    return ddl;
+                }
+            }
             ChangeRecord cr = baseRecord(SQL_REMOVED, s.type, s.filePath, s.qualifiedName, s.startLine, s.endLine,
                     s.modulePath, s.key, s.meta.get("sql"), "", 0.75, "删除 SQL 语句：" + s.qualifiedName);
             cr.tags.add("DATA");
+            columnExtras(cr, s, null);
             return cr;
         }
         return null;
@@ -562,10 +582,15 @@ public class ChangeDetector {
 
     // -------------------------------------------------------------------- SQL
 
+    /**
+     * SQL statements, from MyBatis XML and from {@code .sql} scripts alike.
+     *
+     * Scripts used to be skipped entirely, which meant a migration script could add, drop or retype
+     * a column and produce no change record at all - the schema change existed in git and nowhere in
+     * the report. They are compared here like any other statement; what distinguishes them is that
+     * the DDL comparison runs first.
+     */
     private void detectSql(FileChange fc, List<ChangeRecord> out) {
-        if (fc.path.endsWith(".sql")) {
-            return; // handled as symbols by detectJava-independent pass below
-        }
         List<Sym> oldSyms = sqlOf(baseIndex, fc.oldPath);
         List<Sym> newSyms = sqlOf(headIndex, fc.path);
         Map<String, Sym> oldByKey = byKey(oldSyms);
@@ -574,17 +599,15 @@ public class ChangeDetector {
             Sym old = oldByKey.get(s.key);
             if (old == null) {
                 out.add(addedRecord(s));
-            } else if (!Objects.equals(old.bodyHash, s.bodyHash)) {
-                ChangeRecord cr = baseRecord(SQL_CHANGED, "SQL_STATEMENT", s.filePath, s.qualifiedName,
-                        s.startLine, s.endLine);
-                cr.modulePath = s.modulePath;
-                cr.symbolKey = s.key;
-                cr.oldValue = old.meta.get("sql");
-                cr.newValue = s.meta.get("sql");
-                cr.semanticSummary = "SQL 语句变化：" + s.qualifiedName;
-                cr.riskSeed = 0.7;
-                cr.tags.add("DATA");
-                out.add(cr);
+                continue;
+            }
+            ChangeRecord ddl = ddlChange(s, old, 1.0);
+            if (ddl != null) {
+                out.add(ddl);
+                continue;
+            }
+            if (!Objects.equals(old.bodyHash, s.bodyHash)) {
+                out.add(sqlChange(SQL_CHANGED, s, old, 0.7, "SQL 语句变化：" + s.qualifiedName));
             }
         }
         for (Sym s : oldSyms) {
@@ -592,6 +615,130 @@ public class ChangeDetector {
                 out.add(removedRecord(s));
             }
         }
+    }
+
+    private ChangeRecord sqlChange(String changeType, Sym now, Sym before, double risk, String summary) {
+        ChangeRecord cr = baseRecord(changeType, "SQL_STATEMENT", now.filePath, now.qualifiedName,
+                now.startLine, now.endLine);
+        cr.modulePath = now.modulePath;
+        cr.symbolKey = now.key;
+        cr.oldValue = before.meta.get("sql");
+        cr.newValue = now.meta.get("sql");
+        cr.semanticSummary = summary;
+        cr.riskSeed = risk;
+        cr.tags.add("DATA");
+        cr.extra.put("sqlKind", now.meta.get("sqlKind"));
+        columnExtras(cr, before, now);
+        // A statement edit only reaches the other program when the write set moved, and that is a
+        // sharper contract break than a body tweak: name it and raise the seed to match.
+        if (writeColumnsMoved(cr)) {
+            cr.riskSeed = 0.85;
+            cr.semanticSummary = summary + "（写入字段集合发生变化）";
+        }
+        return cr;
+    }
+
+    private boolean writeColumnsMoved(ChangeRecord cr) {
+        Object before = cr.extra.get("oldWritesColumns");
+        Object after = cr.extra.get("newWritesColumns");
+        return !safe(String.valueOf(before)).equals(safe(String.valueOf(after)));
+    }
+
+    /**
+     * Carries the before/after column sets on the record.
+     *
+     * The peer engine compares these two lists to find out which columns this program started or
+     * stopped writing; that comparison is the whole difference between a noisy statement edit and a
+     * database contract change, and it cannot be made from the statement symbol alone once the
+     * statement is gone from the head revision.
+     */
+    private void columnExtras(ChangeRecord cr, Sym before, Sym now) {
+        Sym b = before == null ? new Sym() : before;
+        Sym n = now == null ? new Sym() : now;
+        cr.extra.put("oldReadsColumns", safe(b.meta.get("readsColumns")));
+        cr.extra.put("newReadsColumns", safe(n.meta.get("readsColumns")));
+        cr.extra.put("oldWritesColumns", safe(b.meta.get("writesColumns")));
+        cr.extra.put("newWritesColumns", safe(n.meta.get("writesColumns")));
+        cr.extra.put("oldWritesTables", safe(b.meta.get("writesTables")));
+        cr.extra.put("newWritesTables", safe(n.meta.get("writesTables")));
+        cr.extra.put("oldReadsTables", safe(b.meta.get("readsTables")));
+        cr.extra.put("newReadsTables", safe(n.meta.get("readsTables")));
+    }
+
+    /**
+     * A schema change, or null when the statement carries no DDL or the DDL did not move.
+     *
+     * The record names the column, because that - not the script file - is what another program
+     * depends on. A {@code CREATE TABLE} / {@code DROP TABLE} has no column and stays table-scoped.
+     */
+    private ChangeRecord ddlChange(Sym now, Sym before, double risk) {
+        String newKind = now.meta.get("ddl");
+        String oldKind = before.meta.get("ddl");
+        String newTable = now.meta.get("ddlTable");
+        String oldTable = before.meta.get("ddlTable");
+        String newColumn = now.meta.get("ddlColumn");
+        String oldColumn = before.meta.get("ddlColumn");
+        if (newKind == null && oldKind == null) {
+            return null;
+        }
+        boolean same = Objects.equals(newKind, oldKind) && Objects.equals(newTable, oldTable)
+                && Objects.equals(newColumn, oldColumn);
+        if (same) {
+            return null;
+        }
+        String table = newTable != null ? newTable : oldTable;
+        String column = newColumn != null ? newColumn : oldColumn;
+        String kind = newKind != null ? newKind : oldKind;
+        boolean removed = newKind == null;
+        double seed = ddlRisk(kind, risk);
+        String verb = removed ? "移除" : "";
+        String summary;
+        if ("DROP_TABLE".equals(kind)) {
+            summary = removed ? "移除删表脚本：" + table : "删除数据库表：" + table;
+        } else if ("CREATE_TABLE".equals(kind)) {
+            summary = removed ? "移除建表脚本：" + table : "新建数据库表：" + table;
+        } else if ("DROP_COLUMN".equals(kind)) {
+            summary = verb + "删除数据库字段：" + table + "." + column;
+        } else if ("ADD_COLUMN".equals(kind)) {
+            summary = verb + "新增数据库字段：" + table + "." + column;
+        } else if ("MODIFY_COLUMN".equals(kind)) {
+            summary = verb + "修改数据库字段：" + table + "." + column
+                    + (oldColumn != null && !Objects.equals(oldColumn, newColumn) ? "（原 " + oldColumn + "）" : "");
+        } else {
+            summary = "表结构发生变化：" + table;
+        }
+        ChangeRecord cr = baseRecord(DDL_CHANGED, "SQL_STATEMENT", now.filePath, now.qualifiedName,
+                now.startLine, now.endLine);
+        cr.modulePath = now.modulePath;
+        cr.symbolKey = now.key;
+        cr.oldValue = oldKind == null ? "" : oldKind + " " + safe(oldTable) + "." + safe(oldColumn);
+        cr.newValue = newKind + " " + safe(table) + "." + safe(column);
+        cr.semanticSummary = summary;
+        cr.riskSeed = seed;
+        cr.tags.add("DATA");
+        cr.tags.add("CONTRACT");
+        cr.extra.put("ddl", kind);
+        cr.extra.put("oldDdl", safe(oldKind));
+        cr.extra.put("table", safe(table));
+        cr.extra.put("column", safe(column));
+        cr.extra.put("oldColumn", safe(oldColumn));
+        cr.extra.put("ddlSql", safe(now.meta.get("ddlSql")));
+        return cr;
+    }
+
+    /**
+     * Risk of a schema change. Dropping is worse than adding: the other side keeps running and
+     * silently reads nothing, while an added column is invisible to code that names its columns.
+     */
+    private double ddlRisk(String kind, double fallback) {
+        return switch (kind == null ? "" : kind) {
+            case "DROP_COLUMN" -> 0.95;
+            case "DROP_TABLE" -> 0.95;
+            case "MODIFY_COLUMN" -> 0.9;
+            case "CREATE_TABLE" -> 0.6;
+            case "ADD_COLUMN" -> 0.6;
+            default -> fallback;
+        };
     }
 
     private List<Sym> sqlOf(CodeIndex index, String file) {
@@ -713,6 +860,37 @@ public class ChangeDetector {
         cr.semanticSummary = summary;
         cr.tags.add(now.test ? "TEST" : "PRODUCTION");
         return cr;
+    }
+
+    /**
+     * Records the database columns a field is mapped onto, as {@code table.column}.
+     *
+     * An entity field is a database contract only because of this mapping: the column is what the
+     * other program reads. The edges live on the field symbol, so the head symbol is used for the
+     * current state and the base symbol for a removal.
+     */
+    private void mappedColumns(ChangeRecord cr, Sym now, Sym before) {
+        Set<String> columns = new LinkedHashSet<>();
+        for (Sym sym : new Sym[]{now, before}) {
+            if (sym == null || sym.key == null) {
+                continue;
+            }
+            for (Edge e : headIndex.outgoing.getOrDefault(sym.key, List.of())) {
+                addMappedColumn(columns, e);
+            }
+            for (Edge e : baseIndex.outgoing.getOrDefault(sym.key, List.of())) {
+                addMappedColumn(columns, e);
+            }
+        }
+        if (!columns.isEmpty()) {
+            cr.extra.put("mappedColumns", String.join(",", columns));
+        }
+    }
+
+    private void addMappedColumn(Set<String> columns, Edge e) {
+        if ("MAPS_COLUMN".equals(e.relation) && e.to != null && e.to.startsWith("db:column:")) {
+            columns.add(e.to.substring("db:column:".length()));
+        }
     }
 
     private ChangeRecord fieldRecord(String type, Sym now, Sym before, double risk, String summary) {

@@ -1,9 +1,12 @@
 package com.geek.association;
 
 import com.geek.association.config.AppProperties;
+import com.geek.association.diff.ChangeDetector;
+import com.geek.association.diff.FileDiffCollector;
 import com.geek.association.impact.PeerImpactEngine;
 import com.geek.association.model.ChangeRecord;
 import com.geek.association.model.CodeIndex;
+import com.geek.association.model.FileChange;
 import com.geek.association.model.PeerImpact;
 import com.geek.association.model.RepoSource;
 import com.geek.association.parse.CodeIndexer;
@@ -177,47 +180,332 @@ class PeerImpactTest {
         assertEquals(0, result.maxRisk);
     }
 
-    /**
-     * A changed SQL statement has no table symbol of its own: the change record points at the
-     * statement, so the tables have to be read back from the statement metadata.
-     */
-    @Test
-    void changedSqlStatementMatchesTheProgramReadingTheSameTable(@TempDir Path tmp) throws IOException {
-        Path writer = tmp.resolve("w");
-        write(writer, "pom.xml", "<project><modelVersion>4.0.0</modelVersion>"
-                + "<groupId>com.example</groupId><artifactId>writer</artifactId><version>1.0</version></project>");
-        write(writer, "src/main/resources/mapper/OrderMapper.xml", "<mapper namespace=\"com.example.w.OrderMapper\">"
-                + "<insert id=\"insertOrder\">INSERT INTO orders (id) VALUES (#{id})</insert>"
-                + "</mapper>");
-        CodeIndex own = index(writer);
+    // ------------------------------------------------------- database contracts
+    //
+    // A shared table is not a contract; a shared column is. The cases below are the acceptance
+    // criteria of that rule, and the first one is the reason it exists: reading one more column of
+    // a shared table must not drag the other program into the review queue.
 
-        Path reader = tmp.resolve("r");
-        write(reader, "pom.xml", "<project><modelVersion>4.0.0</modelVersion>"
+    private static final String WRITER_POM = "<project><modelVersion>4.0.0</modelVersion>"
+            + "<groupId>com.example</groupId><artifactId>writer</artifactId><version>1.0</version></project>";
+
+    /** Indexes two revisions of the same program and returns the head index plus detected changes. */
+    private static final class Change {
+        CodeIndex head;
+        List<ChangeRecord> records;
+    }
+
+    private static Change detectChanges(Path base, Path head) {
+        RevisionPair revisions = new RevisionPair();
+        revisions.base = new DirSource(base, "base", PROPS.getMaxFiles());
+        revisions.head = new DirSource(head, "head", PROPS.getMaxFiles());
+        CodeIndex baseIndex = new CodeIndexer(PROPS.getMaxFiles()).index(revisions.base, "base", "base");
+        CodeIndex headIndex = new CodeIndexer(PROPS.getMaxFiles()).index(revisions.head, "head", "head");
+        List<FileChange> files = new FileDiffCollector(revisions.base, revisions.head).collect();
+        Change change = new Change();
+        change.head = headIndex;
+        change.records = new ChangeDetector(baseIndex, headIndex).detect(files);
+        long seq = 1;
+        for (ChangeRecord record : change.records) {
+            record.id = seq++;
+        }
+        return change;
+    }
+
+    /** One program whose only changed file is a MyBatis mapper with a single statement. */
+    private static Change mapperChange(Path tmp, String before, String after) throws IOException {
+        Path base = tmp.resolve("base");
+        write(base, "pom.xml", WRITER_POM);
+        write(base, "src/main/resources/mapper/OrderMapper.xml", "<mapper namespace=\"com.example.w.OrderMapper\">"
+                + before + "</mapper>");
+        Path head = tmp.resolve("head");
+        write(head, "pom.xml", WRITER_POM);
+        write(head, "src/main/resources/mapper/OrderMapper.xml", "<mapper namespace=\"com.example.w.OrderMapper\">"
+                + after + "</mapper>");
+        return detectChanges(base, head);
+    }
+
+    private static CodeIndex readerOfOrders(Path root, String statement) throws IOException {
+        write(root, "pom.xml", "<project><modelVersion>4.0.0</modelVersion>"
                 + "<groupId>com.example</groupId><artifactId>reader</artifactId><version>1.0</version></project>");
-        write(reader, "src/main/resources/mapper/OrderReader.xml", "<mapper namespace=\"com.example.r.OrderReader\">"
-                + "<select id=\"loadOrder\">SELECT id FROM orders WHERE id = #{id}</select>"
-                + "</mapper>");
-        CodeIndex peer = index(reader);
+        write(root, "src/main/resources/mapper/OrderReader.xml", "<mapper namespace=\"com.example.r.OrderReader\">"
+                + "<select id=\"loadOrder\">" + statement + "</select></mapper>");
+        return index(root);
+    }
 
-        String statementKey = own.symbols.values().stream()
-                .filter(x -> "SQL_STATEMENT".equals(x.type))
-                .map(x -> x.key)
-                .findFirst()
-                .orElseThrow();
-        ChangeRecord cr = new ChangeRecord();
-        cr.id = 1;
-        cr.changeType = "SQL_CHANGED";
-        cr.symbolKey = statementKey;
-        cr.qualifiedName = "insertOrder";
-        cr.semanticSummary = "SQL statement changed";
-
+    private static PeerImpact analyzeAgainst(Change change, CodeIndex peer) {
         PeerImpact info = new PeerImpact();
         info.peerSourceName = "reader";
-        PeerImpact result = new PeerImpactEngine(PROPS).analyze(List.of(cr), own, peer, info);
+        return new PeerImpactEngine(PROPS).analyze(change.records, change.head, peer, info);
+    }
+
+    /**
+     * The headline rule: selecting one more column is this program's own business. The other
+     * program reads the same table, but nothing it can observe has changed.
+     */
+    @Test
+    void readingOneMoreColumnDoesNotReachTheProgramUsingTheSameTable(@TempDir Path tmp) throws IOException {
+        Change change = mapperChange(tmp,
+                "<select id=\"loadOrder\">SELECT id, status FROM orders WHERE id = #{id}</select>",
+                "<select id=\"loadOrder\">SELECT id, status, remark FROM orders WHERE id = #{id}</select>");
+        assertTrue(change.records.stream().anyMatch(c -> ChangeDetector.SQL_CHANGED.equals(c.changeType)),
+                "the statement itself did change");
+
+        CodeIndex peer = readerOfOrders(tmp.resolve("r"), "SELECT id, status FROM orders WHERE id = #{id}");
+        PeerImpact result = analyzeAgainst(change, peer);
+
+        assertTrue(result.matches.isEmpty(),
+                "an extra selected column is invisible to the other program, so it must not match");
+        assertTrue(result.impacts.isEmpty());
+    }
+
+    /** The same edit on the write side does change what the other program reads. */
+    @Test
+    void writingOneMoreColumnReachesTheReaderOfThatColumnOnly(@TempDir Path tmp) throws IOException {
+        Change change = mapperChange(tmp,
+                "<insert id=\"insertOrder\">INSERT INTO orders (id, status) VALUES (#{id}, #{status})</insert>",
+                "<insert id=\"insertOrder\">INSERT INTO orders (id, status, remark) "
+                        + "VALUES (#{id}, #{status}, #{remark})</insert>");
+        CodeIndex peer = readerOfOrders(tmp.resolve("r"), "SELECT remark FROM orders WHERE id = #{id}");
+
+        PeerImpact result = analyzeAgainst(change, peer);
+
+        assertTrue(result.matches.stream().anyMatch(m -> "DB_COLUMN".equals(m.kind)
+                        && "orders.remark".equals(m.contract) && "reader".equals(m.usage)),
+                "the column this program started writing is the contract: " + describe(result));
+        assertFalse(result.impacts.isEmpty());
+    }
+
+    /**
+     * A program that writes its own value into that column is not affected by this program starting
+     * to write it too - only readers observe the change.
+     */
+    @Test
+    void writingOneMoreColumnDoesNotReachTheWriterOfThatColumn(@TempDir Path tmp) throws IOException {
+        Change change = mapperChange(tmp,
+                "<insert id=\"insertOrder\">INSERT INTO orders (id, status) VALUES (#{id}, #{status})</insert>",
+                "<insert id=\"insertOrder\">INSERT INTO orders (id, status, remark) "
+                        + "VALUES (#{id}, #{status}, #{remark})</insert>");
+
+        Path writerPeer = tmp.resolve("w2");
+        write(writerPeer, "pom.xml", "<project><modelVersion>4.0.0</modelVersion>"
+                + "<groupId>com.example</groupId><artifactId>other-writer</artifactId><version>1.0</version></project>");
+        write(writerPeer, "src/main/resources/mapper/OtherWriter.xml",
+                "<mapper namespace=\"com.example.o.OtherWriter\">"
+                        + "<update id=\"touchRemark\">UPDATE orders SET remark = #{remark} WHERE id = #{id}</update>"
+                        + "</mapper>");
+        PeerImpact result = analyzeAgainst(change, index(writerPeer));
+
+        assertTrue(result.matches.stream().noneMatch(m -> "writer".equals(m.usage)),
+                "two programs writing the same column do not conflict through this change: " + describe(result));
+    }
+
+    /** A dropped column breaks both sides, so the read side and the write side both match. */
+    @Test
+    void droppingAColumnReachesReadersAndWriters(@TempDir Path tmp) throws IOException {
+        Path base = tmp.resolve("base");
+        write(base, "pom.xml", WRITER_POM);
+        write(base, "src/main/resources/db/migration/V1__orders.sql",
+                "CREATE TABLE orders (id BIGINT PRIMARY KEY, status INT, remark VARCHAR(64));");
+        Path head = tmp.resolve("head");
+        write(head, "pom.xml", WRITER_POM);
+        write(head, "src/main/resources/db/migration/V1__orders.sql",
+                "CREATE TABLE orders (id BIGINT PRIMARY KEY, status INT, remark VARCHAR(64));\n"
+                        + "ALTER TABLE orders DROP COLUMN remark;");
+        Change change = detectChanges(base, head);
+
+        assertTrue(change.records.stream().anyMatch(c -> ChangeDetector.DDL_CHANGED.equals(c.changeType)
+                        && "orders.remark".equals(c.extra.get("table") + "." + c.extra.get("column"))),
+                "a DDL change in a .sql script must produce a schema change record: " + change.records);
+
+        CodeIndex reader = readerOfOrders(tmp.resolve("r"), "SELECT remark FROM orders WHERE id = #{id}");
+        PeerImpact readSide = analyzeAgainst(change, reader);
+        assertTrue(readSide.matches.stream().anyMatch(m -> "DB_COLUMN".equals(m.kind)
+                        && "orders.remark".equals(m.contract)),
+                "the program reading the dropped column is impacted: " + describe(readSide));
+
+        Path writerPeer = tmp.resolve("w2");
+        write(writerPeer, "pom.xml", "<project><modelVersion>4.0.0</modelVersion>"
+                + "<groupId>com.example</groupId><artifactId>other-writer</artifactId><version>1.0</version></project>");
+        write(writerPeer, "src/main/resources/mapper/OtherWriter.xml",
+                "<mapper namespace=\"com.example.o.OtherWriter\">"
+                        + "<update id=\"touchRemark\">UPDATE orders SET remark = #{remark} WHERE id = #{id}</update>"
+                        + "</mapper>");
+        PeerImpact writeSide = analyzeAgainst(change, index(writerPeer));
+        assertTrue(writeSide.matches.stream().anyMatch(m -> "DB_COLUMN".equals(m.kind)
+                        && "orders.remark".equals(m.contract) && "writer".equals(m.usage)),
+                "the program writing the dropped column is impacted too: " + describe(writeSide));
+    }
+
+    /** Dropping a whole table leaves no column to name, so the table itself becomes the contract. */
+    @Test
+    void droppingATableFallsBackToTheTableContract(@TempDir Path tmp) throws IOException {
+        Path base = tmp.resolve("base");
+        write(base, "pom.xml", WRITER_POM);
+        write(base, "src/main/resources/db/migration/V1__orders.sql", "CREATE TABLE orders (id BIGINT);");
+        Path head = tmp.resolve("head");
+        write(head, "pom.xml", WRITER_POM);
+        write(head, "src/main/resources/db/migration/V1__orders.sql",
+                "CREATE TABLE orders (id BIGINT);\nDROP TABLE orders;");
+        Change change = detectChanges(base, head);
+
+        CodeIndex peer = readerOfOrders(tmp.resolve("r"), "SELECT id FROM orders WHERE id = #{id}");
+        PeerImpact result = analyzeAgainst(change, peer);
 
         assertTrue(result.matches.stream().anyMatch(m -> "DB_TABLE".equals(m.kind) && "orders".equals(m.contract)),
-                "the shared table must be matched through the changed statement");
-        assertFalse(result.impacts.isEmpty(), "the program reading the table is impacted");
+                "a dropped table is matched as a table: " + describe(result));
+        assertFalse(result.impacts.isEmpty());
+    }
+
+    /** A JPA field mapped onto a column is a database contract even without a SQL statement. */
+    @Test
+    void removedEntityColumnMappingReachesTheProgramUsingThatColumn(@TempDir Path tmp) throws IOException {
+        String entityBefore = """
+                package com.example.w;
+
+                import jakarta.persistence.Column;
+                import jakarta.persistence.Entity;
+                import jakarta.persistence.Table;
+
+                @Entity
+                @Table(name = "orders")
+                public class Order {
+                    @Column(name = "id")
+                    private Long id;
+
+                    @Column(name = "remark")
+                    private String remark;
+                }
+                """;
+        String entityAfter = """
+                package com.example.w;
+
+                import jakarta.persistence.Column;
+                import jakarta.persistence.Entity;
+                import jakarta.persistence.Table;
+
+                @Entity
+                @Table(name = "orders")
+                public class Order {
+                    @Column(name = "id")
+                    private Long id;
+                }
+                """;
+        Path base = tmp.resolve("base");
+        write(base, "pom.xml", WRITER_POM);
+        write(base, "src/main/java/com/example/w/Order.java", entityBefore);
+        Path head = tmp.resolve("head");
+        write(head, "pom.xml", WRITER_POM);
+        write(head, "src/main/java/com/example/w/Order.java", entityAfter);
+        Change change = detectChanges(base, head);
+
+        assertTrue(change.records.stream().anyMatch(c -> ChangeDetector.FIELD_REMOVED.equals(c.changeType)),
+                "removing the field must be detected: " + change.records);
+
+        CodeIndex peer = readerOfOrders(tmp.resolve("r"), "SELECT remark FROM orders WHERE id = #{id}");
+        PeerImpact result = analyzeAgainst(change, peer);
+
+        assertTrue(result.matches.stream().anyMatch(m -> "DB_COLUMN".equals(m.kind)
+                        && "orders.remark".equals(m.contract)),
+                "the dropped column mapping is a database contract: " + describe(result));
+    }
+
+    /**
+     * A peer statement that touches the table but names no column cannot be judged either way. It
+     * must be counted, because an empty match list would otherwise read as "nothing to check".
+     */
+    @Test
+    void peerSelectStarIsCountedAsAColumnBlindSpot(@TempDir Path tmp) throws IOException {
+        Change change = mapperChange(tmp,
+                "<insert id=\"insertOrder\">INSERT INTO orders (id) VALUES (#{id})</insert>",
+                "<insert id=\"insertOrder\">INSERT INTO orders (id, remark) VALUES (#{id}, #{remark})</insert>");
+        CodeIndex peer = readerOfOrders(tmp.resolve("r"), "SELECT * FROM orders WHERE id = #{id}");
+
+        PeerImpact result = analyzeAgainst(change, peer);
+
+        assertTrue(result.matches.isEmpty(), "SELECT * names no column, so it cannot match one");
+        assertEquals(1, result.unparsedColumnStatements,
+                "the blind spot must still be counted, not silently dropped");
+        assertFalse(result.unparsedColumnFiles.isEmpty(), "and it must be locatable");
+    }
+
+    /**
+     * A write that names no column ({@code insert into orders values (...)}) has no column to be the
+     * contract, so it stays table-scoped - and only for the table it started writing.
+     */
+    /**
+     * A statement that starts writing a table without naming any column has no column to be the
+     * contract, so the table itself is what the other side sees change.
+     */
+    @Test
+    void columnLessWriteFallsBackToTheTableContract(@TempDir Path tmp) throws IOException {
+        Change change = mapperChange(tmp,
+                "<select id=\"countOrders\">SELECT count(*) FROM orders</select>",
+                "<select id=\"countOrders\">SELECT count(*) FROM orders</select>"
+                        + "<insert id=\"insertOrder\">INSERT INTO order_archive VALUES (#{id})</insert>");
+        CodeIndex peer = readerOfOrders(tmp.resolve("r"), "SELECT id FROM order_archive WHERE id = #{id}");
+
+        PeerImpact result = analyzeAgainst(change, peer);
+
+        assertTrue(result.matches.stream().anyMatch(m -> "DB_TABLE".equals(m.kind)
+                        && "order_archive".equals(m.contract)),
+                "a write with no column list is matched at table level: " + describe(result));
+    }
+
+    /** An added column is a schema change too: code that maps the entity or selects it must be checked. */
+    @Test
+    void addingAColumnReachesTheProgramUsingThatColumn(@TempDir Path tmp) throws IOException {
+        Path base = tmp.resolve("base");
+        write(base, "pom.xml", WRITER_POM);
+        write(base, "src/main/resources/db/migration/V1__orders.sql", "CREATE TABLE orders (id BIGINT);");
+        Path head = tmp.resolve("head");
+        write(head, "pom.xml", WRITER_POM);
+        write(head, "src/main/resources/db/migration/V1__orders.sql",
+                "CREATE TABLE orders (id BIGINT);\nALTER TABLE orders ADD COLUMN remark VARCHAR(64);");
+        Change change = detectChanges(base, head);
+
+        CodeIndex peer = readerOfOrders(tmp.resolve("r"), "SELECT remark FROM orders WHERE id = #{id}");
+        PeerImpact result = analyzeAgainst(change, peer);
+
+        assertTrue(result.matches.stream().anyMatch(m -> "DB_COLUMN".equals(m.kind)
+                        && "orders.remark".equals(m.contract)),
+                "the added column is the contract: " + describe(result));
+    }
+
+    /**
+     * A column of a joined statement belongs to the table it is qualified with, not to every table
+     * of the statement - otherwise a change to {@code order_item.remark} would match readers of
+     * {@code orders}.
+     */
+    @Test
+    void joinedColumnsAreAttributedToTheirOwnTable(@TempDir Path tmp) throws IOException {
+        Change change = mapperChange(tmp,
+                "<insert id=\"insertOrder\">INSERT INTO orders (id, status) VALUES (#{id}, #{status})</insert>",
+                "<insert id=\"insertOrder\">INSERT INTO orders (id, status, remark) "
+                        + "VALUES (#{id}, #{status}, #{remark})</insert>");
+
+        Path peerDir = tmp.resolve("r");
+        write(peerDir, "pom.xml", "<project><modelVersion>4.0.0</modelVersion>"
+                + "<groupId>com.example</groupId><artifactId>joined</artifactId><version>1.0</version></project>");
+        write(peerDir, "src/main/resources/mapper/Joined.xml", "<mapper namespace=\"com.example.j.Joined\">"
+                + "<select id=\"load\">SELECT o.id, i.remark FROM orders o "
+                + "JOIN order_item i ON i.order_id = o.id</select></mapper>");
+        CodeIndex peer = index(peerDir);
+        // Attribution happens at index time: the qualifier decides the owning table.
+        assertTrue(peer.symbol("db:column:order_item.remark") != null,
+                "i.remark must be indexed as order_item.remark");
+        assertTrue(peer.symbol("db:column:orders.remark") == null,
+                "and must not be attributed to orders as well");
+        assertTrue(peer.symbol("db:column:orders.id") != null, "o.id still belongs to orders");
+
+        PeerImpact result = analyzeAgainst(change, peer);
+
+        assertTrue(result.matches.isEmpty(),
+                "the peer reads order_item.remark, which this change did not touch: " + describe(result));
+    }
+
+    private static String describe(PeerImpact impact) {
+        return impact.matches.stream().map(m -> m.kind + ":" + m.contract + ":" + m.usage).toList().toString();
     }
 
     /**

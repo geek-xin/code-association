@@ -83,9 +83,10 @@ class AnalysisProgressTest {
                 "src/main/java/com/example/StockService.java", List.of("PREPARE", "DIFF", "INDEX_HEAD"),
                 List.of("PEERS"));
 
-        // The trailing null is the UpdateService: this test only reads an analysis row, so the
-        // update endpoints are never touched.
-        ApiController controller = new ApiController(store, null, null, properties, null, null, null);
+        // The trailing nulls are the UpdateService and the two AI collaborators: this test only
+        // reads an analysis row, so those endpoints are never touched.
+        ApiController controller = new ApiController(store, null, null, properties, null, null, null,
+                null, null);
         Map<String, Object> row = controller.analysis(analysis.id, false).getBody();
         assertNotNull(row);
         assertEquals("INDEX_BASE", row.get("progressStage"));

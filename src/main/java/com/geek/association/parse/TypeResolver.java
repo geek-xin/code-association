@@ -21,9 +21,32 @@ public class TypeResolver {
     /** qualified type name -> directly known supertypes */
     private final Map<String, Set<String>> supertypes = new HashMap<>();
     private final Map<String, Set<String>> subtypes = new HashMap<>();
+    /**
+     * 「点后面的名字后缀 -> 类型」，只服务于 resolve 末尾那条兜底路径。
+     *
+     * 惰性构建：绝大多数名字在前面的分支就解析成功了，兜底很少走到；而 TypeResolver 实例
+     * 创建得相当频繁（ApiAnalyzer 每次类型链接都会 new 一个），不该让每个实例都为一条冷路径
+     * 先付一次全表遍历。
+     */
+    private Map<String, List<TypeInfo>> nestedSuffixes;
+    /**
+     * 继承体系索引是否已构建。
+     *
+     * resolve 完全不看继承关系，只有 supertypesOf / subtypesOf 用；而 TypeResolver 的实例创建得
+     * 很频繁（ApiAnalyzer 每链接一个类型就 new 一个）。原来构造函数无条件遍历全部类型建这两张表，
+     * 等于每次构造都白扫一遍类型表 —— 改成首次真正需要时再建。
+     */
+    private boolean hierarchyBuilt;
 
     public TypeResolver(CodeIndex index) {
         this.index = index;
+    }
+
+    private void ensureHierarchy() {
+        if (hierarchyBuilt) {
+            return;
+        }
+        hierarchyBuilt = true;
         buildHierarchy();
     }
 
@@ -94,30 +117,41 @@ public class TypeResolver {
         if (!lang.isEmpty()) {
             return lang;
         }
-        List<TypeInfo> nested = new ArrayList<>();
-        for (TypeInfo t : index.types.values()) {
-            if (t.qualifiedName.endsWith("." + name)) {
-                nested.add(t);
-            }
-        }
-        return nested;
+        // 原来这里对每个解析不到的名字都扫一遍全部类型做 endsWith；改成查一次惰性构建的后缀索引，
+        // 结果集和顺序都不变，但每次未解析从 O(类型数) 降到 O(1)。
+        return bySuffix(name);
     }
 
     public List<TypeInfo> byQualified(String qualified) {
+        // index.types 就是以 qualifiedName 为 key 建的（JavaIndexer 里 types.put(qualified, info)），
+        // 所以原来那个「get 未命中后再遍历全部类型比对 qualifiedName」的兜底循环永远不可能命中，
+        // 只是把每次未命中变成 O(类型数) 的纯浪费 —— 删掉。
         TypeInfo t = index.types.get(qualified);
-        if (t != null) {
-            return List.of(t);
-        }
-        List<TypeInfo> out = new ArrayList<>();
-        for (TypeInfo candidate : index.types.values()) {
-            if (candidate.qualifiedName.equals(qualified)) {
-                out.add(candidate);
+        return t != null ? List.of(t) : List.of();
+    }
+
+    /**
+     * 等价于「qualifiedName 以 "." + name 结尾」的全表过滤，只是把扫描换成一次建索引。
+     * 索引按 index.types 的迭代顺序追加，因此返回顺序与原实现完全一致。
+     * 返回的列表是共享的，调用方只能读不能改（现有调用方都只做遍历 / get(0) / addAll）。
+     */
+    private List<TypeInfo> bySuffix(String name) {
+        if (nestedSuffixes == null) {
+            Map<String, List<TypeInfo>> built = new HashMap<>();
+            for (TypeInfo t : index.types.values()) {
+                String qualified = t.qualifiedName;
+                for (int at = qualified.indexOf('.'); at >= 0; at = qualified.indexOf('.', at + 1)) {
+                    built.computeIfAbsent(qualified.substring(at + 1), k -> new ArrayList<>()).add(t);
+                }
             }
+            nestedSuffixes = built;
         }
-        return out;
+        List<TypeInfo> hit = nestedSuffixes.get(name);
+        return hit == null ? List.of() : hit;
     }
 
     public Set<String> supertypesOf(String qualified) {
+        ensureHierarchy();
         Set<String> out = new LinkedHashSet<>();
         Set<String> direct = supertypes.get(qualified);
         if (direct == null) {
@@ -132,6 +166,7 @@ public class TypeResolver {
     }
 
     public Set<String> subtypesOf(String qualified) {
+        ensureHierarchy();
         Set<String> out = new LinkedHashSet<>();
         Set<String> direct = subtypes.get(qualified);
         if (direct == null) {

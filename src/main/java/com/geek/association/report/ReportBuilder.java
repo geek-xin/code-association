@@ -40,6 +40,10 @@ public class ReportBuilder {
         report.headCommit = revisions.headCommit;
         report.baseLabel = revisions.base == null ? "" : revisions.base.label();
         report.headLabel = revisions.head == null ? "" : revisions.head.label();
+        report.commits = revisions.commits == null ? new ArrayList<>() : revisions.commits;
+        report.commitCount = report.commits.size();
+        report.rangeNote = revisions.rangeNote == null ? "" : revisions.rangeNote;
+        report.summary.commitCount = report.commitCount;
         report.generatedAt = java.time.Instant.now().toString();
         report.diffs = diffs;
         report.summary.parsedFiles = headIndex.parsedFiles;
@@ -195,7 +199,7 @@ public class ReportBuilder {
         report.peersNote = peers.isEmpty() ? "本次分析没有选择对比程序" : null;
 
         // Blind spots come from the peer indexes, never from this program's own unresolved calls.
-        report.blindSpots = new ArrayList<>();
+        report.blindSpots = columnBlindSpots(peers);
         report.skippedFiles = skippedFiles(revisions);
         peerNotes(report, headIndex, peers);
         return report;
@@ -228,6 +232,37 @@ public class ReportBuilder {
         return out;
     }
 
+    /**
+     * Peer statements that touch a changed table but name no column.
+     *
+     * They are blind spots, not clean results: {@code SELECT *} is judged by the runtime schema, so
+     * the analyser can neither match nor exclude it. Listing them next to the unresolved calls is
+     * what keeps "no impact found" from quietly meaning "no impact looked for".
+     */
+    private List<ImpactReport.BlindSpot> columnBlindSpots(
+            List<com.geek.association.model.PeerImpact> peers) {
+        List<ImpactReport.BlindSpot> out = new ArrayList<>();
+        for (com.geek.association.model.PeerImpact peer : peers) {
+            for (String location : peer.unparsedColumnFiles) {
+                int colon = location.lastIndexOf(':');
+                ImpactReport.BlindSpot b = new ImpactReport.BlindSpot();
+                b.module = peer.peerSourceName;
+                b.file = colon > 0 ? location.substring(0, colon) : location;
+                try {
+                    b.line = colon > 0 ? Integer.parseInt(location.substring(colon + 1)) : 0;
+                } catch (NumberFormatException e) {
+                    b.line = 0;
+                }
+                b.kind = "COLUMN_BLIND_SPOT";
+                b.expression = "字段盲区";
+                b.reason = "该语句碰到本次变更的表，但没有写明确切列名（SELECT * 或动态拼接），"
+                        + "无法参与字段级匹配，需人工确认";
+                out.add(b);
+            }
+        }
+        return out;
+    }
+
     private void peerNotes(ImpactReport report, CodeIndex ownHead,
                            List<com.geek.association.model.PeerImpact> peers) {
         Set<String> seen = new LinkedHashSet<>();
@@ -241,6 +276,13 @@ public class ReportBuilder {
             ImpactReport.addNote(report.notes, seen,
                     "本次有 " + report.skippedFiles.size() + " 个文件超过单文件读取上限，未被索引；"
                             + "名单见报告末尾，涉及这些文件的改动与影响需人工确认。");
+        }
+        int blindSpots = peers.stream().mapToInt(p -> p.unparsedColumnStatements).sum();
+        if (blindSpots > 0) {
+            ImpactReport.addNote(report.notes, seen,
+                    "对比程序里有 " + blindSpots + " 条 SQL 语句碰到本次变更的表，但没有写明确切列名"
+                            + "（SELECT * 或动态拼接），无法参与字段级匹配；"
+                            + "它们既不算命中也不算排除，请按「字段盲区」人工确认。");
         }
         int peerSkipped = peers.stream().mapToInt(p -> p.skippedFiles.size()).sum();
         if (peerSkipped > 0) {

@@ -30,6 +30,17 @@ java -jar code-association.jar analyze --location https://github.com/org/repo.gi
      --type GITHUB --pr 42 --peer /path/to/consumer --out report.json --fail-on HIGH
 ```
 
+```bash
+# 只评审一批提交（起始提交不含、结束提交含）
+java -jar code-association.jar analyze --location . --range origin/main..HEAD \
+     --peer /path/to/other-service --out report.json --fail-on HIGH
+```
+
+`--range` 与 `--base` + `--target` 等价，只是把两端写进一个参数：从评审工具或 CI 变量里
+直接粘 `$BASE..$HEAD` 是常见用法，手工拆开正是两端写反的地方。两端不是同一条提交线上的
+祖先关系时（例如两个并行分支），命令以退出码 2 失败并说明是哪一端不成立——不会产出一份
+看起来正常、实际在比较两个无关快照的报告。
+
 ## 退出码
 
 | 码 | 含义 |
@@ -47,8 +58,9 @@ java -jar code-association.jar analyze --location https://github.com/org/repo.gi
 | `--location` | 本地路径或 Git 地址（必填） |
 | `--peer` | 被扫描的其他程序，可重复（必填，至少一个） |
 | `--type` | `LOCAL_DIR` / `LOCAL_GIT` / `GITHUB` / `GITLAB` / `GIT`，省略时按地址推断 |
-| `--mode` | `GIT_DIFF`（默认）/ `WORKTREE_DIFF` / `PULL_REQUEST` |
+| `--mode` | `GIT_DIFF`（默认）/ `COMMIT_RANGE` / `WORKTREE_DIFF` / `PULL_REQUEST` |
 | `--base` `--target` | 基线 / 目标引用；`--base` 省略时取目标提交的父提交 |
+| `--range` | `<起始>..<结束>`，等价于 `--base` + `--target` 并切到 `COMMIT_RANGE` |
 | `--pr` | PR / MR 编号（自动切换为 `PULL_REQUEST`） |
 | `--token-env` | 存放访问令牌的环境变量名 |
 | `--out` `--format` | 输出文件与格式（`json` / `markdown`） |

@@ -47,10 +47,12 @@ import java.util.stream.Stream;
  *   <li><b>Checking never throws at the caller.</b> A failed GitHub request is a normal state of
  *       the world (offline, rate limited), so it is recorded in the status and shown in the UI
  *       instead of bubbling out of a GET handler;</li>
- *   <li><b>The process never restarts itself.</b> Applying copies the new jar over the running
- *       one and reports {@code restartRequired}; the restart belongs to start.sh/stop.sh. Killing
- *       the JVM from inside the request that asked for it would drop the HTTP response and leave
- *       the UI showing a failed update that actually succeeded;</li>
+ *   <li><b>The restart is handed off, never done inline.</b> Applying copies the new jar over the
+ *       running one and then asks {@link RestartSupervisor} to take over: a detached supervisor
+ *       waits for this JVM to exit, starts the new one, health-checks it and restores the backup
+ *       when it does not come up. Killing the JVM from inside the request that asked for it would
+ *       drop the HTTP response and leave the UI showing a failed update that actually succeeded,
+ *       which is why the exit is delayed and why the supervisor - not this class - owns it;</li>
  *   <li><b>Transient state stays in memory.</b> "Is there an update right now" depends on the
  *       running process and is re-derived on every view, so caching it in a table could only make
  *       it stale. The one thing worth persisting is the opposite kind of fact - which versions this
@@ -74,11 +76,22 @@ public class UpdateService {
     private static final String JAR_SUFFIX = ".jar";
     /** A failed check is retried after this delay, so a poll loop cannot hammer a dead endpoint. */
     private static final long FAILURE_RETRY_SECONDS = 60;
+    /** How often the streaming loop publishes its byte count; see {@link #fetchAssetOnce}. */
+    private static final long PROGRESS_INTERVAL_MILLIS = 100;
 
     private final AppProperties properties;
     private final VersionSource versionSource;
     private final HttpClient downloadClient;
     private final Version runningVersion;
+
+    /**
+     * Brings the process back after a jar swap. Never null: the no-op form is used when the
+     * service is constructed without one (tests), so every call site can stay unconditional.
+     */
+    private final RestartSupervisor restarts;
+
+    /** Serialises the read-modify-write of the runtime toggles in {@link #saveSettings}. */
+    private final Object settingsLock = new Object();
 
     /** What this installation has seen and done; never throws, so it cannot break a check. */
     private final UpdateHistory history;
@@ -94,6 +107,15 @@ public class UpdateService {
     private final Set<String> autoDownloadAttempted = ConcurrentHashMap.newKeySet();
 
     /**
+     * Versions this process already tried to apply unattended.
+     *
+     * Separate from {@link #autoDownloadAttempted} because the two can fail independently: a
+     * download that succeeded but an apply that threw would otherwise be retried on every check,
+     * which for an apply means a restart attempt per poll.
+     */
+    private final Set<String> autoApplyAttempted = ConcurrentHashMap.newKeySet();
+
+    /**
      * When this process started, in epoch millis.
      *
      * Reported to the UI so it can distinguish "the jar was replaced but you have not restarted
@@ -107,6 +129,16 @@ public class UpdateService {
     /** Guards against two downloads or two applies running at the same time. */
     private final AtomicBoolean working = new AtomicBoolean(false);
 
+    /**
+     * How far the current download/apply has got, for the UI to render as it happens.
+     *
+     * The automatic path runs on a daemon thread nobody is watching, and until this existed the
+     * only outward sign of a 40 MB background download was {@code busy: true} - no version, no
+     * byte count, and no trace at all when it failed, because those failures are logged rather
+     * than thrown. The object is memory-only and process-lifetime: see {@link UpdateProgress}.
+     */
+    private final UpdateProgress progress = new UpdateProgress();
+
     /** Serialises the read-modify-write of {@link #snapshot}; short, never held during I/O. */
     private final Object snapshotLock = new Object();
 
@@ -114,15 +146,18 @@ public class UpdateService {
     private volatile Pending pending;
 
     /**
-     * The production constructor. {@code @Autowired} is required because the class has a second
-     * constructor for tests; without it Spring looks for a no-arg constructor and fails to start.
+     * Check-only form: no restart supervisor, so applying a jar reports {@code restartRequired}
+     * and leaves the restart to the operator.
+     *
+     * Not annotated for injection: the container would then have two candidates and refuse to
+     * start. It exists for the tests, which is also why the client is built here rather than
+     * required from the caller.
      */
-    @Autowired
     public UpdateService(AppProperties properties, VersionSource versionSource) {
         this(properties, versionSource, HttpClient.newBuilder()
                 .connectTimeout(CONNECT_TIMEOUT)
                 .followRedirects(HttpClient.Redirect.NORMAL)
-                .build(), Version.running());
+                .build(), Version.running(), null);
     }
 
     /**
@@ -133,11 +168,30 @@ public class UpdateService {
      */
     public UpdateService(AppProperties properties, VersionSource versionSource, HttpClient downloadClient,
                          Version runningVersion) {
+        this(properties, versionSource, downloadClient, runningVersion, null);
+    }
+
+    /**
+     * The form the container uses: same as above plus the supervisor that owns the restart.
+     *
+     * The supervisor is passed in rather than built here so the port (which only the web layer
+     * knows) comes from the one place that can read it, and so a test can hand in a supervisor
+     * whose launcher and health probe are fakes.
+     */
+    @Autowired
+    public UpdateService(AppProperties properties, VersionSource versionSource, RestartSupervisor restarts) {
+        this(properties, versionSource, GitHubNetwork.client(properties.getUpdate()), Version.running(), restarts);
+    }
+
+    /** The full form: every collaborator is explicit, which is what makes the tests offline. */
+    public UpdateService(AppProperties properties, VersionSource versionSource, HttpClient downloadClient,
+                         Version runningVersion, RestartSupervisor restarts) {
         this.properties = properties;
         this.versionSource = versionSource;
         this.downloadClient = downloadClient;
         this.runningVersion = runningVersion;
         this.history = new UpdateHistory(properties);
+        this.restarts = restarts;
     }
 
     // ---------------------------------------------------------------- status
@@ -227,10 +281,17 @@ public class UpdateService {
         out.put("checkIntervalMinutes", update.getCheckIntervalMinutes());
         out.put("source", source);
         out.put("error", error);
+        // How this process was started, and whether that leaves a jar to overwrite. Both are
+        // reported rather than reduced to a boolean: "no jar" has three different causes with three
+        // different fixes, and the card has to be able to name the one that applies here.
+        LaunchMode launchMode = LaunchMode.of(jar, JarLocation.codeSourceLocation());
+        ApplySupport applySupport = ApplySupport.of(launchMode, isWindows());
         out.put("runningFromJar", jar != null);
-        // Without a jar to overwrite there is nothing to apply; saying so up front is friendlier
-        // than letting the user click a button that can only fail.
-        out.put("applySupported", jar != null && !isWindows());
+        out.put("launchMode", launchMode.wireName());
+        out.put("launchModeLabel", launchMode.label());
+        out.put("applySupported", applySupport.supported());
+        out.put("applyUnsupportedReason", applySupport.reason());
+        out.put("applyHint", applySupport.hint());
         out.put("busy", working.get());
         out.put("pending", pendingView());
         // Non-fatal source problems (e.g. the tags endpoint failed while releases worked). An
@@ -238,9 +299,127 @@ public class UpdateService {
         out.put("warnings", warnings());
         out.put("includeTags", update.isIncludeTags());
         out.put("autoDownload", update.isAutoDownload());
+        // The three automatic behaviours are reported separately from the release list because the
+        // settings card edits them in place, and it has to render their current values from the
+        // same payload it already fetches.
+        out.put("autoApply", update.isAutoApply());
+        out.put("autoRestart", update.isAutoRestart());
+        out.put("restartTimeoutSeconds", update.getRestartTimeoutSeconds());
+        // Whether a hot restart is even possible here, plus what the supervisor is doing right now.
+        // Null-safe on purpose: a deployment without a supervisor must still render the card.
+        out.put("restart", restarts == null ? unsupportedRestartView() : restarts.state());
+        out.put("network", networkView(update));
         out.put("historyTracked", history.size());
         out.put("releases", list);
+        // Before the payload leaves, reconcile a "restarting" pipeline with what the supervisor
+        // actually reported. The restart outlives the request that started it, so the phase can
+        // only be settled from the outside - and a progress block stuck on "正在重启" forever is
+        // exactly the "did it work?" ambiguity this whole block exists to remove.
+        settleProgressAfterRestart();
+        out.put("progress", progress.toMap());
         return out;
+    }
+
+    /**
+     * Turns a {@code restarting} pipeline into its outcome once the supervisor has one.
+     *
+     * Deliberately tolerant: an unrecognised phase, a missing supervisor or an older payload all
+     * leave the block untouched. The cost of being wrong here is a stale sentence, and the cost of
+     * being strict is a card that reports a failure for a restart that is merely slow.
+     */
+    private void settleProgressAfterRestart() {
+        if (!UpdateProgress.PHASE_RESTARTING.equals(progress.getPhase())) {
+            return;
+        }
+        Map<String, Object> restart = restarts == null ? null : restarts.state();
+        if (restart == null) {
+            return;
+        }
+        Object phase = restart.get("phase");
+        if (RestartStatus.PHASE_SUCCEEDED.equals(phase)) {
+            progress.succeeded("已更新到 " + progress.getVersion() + " 并完成重启");
+        } else if (RestartStatus.PHASE_ROLLED_BACK.equals(phase) || RestartStatus.PHASE_FAILED.equals(phase)) {
+            Object message = restart.get("message");
+            progress.failed("升级失败，已回滚到原版本",
+                    message == null ? null : message.toString());
+        }
+    }
+
+    /**
+     * The restart block for an installation that has no supervisor at all.
+     *
+     * Same keys as the real one rather than {@code null}: the settings card reads them
+     * unconditionally, and a missing object would force every caller to guard.
+     */
+    private static Map<String, Object> unsupportedRestartView() {
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("supported", false);
+        out.put("unsupportedReason", "当前启动方式没有启用热重启监督器");
+        out.put("running", false);
+        out.put("phase", "idle");
+        out.put("startedAt", null);
+        out.put("finishedAt", null);
+        out.put("attemptedVersion", null);
+        out.put("message", null);
+        out.put("rolledBack", false);
+        out.put("healthUrl", null);
+        out.put("logFile", null);
+        return out;
+    }
+
+    /**
+     * How the next check will try to reach GitHub.
+     *
+     * Every field answers a question an operator asks when a check fails - "which host", "is a
+     * mirror set", "is a proxy in play", "how many times does it retry", "when is the quota back" -
+     * and none of them can be answered from the release list itself.
+     */
+    private Map<String, Object> networkView(AppProperties.Update update) {
+        Map<String, Object> out = new LinkedHashMap<>();
+        List<String> bases = update.getApiBaseUrls() == null || update.getApiBaseUrls().isEmpty()
+                ? List.of("https://api.github.com") : List.copyOf(update.getApiBaseUrls());
+        out.put("apiBaseUrls", bases);
+        // Which host actually answered last. A fallback that works is worth showing: it explains
+        // why a check succeeds on a network where api.github.com is blocked.
+        out.put("activeApiBase", activeApiBase(bases));
+        out.put("downloadMirror", Texts.isBlank(update.getDownloadMirror())
+                ? "" : update.getDownloadMirror().strip());
+        out.put("proxyConfigured", !Texts.isBlank(update.getProxy()));
+        out.put("retries", Math.max(0, update.getRetries()));
+        out.put("respectRateLimit", update.isRespectRateLimit());
+        // The shared quota deadline, so the UI can say "wait until 14:05" instead of "try again".
+        Instant until = rateLimitGate() == null ? null : rateLimitGate().blockedUntil();
+        out.put("rateLimitedUntil", until == null ? null : until.toString());
+        // Which host failed last, when one did. Kept beside rateLimitedUntil so the card can show
+        // "api.github.com 限流，已改用 mirror" without re-parsing the error message.
+        out.put("lastFailureHost", versionSource instanceof GitHubVersionSource source
+                ? source.lastFailureHost() : null);
+        // Release assets come from a CDN that does not consume the API quota, so a rate-limited
+        // API never blocks a download. Said explicitly because the two are easy to conflate when
+        // the card shows a quota deadline right above a download button.
+        out.put("downloadBlocked", false);
+        return out;
+    }
+
+    private String activeApiBase(List<String> configured) {
+        if (versionSource instanceof GitHubVersionSource source) {
+            String active = source.activeApiBase();
+            if (!Texts.isBlank(active)) {
+                return active;
+            }
+        }
+        return configured.get(0);
+    }
+
+    /**
+     * The quota latch the source uses, when it is the GitHub one.
+     *
+     * Optional rather than required: a {@link VersionSource} is an interface precisely so a test
+     * (or a future source) can exist without a GitHub quota, and asking a non-GitHub source for one
+     * would be a downcast in disguise.
+     */
+    private RateLimitGate rateLimitGate() {
+        return versionSource instanceof GitHubVersionSource source ? source.rateLimitGate() : null;
     }
 
     private Map<String, Object> pendingView() {
@@ -335,6 +514,17 @@ public class UpdateService {
      * UI waiting for a download that will never appear.
      */
     public Map<String, Object> download(String versionText) {
+        return download(versionText, false);
+    }
+
+    /**
+     * The same download, tagged with who asked for it.
+     *
+     * {@code automatic} only changes how the progress block reads ("后台自动更新" versus a button
+     * press); the work is identical, and keeping one implementation is what stops the two paths
+     * from drifting into different failure behaviour.
+     */
+    Map<String, Object> download(String versionText, boolean automatic) {
         AppProperties.Update update = properties.getUpdate();
         if (!update.isEnabled()) {
             throw new IllegalArgumentException("自动更新已禁用，无法下载");
@@ -343,6 +533,8 @@ public class UpdateService {
         if (!working.compareAndSet(false, true)) {
             throw new IllegalArgumentException("已有下载或应用正在进行中，请稍后重试");
         }
+        progress.start(UpdateProgress.PHASE_DOWNLOADING, target.toString(), automatic, 0,
+                automatic ? "后台正在下载新版本" : "正在下载");
         try {
             ReleaseInfo release = releaseOf(target);
             ReleaseInfo.Asset asset = jarAsset(release);
@@ -350,6 +542,7 @@ public class UpdateService {
             Path file = directory.resolve("code-association-" + target + ".jar");
             Path part = directory.resolve(file.getFileName() + ".part");
             DownloadResult result = fetchAsset(asset, part, target);
+            progress.moveTo(UpdateProgress.PHASE_VERIFYING, "校验文件");
             // Move only after the header check, so a bad file never appears under the real name.
             Files.move(part, file, StandardCopyOption.REPLACE_EXISTING);
             Instant downloadedAt = Instant.now();
@@ -364,6 +557,8 @@ public class UpdateService {
             history.markDownloaded(downloaded.version, downloadedAt);
             log.info("downloaded {} to {} ({} bytes, sha256={})",
                     target, file, result.bytes, result.sha256);
+            progress.downloaded(result.bytes, result.bytes);
+            progress.succeeded("已下载 " + downloaded.version);
 
             Map<String, Object> out = new LinkedHashMap<>();
             out.put("downloaded", true);
@@ -373,17 +568,74 @@ public class UpdateService {
             out.put("verified", true);
             return out;
         } catch (IOException e) {
-            throw new IllegalArgumentException("下载失败：" + describe(e), e);
+            progress.failed("下载失败", describeDownload(e));
+            throw new IllegalArgumentException("下载失败：" + describeDownload(e), e);
+        } catch (RuntimeException e) {
+            // Covers the header check, a rejected URL and the retry budget running out. Those
+            // messages are already sentences, so they are shown as the reason - with the leading
+            // "下载失败：" stripped, because the card already prints that as the title and
+            // "下载失败 / 下载失败：连接被拒绝" reads like two different problems.
+            progress.failed("下载失败", stripPrefix(e.getMessage(), "下载失败："));
+            throw e;
         } finally {
             working.set(false);
         }
     }
 
+    /**
+     * Streams the asset to {@code part}, retrying a transfer that failed for a network reason.
+     *
+     * A 40 MB download over a blocked or throttled link fails part-way often enough that a single
+     * attempt would make the feature look broken; a rejected URL, on the other hand, fails the same
+     * way every time, so only transport errors, 5xx and a short read are retried. The partial file
+     * is deleted before each attempt: resuming would need range requests, and a stale {@code .part}
+     * appended to would produce a corrupt jar that passes the header check.
+     */
     private DownloadResult fetchAsset(ReleaseInfo.Asset asset, Path part, Version target) throws IOException {
         if (Texts.isBlank(asset.downloadUrl)) {
             throw new IllegalArgumentException("版本 " + target + " 的附件没有下载地址");
         }
-        HttpRequest request = HttpRequest.newBuilder(URI.create(asset.downloadUrl))
+        AppProperties.Update update = properties.getUpdate();
+        int attempts = Math.max(1, 1 + Math.max(0, update.getRetries()));
+        RuntimeException last = null;
+        for (int attempt = 1; attempt <= attempts; attempt++) {
+            try {
+                return fetchAssetOnce(asset, part, target);
+            } catch (IOException e) {
+                // Covers both a broken stream and the explicit {@link IncompleteTransfer}: a short
+                // read is "the transfer broke", never "the file is bad".
+                Files.deleteIfExists(part);
+                // describeDownload, not describe: this message is what the card shows when the
+                // retry budget runs out, and "ConnectException" is not a sentence for a human.
+                last = new IllegalArgumentException("下载失败：" + describeDownload(e), e);
+                if (attempt >= attempts) {
+                    break;
+                }
+                log.debug("retrying download of {} (attempt {}/{}): {}", target, attempt, attempts, e.toString());
+                if (!pause(attempt, update)) {
+                    break;
+                }
+            } catch (AssetRejected e) {
+                // A 4xx is the server refusing this URL; another attempt would be refused too.
+                Files.deleteIfExists(part);
+                throw new IllegalArgumentException(e.getMessage(), e);
+            }
+        }
+        throw last == null ? new IllegalArgumentException("下载失败") : last;
+    }
+
+    /**
+     * One transfer attempt.
+     *
+     * The two checked failure modes are carried as dedicated exceptions so {@link #fetchAsset} can
+     * tell "the network broke, try again" from "the server said no, stop" without parsing messages.
+     */
+    private DownloadResult fetchAssetOnce(ReleaseInfo.Asset asset, Path part, Version target) throws IOException {
+        // The asset lives on a CDN that some networks block while the API host itself is
+        // reachable, so the mirror is applied here rather than at the call site: every download
+        // path - button, auto-download, retry - has to go through the same rewrite.
+        String url = GitHubNetwork.mirrorDownloadUrl(asset.downloadUrl, properties.getUpdate().getDownloadMirror());
+        HttpRequest request = HttpRequest.newBuilder(URI.create(url))
                 .timeout(DOWNLOAD_TIMEOUT)
                 .header("User-Agent", "code-association/" + runningVersion)
                 .header("Accept", "application/octet-stream")
@@ -393,17 +645,28 @@ public class UpdateService {
         try {
             response = downloadClient.send(request, HttpResponse.BodyHandlers.ofInputStream());
         } catch (HttpTimeoutException e) {
-            throw new IllegalArgumentException("下载超时，请检查网络后重试", e);
+            throw new IOException("下载超时", e);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new IllegalArgumentException("下载被中断", e);
         }
         try (InputStream body = response.body()) {
-            if (response.statusCode() >= 300) {
-                throw new IllegalArgumentException("下载失败：GitHub 返回 HTTP " + response.statusCode());
+            int status = response.statusCode();
+            if (status >= 300) {
+                if (GitHubNetwork.isRetryableStatus(status)) {
+                    throw new IOException("GitHub 返回 HTTP " + status);
+                }
+                throw new AssetRejected("下载失败：GitHub 返回 HTTP " + status
+                        + (status == 404 ? "（该版本的附件可能已被删除）" : ""));
             }
             MessageDigest digest = sha256();
+            // The release asset records its own size; Content-Length is the fallback for a source
+            // that does not, and a mirror may rewrite either. Whichever is larger wins, because
+            // under-reporting the total would make the bar read over 100% at the end.
+            long total = Math.max(asset.size, contentLength(response));
+            progress.attemptStarted(total, progress.getMessage());
             long bytes = 0;
+            long reportedAt = 0;
             try (DigestInputStream in = new DigestInputStream(body, digest);
                  OutputStream out = Files.newOutputStream(part)) {
                 byte[] buffer = new byte[BUFFER_SIZE];
@@ -411,17 +674,65 @@ public class UpdateService {
                 while ((read = in.read(buffer)) >= 0) {
                     out.write(buffer, 0, read);
                     bytes += read;
+                    // Publishing every buffer would be ~600 volatile writes per 40 MB; a 100 ms
+                    // cadence is smoother than the UI can render and keeps the loop cheap.
+                    long now = System.currentTimeMillis();
+                    if (now - reportedAt >= PROGRESS_INTERVAL_MILLIS) {
+                        reportedAt = now;
+                        progress.downloaded(bytes, total);
+                    }
                 }
             }
+            progress.downloaded(bytes, total);
             if (asset.size > 0 && bytes != asset.size) {
-                Files.deleteIfExists(part);
-                throw new IllegalArgumentException("下载不完整：期望 " + asset.size + " 字节，实际 " + bytes + " 字节");
+                // A truncated transfer is the single most common failure on a throttled link, and
+                // it is retryable: the bytes that arrived are simply discarded.
+                throw new IncompleteTransfer("下载不完整：期望 " + asset.size + " 字节，实际 " + bytes + " 字节");
             }
             verifyJar(part);
             DownloadResult result = new DownloadResult();
             result.bytes = bytes;
             result.sha256 = HexFormat.of().formatHex(digest.digest());
             return result;
+        }
+    }
+
+    /**
+     * {@code Content-Length} of the response, or 0 when the header is absent or unusable.
+     *
+     * Only ever used as a fallback for a progress bar: a wrong value here must never fail the
+     * download, which is why a malformed header degrades to "size unknown" instead of throwing.
+     */
+    private static long contentLength(HttpResponse<?> response) {
+        return response.headers().firstValueAsLong("Content-Length").orElse(0L);
+    }
+
+    /** Waits out the backoff; returns false when the thread was interrupted and the retry must stop. */
+    private static boolean pause(int attempt, AppProperties.Update update) {
+        long delay = GitHubNetwork.backoffMillis(attempt, update.getRetryBaseDelayMs());
+        if (delay <= 0) {
+            return true;
+        }
+        try {
+            Thread.sleep(delay);
+            return true;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
+    }
+
+    /** A transfer that broke part-way and is worth another attempt. */
+    private static final class IncompleteTransfer extends IOException {
+        IncompleteTransfer(String message) {
+            super(message);
+        }
+    }
+
+    /** The server refused this URL; retrying cannot change the answer. */
+    private static final class AssetRejected extends RuntimeException {
+        AssetRejected(String message) {
+            super(message);
         }
     }
 
@@ -613,7 +924,10 @@ public class UpdateService {
      * next download attempt, which does report it.
      */
     private void autoDownload(Snapshot fresh) {
-        if (!properties.getUpdate().isAutoDownload() || fresh.releases.isEmpty()) {
+        AppProperties.Update update = properties.getUpdate();
+        // autoApply implies the download: asking for "install it by yourself" without fetching the
+        // jar would make the setting do nothing at all.
+        if (!(update.isAutoDownload() || update.isAutoApply()) || fresh.releases.isEmpty()) {
             return;
         }
         ReleaseInfo newest = null;
@@ -637,8 +951,10 @@ public class UpdateService {
             return;
         }
         String target = newestVersion.toString();
-        // Already on disk (perhaps downloaded before this process started): nothing to fetch.
+        // Already on disk (perhaps downloaded before this process started): nothing to fetch, but
+        // an unattended installation still has to finish the job with the file that is there.
         if (localJars().containsKey(target)) {
+            autoApply(target);
             return;
         }
         if (!autoDownloadAttempted.add(target)) {
@@ -652,14 +968,66 @@ public class UpdateService {
                 return;
             }
             try {
-                download(target);
+                // Marked automatic so the progress block can say this was not the user's doing:
+                // an unexplained 40 MB download appearing out of nowhere is the same class of
+                // problem as one that is invisible.
+                download(target, true);
+                // The download only stages the jar; an unattended installation asked for the whole
+                // sequence, so the apply follows in the same background thread.
+                autoApply(target);
             } catch (RuntimeException e) {
                 // Including the lost race for the flag: whoever holds it is already doing the work.
+                // The reason also lands in the progress block, which is the only place a user can
+                // see it: this thread has no caller to return an error to. The leading label is
+                // stripped because the card prints its own title above this line, and
+                // "后台自动更新失败：下载失败：连接被拒绝" reads as three separate problems.
+                progress.failed("后台自动更新失败", stripPrefix(e.getMessage(), "下载失败："));
                 log.warn("auto-download of {} failed: {}", target, e.getMessage());
             }
         }, "update-auto-download-" + target);
         thread.setDaemon(true);
         thread.start();
+    }
+
+    /**
+     * Applies a downloaded jar without being asked, when the operator turned that on.
+     *
+     * Three guards, each of which is a way this could destroy an installation:
+     *
+     * <ul>
+     *   <li><b>Never when a jar swap is impossible.</b> An IDE run or Windows has no replaceable
+     *       jar, and {@code apply()} would throw into a background thread nobody reads;</li>
+     *   <li><b>Never without a way back.</b> A hot restart without a supervisor is a service that
+     *       stays down until somebody notices, so auto-apply requires both {@code autoRestart}
+     *       and a supported supervisor - the same condition under which the UI stops telling the
+     *       operator to restart by hand;</li>
+     *   <li><b>One version per process.</b> Re-applying the version already running is a no-op that
+     *       still costs a restart, and a loop of them would be an installation that never settles.</li>
+     * </ul>
+     *
+     * Failures are logged, not thrown: this runs on a background thread whose only caller is the
+     * scheduler, and the reason reaches the UI through the status payload on the next poll.
+     */
+    private void autoApply(String version) {
+        AppProperties.Update update = properties.getUpdate();
+        if (!update.isAutoApply() || !update.isAutoRestart()) {
+            return;
+        }
+        if (restarts == null || !restarts.isSupported()) {
+            log.debug("not auto-applying {}: no supported restart supervisor", version);
+            return;
+        }
+        if (!autoApplyAttempted.add(version)) {
+            return;
+        }
+        try {
+            Map<String, Object> result = apply(true);
+            log.info("auto-applied {}: {}", version, result.get("restarting"));
+        } catch (RuntimeException e) {
+            // apply() already recorded the reason on the progress block; repeating it here would
+            // only overwrite "应用更新失败" with a less specific wording.
+            log.warn("auto-apply of {} failed: {}", version, e.getMessage());
+        }
     }
 
     // ----------------------------------------------------------------- apply
@@ -670,13 +1038,26 @@ public class UpdateService {
      * The restart is intentionally left to the operator's script: see the class comment.
      */
     public Map<String, Object> apply() {
+        return apply(false);
+    }
+
+    /**
+     * The same swap, tagged with who asked for it.
+     *
+     * The flag only reaches the progress block, but it has to be carried through: an unattended
+     * install runs download and apply on one background thread, and without this the second half
+     * would report itself as a button press the user never made.
+     */
+    Map<String, Object> apply(boolean automatic) {
         Pending target = pending;
         if (target == null) {
             throw new IllegalArgumentException("还没有下载好的新版本，请先下载");
         }
         Path jar = runningJar();
         if (jar == null) {
-            throw new IllegalArgumentException("当前不是以 java -jar 方式运行，无法自动替换，请手动更新");
+            // The same sentence the card shows before the button is pressed, so a caller that
+            // ignores applySupported and posts anyway gets the actionable version, not a dead end.
+            throw new IllegalArgumentException(ApplySupport.detect().reason());
         }
         if (isWindows()) {
             // Windows holds an exclusive lock on a running executable; the copy would fail with a
@@ -686,6 +1067,8 @@ public class UpdateService {
         if (!working.compareAndSet(false, true)) {
             throw new IllegalArgumentException("已有下载或应用正在进行中，请稍后重试");
         }
+        progress.start(UpdateProgress.PHASE_APPLYING, target.version, automatic, 0,
+                automatic ? "后台正在替换 jar" : "正在替换 jar");
         try {
             Path downloaded = Path.of(target.jarPath);
             if (!Files.isRegularFile(downloaded)) {
@@ -698,6 +1081,7 @@ public class UpdateService {
                 // Without a backup there is no way back, so stop before touching the live jar.
                 throw new IllegalArgumentException("备份当前 jar 失败，已中止更新：" + describe(e), e);
             }
+            progress.moveTo(UpdateProgress.PHASE_APPLYING, "正在写入新 jar");
             try {
                 Files.copy(downloaded, jar, StandardCopyOption.REPLACE_EXISTING);
             } catch (IOException e) {
@@ -708,17 +1092,43 @@ public class UpdateService {
             history.markApplied(target.version, Instant.now());
             log.info("applied {} over {} (backup {})", target.version, jar, backup);
 
+            // The jar is on disk and the swap succeeded; the restart is the remaining half of the
+            // update. Handing it to the supervisor after the copy means a failed copy can never
+            // leave a restart running against a jar that was never replaced.
+            boolean restarting = false;
+            if (properties.getUpdate().isAutoRestart() && restarts != null && restarts.isSupported()) {
+                restarting = restarts.scheduleRestart(target.version);
+                if (restarting) {
+                    log.info("scheduled a supervised restart into {}", target.version);
+                }
+            }
+            if (restarting) {
+                progress.moveTo(UpdateProgress.PHASE_RESTARTING, "已替换 jar，等待服务重启");
+            } else {
+                // Nobody is going to bring the process back, so the pipeline ends here: the file is
+                // in place and the next step is a human one. Calling this "succeeded" without the
+                // restart would be the same lie the old restart banner was fixed for.
+                progress.succeeded("jar 已替换，需要手动重启服务");
+            }
+
             Map<String, Object> out = new LinkedHashMap<>();
             out.put("applied", true);
             out.put("version", target.version);
             out.put("backupPath", backup.toAbsolutePath().toString());
             out.put("jarPath", jar.toAbsolutePath().toString());
-            out.put("restartRequired", true);
+            // True only when nobody is going to bring the process back for the operator: the UI
+            // uses it to choose between "wait a moment, it is restarting" and the manual commands.
+            out.put("restartRequired", !restarting);
+            out.put("restarting", restarting);
+            out.put("restart", restarts == null ? unsupportedRestartView() : restarts.state());
             // Epoch millis, not an ISO string: the client compares it against status().startedAt
             // to decide whether the restart already happened, and two clocks formatted differently
             // (fractional digits, time zones) must not decide that.
             out.put("swappedAt", System.currentTimeMillis());
             return out;
+        } catch (RuntimeException e) {
+            progress.failed("应用更新失败", e.getMessage());
+            throw e;
         } finally {
             working.set(false);
         }
@@ -760,11 +1170,20 @@ public class UpdateService {
             String restored = backupVersion(jar, backup);
             history.markRolledBack(restored, Instant.now());
             log.info("rolled {} back from {}", jar, backup);
+            // A rollback has the same problem an apply has: the file on disk is old news to the
+            // running JVM. The supervisor is reused rather than reimplemented, because "start the
+            // jar again and check that it comes up" is the same job in both directions.
+            boolean restarting = false;
+            if (properties.getUpdate().isAutoRestart() && restarts != null && restarts.isSupported()) {
+                restarting = restarts.scheduleRestart(restored);
+            }
             Map<String, Object> out = new LinkedHashMap<>();
             out.put("rolledBack", true);
             out.put("version", restored);
             out.put("jarPath", jar.toAbsolutePath().toString());
-            out.put("restartRequired", true);
+            out.put("restartRequired", !restarting);
+            out.put("restarting", restarting);
+            out.put("restart", restarts == null ? unsupportedRestartView() : restarts.state());
             out.put("swappedAt", System.currentTimeMillis());
             return out;
         } finally {
@@ -832,10 +1251,14 @@ public class UpdateService {
      * A freshly started instance has no cache and the UI would otherwise show "never checked"
      * until the first cron boundary. It runs on a daemon thread so a slow or unreachable GitHub
      * never delays the web server becoming ready.
+     *
+     * Off means off: an air-gapped host sets {@code check-on-startup: false} to keep the log free
+     * of a failure it already knows about, and a setting that is documented but never read is
+     * worse than no setting at all - the operator would believe it and stop looking.
      */
     @EventListener(ApplicationReadyEvent.class)
     public void onStartup() {
-        if (!properties.getUpdate().isEnabled()) {
+        if (!properties.getUpdate().isEnabled() || !properties.getUpdate().isCheckOnStartup()) {
             return;
         }
         Snapshot current = snapshot;
@@ -894,6 +1317,40 @@ public class UpdateService {
         return message == null || message.isBlank() ? e.getClass().getSimpleName() : message;
     }
 
+    /** Removes a leading label from a message, so a card title and its body do not repeat it. */
+    private static String stripPrefix(String text, String prefix) {
+        if (text == null) {
+            return null;
+        }
+        return text.startsWith(prefix) ? text.substring(prefix.length()) : text;
+    }
+
+    /**
+     * A network failure in words an operator can act on.
+     *
+     * {@code describe} is right for a log line - "ConnectException" is enough to grep for - but it
+     * ends up in the card as "下载失败：ConnectException", which names a Java class instead of the
+     * situation. The three cases below are the ones a blocked network actually produces, and each
+     * has a different next step, so they are worth telling apart.
+     */
+    private static String describeDownload(IOException e) {
+        String raw = describe(e);
+        if (e instanceof java.net.ConnectException || raw.contains("ConnectException")
+                || raw.contains("Connection refused")) {
+            return "无法连接下载地址（连接被拒绝或网络不可达）。若 GitHub 附件被网络阻断，可配置 download-mirror 后重试";
+        }
+        if (e instanceof java.net.UnknownHostException || raw.contains("UnknownHost")) {
+            return "无法解析下载地址的域名，请检查 DNS 或代理设置";
+        }
+        if (e instanceof HttpTimeoutException || raw.contains("超时") || raw.contains("timed out")) {
+            return "下载超时，网络可能不稳定，可以重试或改用下载镜像";
+        }
+        if (e instanceof IncompleteTransfer) {
+            return raw;
+        }
+        return raw;
+    }
+
     public boolean isEnabled() {
         return properties.getUpdate().isEnabled();
     }
@@ -908,6 +1365,17 @@ public class UpdateService {
      */
     public Map<String, Object> history() {
         return history.snapshot();
+    }
+
+    /**
+     * Just the restart block, for the poll that runs while the service is coming back.
+     *
+     * Separate from {@link #status()} because that call reads the release cache and the downloads
+     * directory; while a restart is in flight the browser needs one small answer, every few
+     * seconds, and it must not pay for the rest.
+     */
+    public Map<String, Object> restartState() {
+        return restarts == null ? unsupportedRestartView() : restarts.state();
     }
 
     /**
@@ -928,6 +1396,85 @@ public class UpdateService {
 
     public boolean isBusy() {
         return working.get();
+    }
+
+    /**
+     * The live pipeline state on its own, for the light poll the card runs while a download or a
+     * restart is in flight. Same block as {@code status().progress}; the endpoint exists so a
+     * two-second poll does not re-list the downloads directory and re-derive every release flag.
+     */
+    public Map<String, Object> progressState() {
+        // Same reconciliation as the full payload: this is the endpoint the card polls while a
+        // pipeline is active, and a "restarting" phase it never settles would be polled forever.
+        settleProgressAfterRestart();
+        return progress.toMap();
+    }
+
+    /**
+     * Changes the automatic behaviours at runtime, without a restart.
+     *
+     * These are process-lifetime toggles rather than persisted configuration on purpose: they
+     * describe how <i>this</i> instance behaves from now on, and the next start reads
+     * application.yml again. Persisting them would create a second source of truth that silently
+     * disagrees with the file the operator deployed.
+     *
+     * Unknown keys are ignored and absent keys are left alone, so the UI can send only the switch
+     * that moved. A {@code null} body is a no-op rather than an error: the card may call this with
+     * nothing when a toggle is reset.
+     */
+    public Map<String, Object> saveSettings(Map<String, Object> body) {
+        AppProperties.Update update = properties.getUpdate();
+        if (body != null) {
+            synchronized (settingsLock) {
+                if (body.containsKey("autoDownload")) {
+                    update.setAutoDownload(flag(body.get("autoDownload"), update.isAutoDownload()));
+                }
+                if (body.containsKey("autoApply")) {
+                    update.setAutoApply(flag(body.get("autoApply"), update.isAutoApply()));
+                }
+                if (body.containsKey("autoRestart")) {
+                    update.setAutoRestart(flag(body.get("autoRestart"), update.isAutoRestart()));
+                }
+            }
+            // An unattended install needs both halves; turning on one without the other is a
+            // setting that reads as "on" and never does anything, so it is refused with a reason
+            // rather than accepted and silently ignored at apply time.
+            if (update.isAutoApply() && !update.isAutoRestart()) {
+                synchronized (settingsLock) {
+                    update.setAutoApply(false);
+                }
+                throw new IllegalArgumentException("自动应用需要同时开启自动重启，否则更新完不会有人把服务拉起来");
+            }
+        }
+        log.info("update settings: autoDownload={} autoApply={} autoRestart={}",
+                update.isAutoDownload(), update.isAutoApply(), update.isAutoRestart());
+        return status();
+    }
+
+    /**
+     * Reads a JSON boolean leniently.
+     *
+     * The body arrives as an untyped map, so a value can be a Boolean, the string "true" from a
+     * hand-written curl, or a number. Anything unrecognised keeps the current value instead of
+     * flipping a safety-relevant switch by accident.
+     */
+    private static boolean flag(Object value, boolean fallback) {
+        if (value instanceof Boolean bool) {
+            return bool;
+        }
+        if (value instanceof String text) {
+            String normalized = text.strip().toLowerCase(Locale.ROOT);
+            if ("true".equals(normalized) || "1".equals(normalized)) {
+                return true;
+            }
+            if ("false".equals(normalized) || "0".equals(normalized)) {
+                return false;
+            }
+        }
+        if (value instanceof Number number) {
+            return number.intValue() != 0;
+        }
+        return fallback;
     }
 
     /** Immutable snapshot of the last check; replaced as a whole so readers never see a mix. */

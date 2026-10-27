@@ -13,10 +13,15 @@ import org.eclipse.jgit.transport.UsernamePasswordCredentialsProvider;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.geek.association.model.CommitInfo;
+
 import java.io.File;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Instant;
+import java.time.ZoneOffset;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -160,6 +165,112 @@ public final class GitSupport {
             }
         }
         return null;
+    }
+
+    /**
+     * The most recent {@code limit} commits reachable from {@code head}, newest first.
+     *
+     * This is the list a reviewer picks a range from, so it must be bounded: a repository with
+     * 300k commits would otherwise be walked in full just to fill a dropdown.
+     */
+    public static List<CommitInfo> commits(Repository repo, ObjectId head, int limit) {
+        List<CommitInfo> out = new ArrayList<>();
+        if (head == null || limit <= 0) {
+            return out;
+        }
+        try (RevWalk walk = new RevWalk(repo)) {
+            walk.markStart(walk.parseCommit(head));
+            walk.sort(org.eclipse.jgit.revwalk.RevSort.TOPO);
+            walk.sort(org.eclipse.jgit.revwalk.RevSort.COMMIT_TIME_DESC, true);
+            for (RevCommit commit : walk) {
+                if (out.size() >= limit) {
+                    break;
+                }
+                out.add(toInfo(commit));
+            }
+        } catch (IOException | RuntimeException e) {
+            // A truncated or shallow clone can fail mid-walk; the commits collected so far are still
+            // true, and the caller shows the list rather than an error page.
+            log.debug("commit walk from {} stopped early: {}", head.name(), describe(e));
+        }
+        return out;
+    }
+
+    /**
+     * Commits reachable from {@code head} but not from {@code base}, newest first: exactly the set
+     * a "review this range" run covers.
+     *
+     * When {@code base} is null the whole reachable history is returned, which is the root-commit
+     * case (a first commit has no parent to exclude).
+     */
+    public static List<CommitInfo> commitsInRange(Repository repo, ObjectId base, ObjectId head, int limit) {
+        List<CommitInfo> out = new ArrayList<>();
+        if (head == null || limit <= 0) {
+            return out;
+        }
+        try (RevWalk walk = new RevWalk(repo)) {
+            RevCommit headCommit = walk.parseCommit(head);
+            walk.markStart(headCommit);
+            if (base != null && !base.equals(head)) {
+                walk.markUninteresting(walk.parseCommit(base));
+            }
+            walk.sort(org.eclipse.jgit.revwalk.RevSort.TOPO);
+            walk.sort(org.eclipse.jgit.revwalk.RevSort.COMMIT_TIME_DESC, true);
+            for (RevCommit commit : walk) {
+                if (out.size() >= limit) {
+                    break;
+                }
+                out.add(toInfo(commit));
+            }
+        } catch (IOException | RuntimeException e) {
+            log.debug("range walk {}..{} stopped early: {}",
+                    base == null ? "(root)" : base.name(), head.name(), describe(e));
+        }
+        return out;
+    }
+
+    /**
+     * Whether {@code ancestor} is reachable from {@code descendant}.
+     *
+     * A range whose base is not an ancestor of its head is not a range at all - it is two unrelated
+     * lines of history - and the resulting diff would silently include everything on both sides.
+     * The caller uses this to refuse such a run with a sentence instead of producing a report that
+     * looks legitimate but compares the wrong things.
+     */
+    public static boolean isAncestor(Repository repo, ObjectId ancestor, ObjectId descendant) {
+        if (ancestor == null || descendant == null) {
+            return false;
+        }
+        if (ancestor.equals(descendant)) {
+            return true;
+        }
+        try (RevWalk walk = new RevWalk(repo)) {
+            walk.setRevFilter(org.eclipse.jgit.revwalk.filter.RevFilter.MERGE_BASE);
+            walk.markStart(walk.parseCommit(descendant));
+            walk.markStart(walk.parseCommit(ancestor));
+            RevCommit base = walk.next();
+            return base != null && base.getId().equals(ancestor);
+        } catch (IOException | RuntimeException e) {
+            return false;
+        }
+    }
+
+    /** Projects one commit onto the DTO the API and the report serialise. */
+    public static CommitInfo toInfo(RevCommit commit) {
+        String subject = commit.getShortMessage();
+        if (subject != null) {
+            subject = subject.strip();
+        }
+        String author = commit.getAuthorIdent() == null ? "" : commit.getAuthorIdent().getName();
+        String date = DateTimeFormatter.ISO_INSTANT
+                .withZone(ZoneOffset.UTC)
+                .format(Instant.ofEpochSecond(commit.getCommitTime()));
+        List<String> parents = new ArrayList<>();
+        for (RevCommit parent : commit.getParents()) {
+            String id = parent.getId().name();
+            parents.add(id.length() > 8 ? id.substring(0, 8) : id);
+        }
+        return CommitInfo.of(commit.getId().name(), subject, author, date, parents);
     }
 
     public static String mergeBase(Repository repo, ObjectId a, ObjectId b) {

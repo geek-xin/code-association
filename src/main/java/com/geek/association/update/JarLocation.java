@@ -4,6 +4,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.net.URL;
@@ -11,6 +12,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.CodeSource;
 import java.util.Locale;
+import java.util.Properties;
 import java.util.jar.JarFile;
 
 /**
@@ -40,6 +42,18 @@ public final class JarLocation {
      * Null is the honest answer in an IDE or a test run, where there is no jar to replace.
      */
     public static Path currentJar() {
+        String location = codeSourceLocation();
+        return location == null ? null : jarOf(location);
+    }
+
+    /**
+     * The raw classloader location, or null when the class was loaded without one.
+     *
+     * Kept separate from {@link #currentJar()} because "there is no jar" and "there is no code
+     * source at all" are different answers: the first one is the normal development case and the
+     * second one is unusual enough that {@link LaunchMode} reports it as unknown.
+     */
+    public static String codeSourceLocation() {
         CodeSource source = JarLocation.class.getProtectionDomain().getCodeSource();
         if (source == null) {
             log.debug("no code source: the class was loaded without one");
@@ -51,7 +65,7 @@ public final class JarLocation {
             return null;
         }
         log.debug("class loaded from {}", location);
-        return jarOf(location.toString());
+        return location.toString();
     }
 
     /**
@@ -100,6 +114,63 @@ public final class JarLocation {
 
     private static String stripPrefix(String text, String prefix) {
         return text.startsWith(prefix) ? text.substring(prefix.length()) : text;
+    }
+
+    /**
+     * The directory a classloader location points at, or null when it is not a local directory.
+     *
+     * This is the development half of {@link #jarOf(String)}: {@code mvn spring-boot:run} and an
+     * IDE both report {@code file:/.../target/classes/}, which is a directory on disk and not a
+     * jar. Naming it explicitly is what lets the update card say "you are in development mode"
+     * instead of "not a jar, cause unknown".
+     */
+    public static Path directoryOf(String location) {
+        if (location == null || location.isBlank()) {
+            return null;
+        }
+        String text = location.strip();
+        if (text.startsWith("jar:") || text.contains("!")) {
+            // A nested archive location always names an archive, never a plain classes folder.
+            return null;
+        }
+        text = stripPrefix(text, "file:");
+        while (text.length() > 1 && text.endsWith("/")) {
+            text = text.substring(0, text.length() - 1);
+        }
+        Path path;
+        try {
+            path = text.contains("://") || text.startsWith("file:")
+                    ? Path.of(new URI(location.strip()))
+                    : Path.of(text);
+        } catch (URISyntaxException | IllegalArgumentException e) {
+            log.debug("could not turn {} into a directory", location, e);
+            return null;
+        }
+        return Files.isDirectory(path) ? path : null;
+    }
+
+    /**
+     * The version written by the Maven build, readable in development mode too.
+     *
+     * The jar manifest only exists once the project is packaged, so {@code mvn spring-boot:run}
+     * and an IDE run had no version at all and the settings page fell back to "0.0.0-dev". The
+     * {@code spring-boot-maven-plugin:build-info} goal writes the same version into
+     * {@code META-INF/build-info.properties} inside {@code target/classes}, which is exactly what
+     * those launch modes put on the classpath - so the same read works for every mode.
+     */
+    public static String buildInfoVersion() {
+        try (InputStream in = JarLocation.class.getResourceAsStream("/META-INF/build-info.properties")) {
+            if (in == null) {
+                return null;
+            }
+            Properties properties = new Properties();
+            properties.load(in);
+            String version = properties.getProperty("build.version");
+            return version == null || version.isBlank() ? null : version.strip();
+        } catch (IOException | RuntimeException e) {
+            log.debug("could not read META-INF/build-info.properties", e);
+            return null;
+        }
     }
 
     /**

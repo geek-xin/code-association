@@ -36,6 +36,18 @@ public class PeerImpact {
     public List<com.geek.association.source.FileSource.SkippedFile> skippedFiles = new ArrayList<>();
 
     /**
+     * Statements in this program that touch a table this side changed but name no column
+     * ({@code SELECT *}, dynamic SQL).
+     *
+     * Database contracts are matched per column, so these statements cannot be judged: they are
+     * counted and shown instead of being reported as "not affected". Reading a gap as a clean
+     * result is the mistake this field exists to prevent.
+     */
+    public int unparsedColumnStatements;
+    /** One line per statement behind {@link #unparsedColumnStatements}, capped for display. */
+    public List<String> unparsedColumnFiles = new ArrayList<>();
+
+    /**
      * One shared contract: the changed thing on this side, and the code on the peer side that
      * consumes it.
      */

@@ -66,11 +66,63 @@ code-association:
     # Fetch a newly discovered jar in the background so it is ready when someone presses 应用更新.
     # Off by default: the download is tens of MB and applying is still a manual decision.
     auto-download: false
+    # Replace the running jar and bring the process back without anyone running stop.sh/start.sh.
+    # The supervisor health-checks the new process and restores the backup when it does not come
+    # up, so the worst case is a short outage rather than an installation that no longer starts.
+    auto-restart: true
+    # Do the whole thing unattended (download -> apply -> restart) as soon as a newer installable
+    # version appears. Off by default: restarting a service is disruptive and the operator should
+    # be the one who decides that nobody is watching.
+    auto-apply: false
+    # How long the supervisor waits for the new process to answer /api/health before it restores
+    # the backup and starts the old jar again.
+    restart-timeout-seconds: 90
+    # GitHub API hosts tried in order. The first is canonical; the rest are mirrors used only when
+    # it cannot be reached. A mirror must speak the GitHub REST API under the same paths (a proxy
+    # or a self-hosted replica), not a release page.
+    api-base-urls:
+      - https://api.github.com
+    # Prefix prepended to asset download URLs to route them through a mirror, e.g. https://ghfast.top
+    # Release assets are served from a CDN that is blocked in some networks while the API itself is
+    # reachable, so this is deliberately separate from api-base-urls. Empty means direct download.
+    download-mirror: ""
+    # Optional proxy for update traffic only: host:port or http://user:pass@host:port. Empty means
+    # "use the JVM's own proxy settings", which is what -Dhttps.proxyHost and HTTPS_PROXY become.
+    proxy: ${UPDATE_PROXY:}
+    # Extra attempts per request after the first failure. A flaky connection is the common case on
+    # a blocked network; a permanent 404 is not retried, because it cannot become a 200.
+    retries: 2
+    # Base delay of the exponential backoff between attempts, milliseconds (500 -> 1000 -> 2000).
+    retry-base-delay-ms: 500
+    # Once GitHub reports the quota as exhausted, stop retrying until the reported reset time.
+    # Without it a retry loop turns "wait until 14:05" into "stay limited for the rest of the hour".
+    respect-rate-limit: true
+    # Run one check shortly after startup instead of waiting for the first cron boundary.
+    check-on-startup: true
+  # Optional LLM review layer. Off by default: every conclusion in a report comes from static
+  # analysis, and the model only restates those facts in review language. When it is off, nothing
+  # is sent anywhere and the report is byte-for-byte what it was before this feature existed.
+  # The settings page writes its own snapshot to {data-dir}/ai-settings.json and overrides the
+  # values below on startup; this block stays the baseline for a headless/CLI install.
   ai:
     enabled: false
+    # OpenAI-compatible endpoint, e.g. https://api.deepseek.com/v1, https://api.openai.com/v1 or
+    # http://localhost:11434/v1 for a local Ollama. "/chat/completions" is appended when missing.
     base-url: ""
-    api-key: ""
+    # Read from the environment so no secret has to be committed. Empty is valid: a local model
+    # needs no key, which is why the key is not part of the "configured" check.
+    api-key: ${AI_API_KEY:}
+    # Model name as the endpoint spells it, e.g. deepseek-chat, gpt-4o-mini, qwen2.5-coder:7b.
     model: ""
+    # How many impact rows are sent to the model per call (1..50). The prompt is the cost, and the
+    # first dozen findings carry almost all of the review value.
+    max-impacts: 12
+    # Wall-clock limit of one model request (5..300). The analysis is already finished by the time
+    # this runs, so a dead endpoint must not hold the run open.
+    timeout-seconds: 60
+    # Default state of the "generate AI review" checkbox in the run dialog. Each run can still say
+    # no, and this has no effect while enabled is false.
+    default-for-runs: true
 
 logging:
   level:

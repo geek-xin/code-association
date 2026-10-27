@@ -504,46 +504,57 @@ public class JavaIndexer {
         public final java.util.Set<String> calls = new java.util.LinkedHashSet<>();
         public String hash = "";
 
+        /**
+         * 一次遍历收集所有条件与调用名。
+         *
+         * 原来对同一个方法体做了 7 次 findAll（If/While/For/Conditional/Switch/Return/MethodCall），
+         * 而条件表达式本身又各 toString() 一次 —— pretty-print 是这里最贵的一步。
+         * 遍历顺序仍是 findAll 的深度优先顺序，所以 conditions 的排列顺序与原来一致，
+         * conditionsHash（对外报告里用于判断「条件是否变了」）因此不会变。
+         */
         public static ConditionFingerprint of(com.github.javaparser.ast.Node body) {
             ConditionFingerprint fp = new ConditionFingerprint();
-            for (com.github.javaparser.ast.stmt.IfStmt ifStmt : body.findAll(com.github.javaparser.ast.stmt.IfStmt.class)) {
-                fp.conditions.add("if(" + normalize(ifStmt.getCondition().toString()) + ")");
-            }
-            for (com.github.javaparser.ast.stmt.WhileStmt w : body.findAll(com.github.javaparser.ast.stmt.WhileStmt.class)) {
-                fp.conditions.add("while(" + normalize(w.getCondition().toString()) + ")");
-            }
-            for (com.github.javaparser.ast.stmt.ForStmt f : body.findAll(com.github.javaparser.ast.stmt.ForStmt.class)) {
-                f.getCompare().ifPresent(c -> fp.conditions.add("for(" + normalize(c.toString()) + ")"));
-            }
-            for (com.github.javaparser.ast.expr.ConditionalExpr ce : body.findAll(com.github.javaparser.ast.expr.ConditionalExpr.class)) {
-                fp.conditions.add("?(" + normalize(ce.getCondition().toString()) + ")");
-            }
-            for (com.github.javaparser.ast.stmt.SwitchStmt sw : body.findAll(com.github.javaparser.ast.stmt.SwitchStmt.class)) {
-                fp.conditions.add("switch(" + normalize(sw.getSelector().toString()) + ")");
-            }
-            for (com.github.javaparser.ast.stmt.ReturnStmt ret : body.findAll(com.github.javaparser.ast.stmt.ReturnStmt.class)) {
-                ret.getExpression().ifPresent(expr -> {
-                    String text = normalize(expr.toString());
-                    if (text.contains("&&") || text.contains("||") || text.contains("==") || text.contains("!=")
-                            || text.contains("<") || text.contains(">") || text.contains("instanceof")
-                            || text.contains("?")) {
-                        fp.conditions.add("return(" + text + ")");
-                    }
-                });
-            }
-            for (com.github.javaparser.ast.expr.MethodCallExpr call : body.findAll(com.github.javaparser.ast.expr.MethodCallExpr.class)) {
-                fp.calls.add(call.getNameAsString());
-            }
+            body.walk(node -> {
+                if (node instanceof com.github.javaparser.ast.stmt.IfStmt ifStmt) {
+                    fp.conditions.add("if(" + normalize(ifStmt.getCondition().toString()) + ")");
+                } else if (node instanceof com.github.javaparser.ast.stmt.WhileStmt w) {
+                    fp.conditions.add("while(" + normalize(w.getCondition().toString()) + ")");
+                } else if (node instanceof com.github.javaparser.ast.stmt.ForStmt f) {
+                    f.getCompare().ifPresent(c -> fp.conditions.add("for(" + normalize(c.toString()) + ")"));
+                } else if (node instanceof com.github.javaparser.ast.expr.ConditionalExpr ce) {
+                    fp.conditions.add("?(" + normalize(ce.getCondition().toString()) + ")");
+                } else if (node instanceof com.github.javaparser.ast.stmt.SwitchStmt sw) {
+                    fp.conditions.add("switch(" + normalize(sw.getSelector().toString()) + ")");
+                } else if (node instanceof com.github.javaparser.ast.stmt.ReturnStmt ret) {
+                    ret.getExpression().ifPresent(expr -> {
+                        String text = normalize(expr.toString());
+                        if (text.contains("&&") || text.contains("||") || text.contains("==") || text.contains("!=")
+                                || text.contains("<") || text.contains(">") || text.contains("instanceof")
+                                || text.contains("?")) {
+                            fp.conditions.add("return(" + text + ")");
+                        }
+                    });
+                } else if (node instanceof com.github.javaparser.ast.expr.MethodCallExpr call) {
+                    fp.calls.add(call.getNameAsString());
+                }
+            });
             fp.hash = Hashes.sha1(String.join(";", fp.conditions));
             return fp;
         }
     }
 
+    /**
+     * normalize 是整条索引流水线上调用最频繁的字符串操作（每个类体 hash、每个方法体 hash、
+     * 每个条件表达式都要过一遍）。原来用 String.replaceAll 每次调用都重新编译一遍正则，
+     * 这里改成预编译的 Pattern —— 匹配语义与替换结果完全相同。
+     */
+    private static final java.util.regex.Pattern WHITESPACE = java.util.regex.Pattern.compile("\\s+");
+
     public static String normalize(String text) {
         if (text == null) {
             return "";
         }
-        return text.replaceAll("\\s+", " ").trim();
+        return WHITESPACE.matcher(text).replaceAll(" ").trim();
     }
 
     public static String typeKey(String modulePath, String qualified) {

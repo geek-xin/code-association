@@ -47,6 +47,17 @@ public class ImpactReport {
     public List<com.geek.association.model.PeerImpact> peers = new ArrayList<>();
     /** Set when no peer was selected, so the UI can say why the section is empty. */
     public String peersNote = null;
+    /**
+     * Commits contained in the reviewed range, newest first.
+     *
+     * The file list says what changed; only the commits say what the reviewer is being asked to
+     * approve. Empty for a working-tree run, which has no commits of its own yet.
+     */
+    public List<com.geek.association.model.CommitInfo> commits = new ArrayList<>();
+    /** How many commits the range holds (the same as {@link #commits} unless it was truncated). */
+    public int commitCount = 0;
+    /** Why {@link #commits} is shorter than the range, or "" when it is complete. */
+    public String rangeNote = "";
 
     public static class Summary {
         public int changedModules;
@@ -68,6 +79,8 @@ public class ImpactReport {
         public int messageChanges;
         public int buildChanges;
         public int unresolvedCalls;
+        /** Commits in the reviewed range; 0 for a working-tree run. */
+        public int commitCount;
         public int parsedFiles;
         public long indexMillis;
         /** Changed symbols that no statically resolvable code calls (e.g. framework entry points). */
@@ -157,6 +170,8 @@ public class ImpactReport {
     }
 
     public static class BlindSpot {
+        /** UNRESOLVED_CALL | COLUMN_BLIND_SPOT - the two need different follow-up. */
+        public String kind = "UNRESOLVED_CALL";
         public String module;
         public String file;
         public int line;

@@ -1,6 +1,7 @@
 package com.geek.association.source;
 
 import com.geek.association.config.AppProperties;
+import com.geek.association.model.CommitInfo;
 import com.geek.association.model.RepoSource;
 import com.geek.association.util.Texts;
 import org.eclipse.jgit.lib.ObjectId;
@@ -12,6 +13,7 @@ import org.springframework.stereotype.Component;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -35,7 +37,10 @@ public class RepositoryPreparer {
 
     public static final class Request {
         public RepoSource source;
-        /** GIT_DIFF (two refs), WORKTREE_DIFF (uncommitted changes vs HEAD), PULL_REQUEST (PR/MR head). */
+        /**
+         * GIT_DIFF (two refs), WORKTREE_DIFF (uncommitted changes vs HEAD), COMMIT_RANGE (an
+         * explicit first..last commit range), PULL_REQUEST (PR/MR head).
+         */
         public String mode = "GIT_DIFF";
         public String baseRef;
         public String targetRef;
@@ -43,12 +48,24 @@ public class RepositoryPreparer {
         public boolean includeUncommitted = true;
     }
 
+    /**
+     * How many commits one run lists in its report.
+     *
+     * A release branch cut from main can contain thousands of commits, and neither the report nor
+     * the reviewer benefits from all of them. The count is reported either way, so a truncated list
+     * is stated rather than silently passed off as the whole range.
+     */
+    static final int MAX_COMMITS_IN_REPORT = 200;
+
     public RevisionPair prepare(Request request) throws IOException {
         RepoSource source = request.source;
         String type = source.type == null ? "LOCAL_DIR" : source.type.toUpperCase();
         String mode = request.mode == null ? "GIT_DIFF" : request.mode.toUpperCase();
         if ("WORKTREE_DIFF".equals(mode) && !isRemote(type)) {
             return worktreeDiff(request);
+        }
+        if ("COMMIT_RANGE".equals(mode) || "RANGE".equals(mode) || "COMMITS".equals(mode)) {
+            return commitRange(request);
         }
         if ("PULL_REQUEST".equals(mode) || "MR".equals(mode) || "PR".equals(mode)) {
             return pullRequest(request);
@@ -164,6 +181,7 @@ public class RepositoryPreparer {
         pair.headCommit = headId.name();
         pair.baseRef = targetRef;
         pair.headRef = usedRef;
+        fillCommits(pair, repo, baseId, headId);
         return pair;
     }
 
@@ -174,6 +192,202 @@ public class RepositoryPreparer {
             case "GITLAB" -> new String[]{"refs/merge-requests/{n}/head"};
             default -> new String[]{"refs/pull/{n}/head", "refs/merge-requests/{n}/head"};
         };
+    }
+
+    /**
+     * Analyses an explicit first..last commit range.
+     *
+     * This is the mode a reviewer reaches for when the unit of review is a set of commits rather
+     * than a branch name: "these 12 commits are what I am about to merge". Both ends are required
+     * and the base must be an ancestor of the head - a range whose ends belong to different lines
+     * of history still produces a diff, but it is a diff of two unrelated snapshots, and a report
+     * built from it would look legitimate while answering the wrong question.
+     */
+    private RevisionPair commitRange(Request request) throws IOException {
+        if (Texts.isBlank(request.baseRef) || Texts.isBlank(request.targetRef)) {
+            throw new IOException("提交范围需要同时指定起始提交与结束提交");
+        }
+        RepoSource source = request.source;
+        String token = tokenOf(source);
+        try (Repository repo = openRepository(source, token)) {
+            String baseRef = request.baseRef.strip();
+            String targetRef = request.targetRef.strip();
+            ObjectId headId = resolveWithFetch(repo, targetRef, token);
+            if (headId == null) {
+                throw new IOException("找不到结束提交：" + targetRef + "（请检查名称，远端分支可能尚未拉取）");
+            }
+            ObjectId baseId = resolveWithFetch(repo, baseRef, token);
+            if (baseId == null) {
+                throw new IOException("找不到起始提交：" + baseRef + "（请检查名称，远端分支可能尚未拉取）");
+            }
+            if (baseId.equals(headId)) {
+                throw new IOException("起始提交与结束提交是同一个（" + shortId(headId) + "），没有可分析的变更");
+            }
+            if (!GitSupport.isAncestor(repo, baseId, headId)) {
+                throw new IOException("起始提交 " + baseRef + " 不在 " + targetRef
+                        + " 的历史里，两端不是同一条提交线，无法构成范围");
+            }
+            RevisionPair pair = new RevisionPair();
+            pair.repoPath = repo.getDirectory().getParent();
+            pair.note = source.name;
+            pair.mode = "COMMIT_RANGE";
+            pair.base = new GitTreeSource(repo, baseId, "base " + shortId(baseId),
+                    properties.getMaxFiles(), properties.maxFileBytes());
+            pair.head = new GitTreeSource(repo, headId, "head " + shortId(headId),
+                    properties.getMaxFiles(), properties.maxFileBytes());
+            pair.baseCommit = baseId.name();
+            pair.headCommit = headId.name();
+            pair.baseRef = baseRef;
+            pair.headRef = targetRef;
+            fillCommits(pair, repo, baseId, headId);
+            return pair;
+        }
+    }
+
+    /**
+     * Opens the repository behind a source, refreshing a remote clone first.
+     *
+     * The fetch is best effort for a clone that already has history: a reviewer on a train should
+     * still get a commit list for the branch as of the last successful fetch rather than an error.
+     */
+    private Repository openRepository(RepoSource source, String token) throws IOException {
+        String type = source.type == null ? "LOCAL_DIR" : source.type.toUpperCase();
+        if (isRemote(type)) {
+            Path cache = properties.dataPath().resolve("repos").resolve(slug(source));
+            Repository repo = GitSupport.cloneIfMissing(cache, source.location, token);
+            try {
+                GitSupport.fetchAll(repo, token);
+            } catch (IOException e) {
+                if (repo.resolve("HEAD^{commit}") == null) {
+                    throw e;
+                }
+                log.warn("commit list of {} served from the cache, refresh failed: {}",
+                        source.name, GitSupport.describe(e));
+            }
+            return repo;
+        }
+        Path root = Path.of(source.location).toAbsolutePath().normalize();
+        if (!Files.isDirectory(root.resolve(".git"))) {
+            throw new IOException("这个目录不是 Git 仓库，没有可选的提交");
+        }
+        return GitSupport.open(root);
+    }
+
+    /**
+     * Resolves a ref, pulling it from origin once when the local clone does not know it yet.
+     *
+     * Returns null rather than throwing: the caller turns "cannot find this commit" into a sentence
+     * naming the ref, which is more useful than a transport exception from a fetch attempt.
+     */
+    private ObjectId resolveWithFetch(Repository repo, String ref, String token) {
+        try {
+            ObjectId id = GitSupport.resolve(repo, ref);
+            if (id == null && !Texts.isBlank(ref)) {
+                try {
+                    GitSupport.fetchRef(repo, "refs/heads/" + ref, token);
+                } catch (IOException ignored) {
+                    // not a branch name (a sha, a tag, HEAD~3): the resolve below is the real answer
+                }
+                id = GitSupport.resolve(repo, ref);
+            }
+            return id;
+        } catch (IOException | RuntimeException e) {
+            log.warn("cannot resolve {}: {}", ref, GitSupport.describe(e));
+            return null;
+        }
+    }
+
+    /**
+     * Records which commits the run actually covers.
+     *
+     * One extra commit is requested so truncation is detectable without walking the whole history a
+     * second time: a range cut from a long-lived branch can hold thousands of commits, and claiming
+     * "these are the commits" while showing 200 of them would misstate the review.
+     */
+    private void fillCommits(RevisionPair pair, Repository repo, ObjectId baseId, ObjectId headId) {
+        if (headId == null) {
+            return;
+        }
+        List<CommitInfo> commits = GitSupport.commitsInRange(repo, baseId, headId,
+                MAX_COMMITS_IN_REPORT + 1);
+        if (commits.size() > MAX_COMMITS_IN_REPORT) {
+            pair.commits = new ArrayList<>(commits.subList(0, MAX_COMMITS_IN_REPORT));
+            pair.rangeNote = "本次范围提交较多，只列出最新的 " + MAX_COMMITS_IN_REPORT
+                    + " 个（按提交时间倒序）";
+        } else {
+            pair.commits = commits;
+            pair.rangeNote = "";
+        }
+    }
+
+    private String shortId(ObjectId id) {
+        return id == null ? "" : id.name().substring(0, 8);
+    }
+
+    /**
+     * Commit list for the run form: either the newest commits of one ref, or the commits between
+     * two refs.
+     *
+     * Never throws: the caller is a form field that must keep working while a repository is
+     * unreachable, so a failure is reported as an empty list plus one sentence a person can act on.
+     */
+    public Map<String, Object> commits(RepoSource source, String base, String target, int limit) {
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("commits", List.of());
+        out.put("count", 0);
+        out.put("ref", "");
+        out.put("base", "");
+        out.put("target", "");
+        out.put("note", "");
+        String type = source.type == null ? "LOCAL_DIR" : source.type.toUpperCase();
+        if (!isRemote(type)) {
+            try {
+                Path root = Path.of(source.location).toAbsolutePath().normalize();
+                if (!Files.isDirectory(root.resolve(".git"))) {
+                    out.put("note", "这个目录不是 Git 仓库，没有可选的提交");
+                    return out;
+                }
+            } catch (RuntimeException e) {
+                out.put("note", "路径格式不正确");
+                return out;
+            }
+        }
+        int capped = Math.max(1, Math.min(limit <= 0 ? 30 : limit, 500));
+        String token = tokenOf(source);
+        try (Repository repo = openRepository(source, token)) {
+            String targetRef = Texts.isBlank(target) ? defaultRef(source, repo) : target.strip();
+            out.put("ref", targetRef);
+            out.put("target", targetRef);
+            ObjectId headId = resolveWithFetch(repo, targetRef, token);
+            if (headId == null) {
+                out.put("note", "找不到提交或分支：" + targetRef);
+                return out;
+            }
+            ObjectId baseId = null;
+            if (!Texts.isBlank(base)) {
+                String baseRef = base.strip();
+                out.put("base", baseRef);
+                baseId = resolveWithFetch(repo, baseRef, token);
+                if (baseId == null) {
+                    out.put("note", "找不到起始提交：" + baseRef);
+                    return out;
+                }
+            }
+            List<CommitInfo> list = baseId == null
+                    ? GitSupport.commits(repo, headId, capped)
+                    : GitSupport.commitsInRange(repo, baseId, headId, capped);
+            out.put("commits", list);
+            out.put("count", list.size());
+            out.put("target", shortId(headId));
+            if (baseId != null) {
+                out.put("base", shortId(baseId));
+            }
+            return out;
+        } catch (IOException | RuntimeException e) {
+            log.warn("commit list of {} failed: {}", source.name, GitSupport.describe(e));
+            out.put("note", refsFailureNote(GitSupport.describe(e)));
+            return out;
+        }
     }
 
     private RevisionPair localDir(Request request) throws IOException {
@@ -286,6 +500,9 @@ public class RepositoryPreparer {
             pair.baseRef = Texts.isBlank(request.baseRef) ? (baseId == null ? "" : shortName(repo, baseId)) : request.baseRef;
             pair.headRef = targetRef;
             pair.mode = "GIT_DIFF";
+            // A branch/tag comparison is also a commit range; listing it costs one bounded walk and
+            // is what tells a reviewer whether "main..HEAD" means one commit or fifty.
+            fillCommits(pair, repo, baseId, headId);
         }
     }
 
@@ -666,6 +883,7 @@ public class RepositoryPreparer {
         out.put("headCommit", pair.headCommit);
         out.put("baseLabel", pair.base == null ? "" : pair.base.label());
         out.put("headLabel", pair.head == null ? "" : pair.head.label());
+        out.put("commitCount", pair.commitCount());
         return out;
     }
 }

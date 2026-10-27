@@ -1,8 +1,10 @@
 package com.geek.association.web;
 
+import com.geek.association.config.AiSettings;
 import com.geek.association.config.AppProperties;
 import com.geek.association.model.Analysis;
 import com.geek.association.model.RepoSource;
+import com.geek.association.report.AiExplainer;
 import com.geek.association.report.ImpactReport;
 import com.geek.association.schedule.ScheduledScanService;
 import com.geek.association.service.AnalysisService;
@@ -14,6 +16,7 @@ import com.geek.association.transfer.SourceTags;
 import com.geek.association.transfer.SourceTransfer;
 import com.geek.association.update.UpdateService;
 import com.geek.association.util.Json;
+import com.geek.association.util.Texts;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.DeleteMapping;
@@ -42,10 +45,21 @@ public class ApiController {
     private final PathBrowser pathBrowser;
     private final ScheduledScanService scheduledScan;
     private final UpdateService updateService;
+    private final AiSettings aiSettings;
+    private final AiExplainer aiExplainer;
 
+    /**
+     * The last two parameters were added with the AI settings endpoints.
+     *
+     * Nullable on purpose: {@code AnalysisProgressTest} constructs this controller directly with
+     * the original five collaborators to pin the progress payload, and the AI endpoints are simply
+     * not exercised there. Every AI handler therefore guards on {@code aiSettings == null} rather
+     * than the test having to know about a feature it does not test.
+     */
     public ApiController(Store store, AnalysisService analysisService, RepositoryPreparer preparer,
                          AppProperties properties, PathBrowser pathBrowser,
-                         ScheduledScanService scheduledScan, UpdateService updateService) {
+                         ScheduledScanService scheduledScan, UpdateService updateService,
+                         AiSettings aiSettings, AiExplainer aiExplainer) {
         this.store = store;
         this.analysisService = analysisService;
         this.preparer = preparer;
@@ -53,6 +67,8 @@ public class ApiController {
         this.pathBrowser = pathBrowser;
         this.scheduledScan = scheduledScan;
         this.updateService = updateService;
+        this.aiSettings = aiSettings;
+        this.aiExplainer = aiExplainer;
     }
 
     @GetMapping("/health")
@@ -63,8 +79,82 @@ public class ApiController {
         out.put("maxDepth", properties.getMaxDepth());
         out.put("maxFiles", properties.getMaxFiles());
         out.put("maxFileMb", properties.getMaxFileMb());
-        out.put("aiEnabled", properties.getAi().isEnabled());
+        // Kept for the clients that already read it, and now equal to "ready": a switch that is on
+        // but has no endpoint or model cannot produce anything, and reporting it as enabled was the
+        // reason the old value was misleading. aiReady is the same value under a name that says so.
+        boolean aiReady = properties.getAi().ready();
+        out.put("aiEnabled", aiReady);
+        out.put("aiReady", aiReady);
         return out;
+    }
+
+    // ----------------------------------------------------------------------- ai
+
+    /**
+     * The AI settings as the settings card renders them: everything except the key itself.
+     *
+     * Returns the same shape as {@link #saveAi(Map)} so the card can re-render from whichever
+     * response it got last, and so "saved" and "loaded" can never disagree about a field name.
+     */
+    @GetMapping("/ai")
+    public Map<String, Object> ai() {
+        return aiSettings.view();
+    }
+
+    /**
+     * Applies and persists the settings, without a restart.
+     *
+     * A PUT rather than a POST because it replaces the configuration as a set. Validation failures
+     * are {@link IllegalArgumentException}s, which the existing advice turns into a 400 with the
+     * Chinese sentence the form shows in its toast.
+     */
+    @PutMapping("/ai")
+    public Map<String, Object> saveAi(@RequestBody(required = false) Map<String, Object> body) {
+        return aiSettings.update(body);
+    }
+
+    /**
+     * Proves the endpoint, key and model work together, using the form's unsaved draft.
+     *
+     * Always answers 200 and puts the outcome in {@code ok}: this is the result of a test the user
+     * asked for, and a 4xx/5xx would make the card's error path indistinguishable from "the test
+     * itself failed". The body may override any of the three fields, so the user can test before
+     * saving - and a blank apiKey falls back to the stored one, because the form only holds a mask.
+     */
+    @PostMapping("/ai/test")
+    public Map<String, Object> testAi(@RequestBody(required = false) Map<String, Object> body) {
+        Object baseUrl = body == null ? null : body.get("baseUrl");
+        Object model = body == null ? null : body.get("model");
+        Object apiKey = body == null ? null : body.get("apiKey");
+        return aiExplainer.testConnection(
+                baseUrl == null ? null : baseUrl.toString(),
+                model == null ? null : model.toString(),
+                apiKey == null ? null : apiKey.toString());
+    }
+
+    /**
+     * Generates the AI section of an existing report and stores it.
+     *
+     * Three distinct answers on purpose: 404 when the analysis does not exist (the caller's id is
+     * wrong), 409 when it exists but has no report yet (the run has not finished - retry later), and
+     * a 200 carrying {@code generated:false} when the model call itself failed, because that is a
+     * content-level outcome the page must render rather than an HTTP error it must catch.
+     */
+    @PostMapping("/analyses/{id}/ai-review")
+    public ResponseEntity<Map<String, Object>> generateAiReview(@PathVariable long id) {
+        // Readiness first, in the order the contract lists the failures: "not configured" is a
+        // property of this installation, so it explains the refusal better than the id does.
+        if (aiExplainer != null && !aiExplainer.ready()) {
+            throw new IllegalArgumentException("AI 审核未启用或未配置完成：" + aiExplainer.notReadyReason());
+        }
+        if (store.analysis(id) == null) {
+            return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of("error", "分析不存在：" + id));
+        }
+        Map<String, Object> ai = analysisService.saveAiReview(id);
+        if (ai == null) {
+            return ResponseEntity.status(HttpStatus.CONFLICT).body(Map.of("error", "该分析还没有可用的报告"));
+        }
+        return ResponseEntity.ok(ai);
     }
 
     // --------------------------------------------------------------- schedule
@@ -161,6 +251,43 @@ public class ApiController {
     @GetMapping("/update/history")
     public Map<String, Object> updateHistory() {
         return updateService.history();
+    }
+
+    /**
+     * Turns the automatic behaviours on or off without a restart.
+     *
+     * A PUT rather than a POST because it replaces the three toggles as a set, and it returns the
+     * full status payload rather than the settings alone: the card re-renders from one response,
+     * which is also what keeps "the switch moved" and "the banner says otherwise" from disagreeing.
+     */
+    @PutMapping("/update/settings")
+    public Map<String, Object> updateSettings(@RequestBody(required = false) Map<String, Object> body) {
+        return updateService.saveSettings(body);
+    }
+
+    /**
+     * Status of the supervised restart, for a client that only wants that part.
+     *
+     * The same block is embedded in {@code GET /api/update}; this endpoint exists so the
+     * post-restart poll can be one small request instead of the whole release list.
+     */
+    @GetMapping("/update/restart")
+    public Map<String, Object> restartStatus() {
+        return updateService.restartState();
+    }
+
+    /**
+     * Progress of the running download/apply pipeline, for the poll the card runs while busy.
+     *
+     * Separate from {@code GET /api/update} for the same reason as the restart block: a background
+     * download lasts tens of seconds and the card wants a byte count twice a second, while the full
+     * payload lists the downloads directory and re-derives every release flag. Polling the heavy
+     * one at that rate would turn "watching a progress bar" into load on the machine doing the
+     * analysis.
+     */
+    @GetMapping("/update/progress")
+    public Map<String, Object> updateProgress() {
+        return updateService.progressState();
     }
 
     // ------------------------------------------------------------- filesystem
@@ -275,6 +402,13 @@ public class ApiController {
         }
         requireLocalDirectory(existing);
         SourceNames.withDerivedName(existing);
+        // requireLocalDirectory() rejects an unusable local path, so this mostly confirms what it
+        // just checked. The row still has to be re-judged explicitly: a source imported on this
+        // machine while its directory was absent carries that import's MISSING verdict, and without
+        // this the list would keep showing 目录缺失 - with the import's explanation - for a source
+        // the user has just pointed at the right place. Judging again instead of assuming OK also
+        // covers the directory disappearing between the two checks.
+        SourceTransfer.markAvailability(existing, "编辑时");
         return store.saveSource(existing);
     }
 
@@ -346,6 +480,34 @@ public class ApiController {
         return preparer.refsForLocation(type, location, credentialEnv);
     }
 
+    /**
+     * Commits a source can be compared over, so the run form offers a picker instead of asking for
+     * two SHAs by hand.
+     *
+     * Two shapes from one endpoint on purpose: with only {@code ref} it answers "the newest commits
+     * of this branch" (what the dropdown lists), and with {@code base} + {@code target} it answers
+     * "the commits this range would cover" (what the preview shows). The response shape is the same
+     * either way, so the client has one thing to render.
+     *
+     * A repository problem never becomes an HTTP error here: the caller is a form field, and an
+     * empty list plus a readable {@code note} keeps the rest of the form usable.
+     */
+    @GetMapping("/sources/{id}/commits")
+    public Map<String, Object> commits(@PathVariable long id,
+                                       @RequestParam(required = false) String ref,
+                                       @RequestParam(required = false) String base,
+                                       @RequestParam(required = false) String target,
+                                       @RequestParam(defaultValue = "30") int limit) {
+        RepoSource source = store.source(id);
+        if (source == null) {
+            throw new IllegalArgumentException("unknown source: " + id);
+        }
+        // target wins over ref when both are given: a range request always names its end, and the
+        // branch is then only the fallback for the "which branch am I looking at" case.
+        String headRef = Texts.isBlank(target) ? ref : target;
+        return preparer.commits(source, base, headRef, limit);
+    }
+
     /** Branches and tags of a source, so the UI can offer real refs instead of free text. */
     @GetMapping("/sources/{id}/refs")
     public Map<String, Object> refs(@PathVariable long id) {
@@ -394,6 +556,20 @@ public class ApiController {
         return out;
     }
 
+    /**
+     * 摘要列的解析。
+     *
+     * 列表接口一次返回 30 行，原来每行都新建一个匿名 TypeReference；类型信息是常量，
+     * 复用同一个实例即可，行为完全一致。
+     */
+    private static final com.fasterxml.jackson.core.type.TypeReference<Map<String, Object>> SUMMARY_TYPE =
+            new com.fasterxml.jackson.core.type.TypeReference<>() {
+            };
+
+    private Map<String, Object> summaryOf(Analysis a) {
+        return a.summaryJson == null ? null : Json.read(a.summaryJson, SUMMARY_TYPE);
+    }
+
     @GetMapping("/analyses")
     public List<Map<String, Object>> analyses(@RequestParam(defaultValue = "30") int limit) {
         List<Map<String, Object>> out = new ArrayList<>();
@@ -419,7 +595,7 @@ public class ApiController {
             row.put("progressDetail", a.progressDetail);
             row.put("progressCompleted", a.progressCompleted);
             row.put("progressSkipped", a.progressSkipped);
-            row.put("summary", a.summaryJson == null ? null : Json.readMap(a.summaryJson));
+            row.put("summary", summaryOf(a));
             out.add(row);
         }
         return out;
@@ -428,7 +604,9 @@ public class ApiController {
     @GetMapping("/analyses/{id}")
     public ResponseEntity<Map<String, Object>> analysis(@PathVariable long id,
                                                         @RequestParam(defaultValue = "false") boolean withReport) {
-        Analysis a = store.analysis(id);
+        // report_json 是 MB 级的 blob：只有调用方明确要报告时才把它读出来，
+        // 否则一次状态查询会把整份报告从 SQLite 里流出来。
+        Analysis a = withReport ? store.analysisWithReport(id) : store.analysis(id);
         if (a == null) {
             return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of("error", "not found"));
         }
@@ -452,7 +630,7 @@ public class ApiController {
         row.put("progressDetail", a.progressDetail);
         row.put("progressCompleted", a.progressCompleted);
         row.put("progressSkipped", a.progressSkipped);
-        row.put("summary", a.summaryJson == null ? null : Json.readMap(a.summaryJson));
+        row.put("summary", summaryOf(a));
         if (withReport && a.reportJson != null) {
             row.put("report", Json.readMap(a.reportJson));
         }
