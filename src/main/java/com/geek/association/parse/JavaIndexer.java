@@ -59,14 +59,14 @@ public class JavaIndexer {
     private final JavaParser parser;
     private final CodeIndex index;
     private final Map<String, List<String>> duplicateQualified = new HashMap<>();
-    private final Consumer<String> onFile;
+    private final FileProgress onFile;
 
     public JavaIndexer(FileSource source, MavenParser maven, CodeIndex index, int maxFiles) {
-        this(source, maven, index, maxFiles, null);
+        this(source, maven, index, maxFiles, (FileProgress) null);
     }
 
     public JavaIndexer(FileSource source, MavenParser maven, CodeIndex index, int maxFiles,
-                       Consumer<String> onFile) {
+                       FileProgress onFile) {
         this.source = source;
         this.maven = maven;
         this.index = index;
@@ -94,9 +94,16 @@ public class JavaIndexer {
             javaFiles = new ArrayList<>(javaFiles.subList(0, maxFiles));
         }
         Map<String, CompilationUnit> units = new LinkedHashMap<>();
+        // Indexing does two passes over the same files: parsing, then building the call graph. One
+        // pass's worth of files would make the bar run to 100% and then restart, so the unit is a
+        // (pass, file) pair and there are two units per file.
+        int passTotal = javaFiles.size() * 2;
+        int seen = 0;
         for (String file : javaFiles) {
             if (onFile != null) {
-                onFile.accept(file);
+                // 1-based: "the 500th of 1500" is what the UI shows, and reporting 0 for the first
+                // file would read as "nothing done yet" on a run that has already started.
+                onFile.file(file, ++seen, passTotal);
             }
             String content = source.read(file);
             if (content == null) {
@@ -114,7 +121,13 @@ public class JavaIndexer {
             collectTypes(cu, file);
         }
         resolveSupertypes();
-        new CallGraphBuilder(source, index, maven, units, parser).build();
+        // Second pass: continue the same unit count so the reported percentage keeps climbing
+        // instead of falling back to the start of a new range. The offset is captured in a final
+        // local because javaFiles is reassigned above and so cannot be used inside the lambda.
+        final int graphOffset = javaFiles.size();
+        FileProgress graphProgress = onFile == null ? null
+                : (file, done, ignoredTotal) -> onFile.file(file, graphOffset + done, passTotal);
+        new CallGraphBuilder(source, index, maven, units, parser, graphProgress).build();
         index.buildMillis = System.currentTimeMillis() - start;
         return index;
     }

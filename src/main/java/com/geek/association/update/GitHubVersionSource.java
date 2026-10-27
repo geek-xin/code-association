@@ -115,12 +115,14 @@ public class GitHubVersionSource implements VersionSource {
             throw new UpdateException("未配置更新仓库（code-association.update.repo）");
         }
         int perPage = Math.max(1, Math.min(100, update.getMaxReleases()));
+        // Warnings describe this attempt only; a stale line from the previous check would be read
+        // as if the current one had the same problem.
+        warnings = List.of();
         // The releases request carries what an update needs (notes, assets), so its failure stays
         // fatal: a half-known answer here would be reported as "no update" and hide a real one.
         List<ReleaseInfo> releases = parseReleases(get(releasesUri(repo, perPage), repo, update), repo);
         if (!update.isIncludeTags()) {
-            // Nothing to warn about: tags were never asked for.
-            warnings = List.of();
+            // Tags were never asked for, so there is nothing that could be missing.
             return select(releases, update);
         }
         return withTags(releases, repo, perPage, update);
@@ -153,7 +155,6 @@ public class GitHubVersionSource implements VersionSource {
             warnings = List.of("读取标签列表失败，本次仅显示 releases：" + e.getMessage());
             return select(releases, update);
         }
-        warnings = List.of();
         return select(merge(releases, tags), update);
     }
 
@@ -197,12 +198,15 @@ public class GitHubVersionSource implements VersionSource {
         return response.body();
     }
 
+    /** Drops trailing slashes without eating the "//" of the scheme itself. */
     private static String stripTrailingSlash(String text) {
-        String out = text;
-        while (out.endsWith("/")) {
-            out = out.substring(0, out.length() - 1);
+        int scheme = text.indexOf("://");
+        int floor = scheme < 0 ? 1 : scheme + 3;
+        int end = text.length();
+        while (end > floor && text.charAt(end - 1) == '/') {
+            end--;
         }
-        return out;
+        return text.substring(0, end);
     }
 
     /**
@@ -351,14 +355,14 @@ public class GitHubVersionSource implements VersionSource {
             if (!node.isObject()) {
                 continue;
             }
-            // "name" is what tags returns; "ref"/"tag_name" appear in other tag-shaped payloads
-            // and cost nothing to accept, which keeps the parser usable if the shape shifts.
+            // "name" is the shape /tags returns. A "refs/tags/x" form also turns up in GitHub's
+            // other tag-shaped payloads and costs one strip to accept, so the parser survives a
+            // switch between them.
             String tag = text(node, "name");
             if (tag == null) {
-                tag = text(node, "ref");
-            }
-            if (tag == null) {
-                tag = text(node, "tag_name");
+                String ref = text(node, "ref");
+                tag = ref == null ? null : (ref.startsWith("refs/tags/")
+                        ? ref.substring("refs/tags/".length()) : ref);
             }
             // An unparsable tag is one entry lost, not the whole list: repositories carry
             // non-version tags ("nightly", "latest") all the time.
@@ -389,8 +393,11 @@ public class GitHubVersionSource implements VersionSource {
      * only notes and assets either of them has, so keying on the normalised version and keeping the
      * release is what makes the merge lossless. Same version from both sides is the common case,
      * not an edge case: every released version is tagged.
+     *
+     * Public for the same reason as {@link #parseReleases}: the rule is the interesting part and
+     * is testable from inline JSON without a server.
      */
-    static List<ReleaseInfo> merge(List<ReleaseInfo> releases, List<ReleaseInfo> tags) {
+    public static List<ReleaseInfo> merge(List<ReleaseInfo> releases, List<ReleaseInfo> tags) {
         Map<String, ReleaseInfo> byVersion = new LinkedHashMap<>();
         for (ReleaseInfo release : releases) {
             byVersion.putIfAbsent(release.version, release);

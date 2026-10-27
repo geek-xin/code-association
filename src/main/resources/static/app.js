@@ -55,6 +55,15 @@ const PAGE_KEY = 'ca.page';
 const DENSITY_KEY = 'ca.density';
 const THEME_KEY = 'ca.theme';
 const NAV_KEY = 'ca.nav';
+/** Version the user chose to stop being told about; the settings card still lists it. */
+const UPDATE_SKIP_KEY = 'ca.update.skip.v1';
+/** Collapsed tag groups in the source sidebar; expanded is the default, so only folds are stored. */
+const NAVTAGS_KEY = 'ca.navtags';
+/** Mirrors SourceTags on the server: it stays authoritative, these only shape the input. */
+const TAG_MAX_COUNT = 12;
+const TAG_MAX_LENGTH = 24;
+/** Sources without any tag are listed under this pseudo group; it is never a real tag. */
+const UNTAGGED_GROUP = '未分类';
 
 function esc(v) {
   return String(v == null ? '' : v)
@@ -161,10 +170,25 @@ var state = {
   importStep: -1,
   importError: false,
   maps: {},
-  picker: { target: null, path: null, selected: null },
+  /** GET /api/tags result: [{tag, count}], most used first. Empty when the call fails. */
+  tags: [],
+  /** Tag the workspace is filtered to, or null for "everything". */
+  tagFilter: null,
+  /** Source being edited in #modal-source; null means the modal is in "add" mode. */
+  editingSourceId: null,
+  /** Tags of the source form currently being edited, shared by the add form and the modal. */
+  sourceTags: [],
+  /** parent is whatever the server last reported; the client never derives it (see loadDir). */
+  picker: { target: null, path: null, parent: null, selected: null },
   /** Cached GET /api/update payload; see ensureUpdateLoaded(). */
   update: null,
-  updateLoaded: false
+  updateLoaded: false,
+  /**
+   * Version whose banner the user dismissed with the X in this page load. Deliberately not
+   * persisted: only "忽略此版本" is a lasting choice, closing is "not now". Kept on state rather
+   * than in the DOM so a re-render cannot resurrect a banner the user just closed.
+   */
+  updateBannerClosed: null
 };
 
 /* ---------------------------------------------------------------- decisions */
@@ -392,22 +416,212 @@ async function loadSources() {
   try { state.sources = await api('/sources'); } catch (e) { state.sources = []; }
 }
 
+/**
+ * All tags in use, with counts. A failure must not take the workspace down: the tag groups, the
+ * filter pills and the candidate list all degrade to "no tags known" and everything else still
+ * renders, so this mirrors loadSources' swallow-and-empty style.
+ */
+async function loadTags() {
+  try { state.tags = (await api('/tags')) || []; } catch (e) { state.tags = []; }
+}
+
+/* ---------------------------------------------------------------- tag rules */
+
+/**
+ * Client-side mirror of the server's normalisation (SourceTags): split on both comma forms, trim,
+ * drop empties, de-duplicate case-insensitively keeping the first spelling, drop anything longer
+ * than 24 characters, keep at most 12. It never throws — the point is to shape the input, and the
+ * server's answer stays authoritative.
+ */
+function normalizeTags(value) {
+  var raw = [];
+  if (value == null) return raw;
+  if (Object.prototype.toString.call(value) === '[object Array]') raw = value;
+  else raw = String(value).split(/[,，]/);
+  var seen = {};
+  var out = [];
+  for (var i = 0; i < raw.length; i++) {
+    var t = String(raw[i] == null ? '' : raw[i]).trim();
+    if (!t || t.length > TAG_MAX_LENGTH) continue;
+    var key = t.toLowerCase();
+    if (seen[key]) continue;
+    seen[key] = true;
+    out.push(t);
+    if (out.length >= TAG_MAX_COUNT) break;
+  }
+  return out;
+}
+
+/** Tags of one source, always an array even for a payload from an older server. */
+function sourceTagsOf(source) {
+  return (source && source.tags) || [];
+}
+
+/** True when the tag is already in the list, ignoring case — matches the server's dedupe rule. */
+function hasTag(list, tag) {
+  var key = String(tag == null ? '' : tag).trim().toLowerCase();
+  return list.some(function (t) { return String(t).toLowerCase() === key; });
+}
+
+/* ------------------------------------------------------------ tag chips */
+
+/**
+ * The tag list of one form, keyed by form prefix ("src" for the add form, "m" for the modal).
+ *
+ * They are deliberately separate: the add form and the edit dialog are two different drafts, and
+ * sharing one array would carry the tags typed in one over to the other. state.sourceTags is that
+ * per-form draft store.
+ */
+function tagBuffer(prefix) {
+  if (!state.sourceTags[prefix]) state.sourceTags[prefix] = [];
+  return state.sourceTags[prefix];
+}
+
+/** Replaces a form's draft with the given tags, normalised the way the server will. */
+function setFormTags(prefix, tags) {
+  state.sourceTags[prefix] = normalizeTags(tags || []);
+  renderTagInput(prefix);
+}
+
+/** Merges whatever is in the text field into the draft. Used by Enter, comma and paste. */
+function commitTagInput(prefix) {
+  var input = document.querySelector('[data-tag-input="' + prefix + '"]');
+  if (!input) return;
+  var raw = String(input.value || '');
+  if (!raw.trim()) return;
+  var before = tagBuffer(prefix).length;
+  var merged = normalizeTags(tagBuffer(prefix).concat(raw.split(/[,，]/)));
+  state.sourceTags[prefix] = merged;
+  input.value = '';
+  renderTagInput(prefix);
+  // Silence here would look like a dropped keystroke: say why nothing was added.
+  if (merged.length === before) {
+    toast(merged.length >= TAG_MAX_COUNT
+      ? '最多 ' + TAG_MAX_COUNT + ' 个标签'
+      : '标签重复或超过 ' + TAG_MAX_LENGTH + ' 个字符', 'error');
+  }
+}
+
+/** Adds one tag (a candidate click). */
+function addFormTag(prefix, tag) {
+  var merged = normalizeTags(tagBuffer(prefix).concat([tag]));
+  var before = tagBuffer(prefix).length;
+  state.sourceTags[prefix] = merged;
+  renderTagInput(prefix);
+  if (merged.length === before) toast('最多 ' + TAG_MAX_COUNT + ' 个标签', 'error');
+}
+
+function removeFormTag(prefix, tag) {
+  state.sourceTags[prefix] = tagBuffer(prefix).filter(function (t) {
+    return String(t).toLowerCase() !== String(tag).toLowerCase();
+  });
+  renderTagInput(prefix);
+}
+
+/**
+ * Draws the chips and the candidate pool of one form.
+ *
+ * Only the chips and candidates are replaced; the text input is never touched, so re-rendering
+ * after every commit cannot steal focus mid-typing.
+ */
+function renderTagInput(prefix) {
+  var chipsHost = $(prefix + '-tags-chips');
+  var candsHost = $(prefix + '-tags-cands');
+  var tags = tagBuffer(prefix);
+
+  if (chipsHost) {
+    chipsHost.innerHTML = tags.map(function (t) {
+      return '<span class="chip tag-chip">' + esc(t) +
+        '<button class="tag-chip-x" type="button" data-tag-remove="' + prefix + '"' +
+        ' data-tag-value="' + esc(t) + '" aria-label="移除标签 ' + esc(t) + '">' + icon('i-x') + '</button>' +
+        '</span>';
+    }).join('');
+  }
+
+  if (candsHost) {
+    if (tags.length >= TAG_MAX_COUNT) {
+      candsHost.innerHTML = '<span class="tag-cands-hint">已到上限 ' + TAG_MAX_COUNT + ' 个</span>';
+      return;
+    }
+    var pool = knownTags().filter(function (t) { return !hasTag(tags, t); });
+    candsHost.innerHTML = pool.length
+      ? '<span class="tag-cands-label">已有标签</span>' + pool.slice(0, 16).map(function (t) {
+          return '<button class="pill neutral tag-cand" type="button" data-tag-add="' + prefix + '"' +
+            ' data-tag-value="' + esc(t) + '">' + icon('i-plus') + esc(t) + '</button>';
+        }).join('')
+      : '<span class="tag-cands-hint">还没有其他标签，直接输入即可创建</span>';
+  }
+}
+
+/** Every tag known locally, either from GET /api/tags or from the sources themselves. */
+function knownTags() {
+  var seen = {};
+  var out = [];
+  var push = function (t) {
+    var key = String(t).toLowerCase();
+    if (seen[key]) return;
+    seen[key] = true;
+    out.push(String(t));
+  };
+  (state.tags || []).forEach(function (row) { if (row && row.tag) push(row.tag); });
+  state.sources.forEach(function (s) { sourceTagsOf(s).forEach(push); });
+  return out;
+}
+
 async function loadAnalyses() {
   try { state.analyses = await api('/analyses?limit=30'); } catch (e) { state.analyses = []; }
 }
 
+/**
+ * The analysis record the workspace is currently showing, or null.
+ *
+ * The report is only written when a run succeeds, so everything that has to be shown about a
+ * failed or in-flight run comes from this row instead. Without it the page cannot tell "no
+ * analysis was ever run here" from "this run failed".
+ */
+function selectedAnalysis() {
+  if (state.analysisId == null) return null;
+  var row = state.analyses.filter(function (a) { return a.id === state.analysisId; })[0] || null;
+  // A live run carries fresher progress than the list row fetched a moment earlier.
+  if (state.liveAnalysis && state.liveAnalysis.id === state.analysisId) return state.liveAnalysis;
+  return row;
+}
+
 async function openAnalysis(id) {
   state.analysisId = id;
-  try {
-    state.report = await api('/analyses/' + id + '/report');
-  } catch (e) {
-    state.report = null;
-    toast('读取报告失败：' + e.message, 'error');
+  var owner = state.analyses.filter(function (a) { return a.id === id; })[0] || null;
+  // A finished run has a report, but a pending one does not, and asking for it anyway is how a
+  // failed record ended up with a null report *and* no visible reason.
+  var hasReport = !owner || owner.status === 'DONE';
+  state.report = null;
+  if (hasReport) {
+    try {
+      state.report = await api('/analyses/' + id + '/report');
+    } catch (e) {
+      // 202 means "not ready yet" and is a normal answer for a run that is still going; only a
+      // real failure deserves an error toast.
+      if (!/(^|\s)202(\s|$)/.test(e.message)) toast('读取报告失败：' + e.message, 'error');
+    }
   }
   // The report is the authority on which source it belongs to.
   if (state.report) {
-    var owner = state.analyses.filter(function (a) { return a.id === id; })[0];
-    if (owner) state.sourceId = owner.sourceId;
+    var reportOwner = state.analyses.filter(function (a) { return a.id === id; })[0];
+    if (reportOwner) state.sourceId = reportOwner.sourceId;
+  } else if (owner && owner.sourceId != null) {
+    // Keep the workspace pointed at the source even when the run produced no report.
+    state.sourceId = owner.sourceId;
+  }
+  // The live panel is what renders progress and failure; make sure it matches the opened record.
+  if (owner && (owner.status === 'RUNNING' || owner.status === 'PENDING' || owner.status === 'FAILED')) {
+    state.liveAnalysis = owner;
+  } else if (state.liveAnalysis && state.liveAnalysis.id !== id) {
+    state.liveAnalysis = null;
+  }
+  // Opening a run that is still in flight must also subscribe to it. Without this the panel shows
+  // whatever the list row happened to say at click time and then never moves again - which is
+  // exactly what "the progress is not updating" looks like from the outside.
+  if (owner && (owner.status === 'RUNNING' || owner.status === 'PENDING')) {
+    pollAnalysis(id);
   }
   state.selectedModule = null;
   state.selectedImpactId = null;
@@ -469,7 +683,7 @@ function currentSource() {
 }
 
 async function refreshAll(keepPage) {
-  await Promise.all([loadSources(), loadAnalyses()]);
+  await Promise.all([loadSources(), loadAnalyses(), loadTags()]);
   // A reload during a run must resume the live panel from persisted server progress.
   var running = state.analyses.filter(function (a) {
     return a.status === 'RUNNING' || a.status === 'PENDING';
@@ -521,6 +735,9 @@ function go(page) {
   if (ws) ws.scrollTop = 0;
   try { localStorage.setItem(PAGE_KEY, page); } catch (e) { /* ignore */ }
   renderMapsFor(page);
+  // Page switches do not re-fetch anything, but the notice is page-independent and cheap to
+  // re-evaluate; doing it here keeps the rail dot in sync without a poll-time API call.
+  renderUpdateNotice();
 }
 
 function renderMapsFor(page) {
@@ -637,6 +854,66 @@ function renderPeerPanel(report, prefix) {
   }).join('');
 }
 
+/* --------------------------------------------------- sidebar tag groups */
+
+/** Folded tag groups, persisted so the menu keeps its shape across reloads. */
+function readNavTagFolds() {
+  try { return JSON.parse(localStorage.getItem(NAVTAGS_KEY) || '{}') || {}; } catch (e) { return {}; }
+}
+
+function writeNavTagFolds(folds) {
+  try { localStorage.setItem(NAVTAGS_KEY, JSON.stringify(folds)); } catch (e) { /* ignore quota */ }
+}
+
+function toggleNavTagGroup(name) {
+  var folds = readNavTagFolds();
+  if (folds[name]) delete folds[name];
+  else folds[name] = true;
+  writeNavTagFolds(folds);
+  renderNavSources();
+}
+
+/** Sets or clears the tag filter; the same tag twice means "show everything again". */
+function setTagFilter(tag) {
+  var next = tag == null ? null : String(tag);
+  state.tagFilter = (next && state.tagFilter !== next) ? next : null;
+  renderNavSources();
+  renderSourcesPage();
+}
+
+/**
+ * Groups sources by tag for the sidebar. A source with several tags appears in every one of its
+ * groups (that is the point of tags), untagged ones land in 未分类. The order follows the tag
+ * counts the server returned, so the busiest group is at the top; 未分类 always sits last.
+ */
+function tagGroupsOf(list) {
+  var order = [];
+  var byTag = {};
+  var addTo = function (tag, source) {
+    var key = tag;
+    if (!byTag[key]) { byTag[key] = []; order.push(key); }
+    byTag[key].push(source);
+  };
+  (state.tags || []).forEach(function (row) {
+    if (row && row.tag && !byTag[row.tag]) { byTag[row.tag] = []; order.push(row.tag); }
+  });
+  list.forEach(function (s) {
+    var tags = sourceTagsOf(s);
+    if (!tags.length) addTo(UNTAGGED_GROUP, s);
+    else tags.forEach(function (t) { addTo(t, s); });
+  });
+  // A tag that no longer has any source (or was never counted) must not leave an empty group.
+  var groups = order.filter(function (name) { return byTag[name].length > 0; }).map(function (name) {
+    return { name: name, sources: byTag[name] };
+  });
+  groups.sort(function (a, b) {
+    if (a.name === UNTAGGED_GROUP) return 1;
+    if (b.name === UNTAGGED_GROUP) return -1;
+    return 0;
+  });
+  return groups;
+}
+
 function renderNavSources() {
   var host = $('nav-sources');
   if (!host) return;
@@ -644,22 +921,54 @@ function renderNavSources() {
   if (state.search) {
     var q = state.search.toLowerCase();
     list = list.filter(function (s) {
-      return (String(s.name) + ' ' + String(s.location)).toLowerCase().indexOf(q) >= 0;
+      var hay = String(s.name) + ' ' + String(s.location) + ' ' + sourceTagsOf(s).join(' ');
+      return hay.toLowerCase().indexOf(q) >= 0;
     });
+  }
+  if (state.tagFilter) {
+    list = list.filter(function (s) { return hasTag(sourceTagsOf(s), state.tagFilter); });
   }
   if (!list.length) {
     host.innerHTML = '<p class="muted" style="font-size:11.5px;padding:4px 8px">没有匹配的代码源</p>';
     return;
   }
-  host.innerHTML = list.map(function (s) {
-    var tone = s.status === 'FAILED' ? 'danger' : 'brand';
-    var active = state.sourceId != null && s.id === state.sourceId;
-    return '<button class="nav-item' + (active ? ' active' : '') + '" data-source-id="' + s.id + '">' +
-      '<span class="row-icon ' + tone + '" style="width:22px;height:22px;border-radius:6px;margin:0">' + icon('i-git') + '</span>' +
-      '<span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(s.name) + '</span>' +
-      '<span class="count">' + esc(sourceTypeLabel(s.type)) + '</span>' +
+
+  var folds = readNavTagFolds();
+  var groups = tagGroupsOf(list);
+  host.innerHTML = groups.map(function (group) {
+    var folded = !!folds[group.name];
+    var head = '<button class="nav-group-title nav-tag-head" type="button" data-navtag-group="' + esc(group.name) + '"' +
+      ' aria-expanded="' + (folded ? 'false' : 'true') + '" title="' + (folded ? '展开' : '收起') + ' ' + esc(group.name) + '">' +
+      icon(folded ? 'i-chevron-right' : 'i-chevron-down') +
+      '<span class="nav-tag-name">' + esc(group.name) + '</span>' +
+      '<span class="nav-tag-count">' + group.sources.length + '</span>' +
       '</button>';
+    var items = folded ? '' : group.sources.map(function (s) {
+      var tone = s.status === 'FAILED' ? 'danger' : 'brand';
+      var active = state.sourceId != null && s.id === state.sourceId;
+      return '<button class="nav-item' + (active ? ' active' : '') + '" data-source-id="' + s.id + '">' +
+        '<span class="row-icon ' + tone + '" style="width:22px;height:22px;border-radius:6px;margin:0">' + icon('i-git') + '</span>' +
+        '<span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(s.name) + '</span>' +
+        '<span class="count">' + esc(sourceTypeLabel(s.type)) + '</span>' +
+        '</button>';
+    }).join('');
+    return '<div class="nav-tag-group">' + head + (items ? '<div class="nav-tag-items">' + items + '</div>' : '') + '</div>';
   }).join('');
+}
+
+/** The "筛选：<tag> 清除" strip shown above the source list while a tag filter is active. */
+function renderTagFilterBar() {
+  var host = $('src-filter-bar');
+  if (!host) return;
+  if (!state.tagFilter) {
+    host.innerHTML = '';
+    host.classList.add('hidden');
+    return;
+  }
+  host.classList.remove('hidden');
+  host.innerHTML = icon('i-filter') +
+    '<span>筛选：<b>' + esc(state.tagFilter) + '</b></span>' +
+    '<button class="btn btn-sm btn-ghost" type="button" data-tag-filter-clear>' + icon('i-x') + '清除</button>';
 }
 
 function renderNavCounts() {
@@ -801,14 +1110,19 @@ function renderOverview() {
     var rows = state.analyses.slice(0, 5);
     tl.innerHTML = rows.length ? rows.map(function (a, idx) {
       var done = a.status === 'DONE';
-      var tone = done ? (a.summary && a.summary.highRisk > 0 ? 'danger' : 'success') : '';
-      return '<div class="tl-item">' +
+      var failed = a.status === 'FAILED';
+      // A failed run is the most urgent event on this list, so it must not share the neutral dot
+      // (and blank meta) that an in-flight run gets.
+      var tone = done ? (a.summary && a.summary.highRisk > 0 ? 'danger' : 'success') : (failed ? 'danger' : '');
+      var meta = failed
+        ? '<div class="tl-meta tl-reason" title="' + esc(a.message || '') + '">' + esc(a.message || '未记录失败原因') + '</div>'
+        : '<div class="tl-meta">' + (a.summary ? ' · 影响 ' + (a.summary.impactedSymbols || 0) + ' · 高风险 ' + (a.summary.highRisk || 0) : '') + '</div>';
+      return '<div class="tl-item" data-analysis-id="' + a.id + '">' +
         '<div class="tl-rail"><div class="tl-dot ' + tone + '"></div>' + (idx < rows.length - 1 ? '<div class="tl-line"></div>' : '') + '</div>' +
         '<div class="tl-body">' +
           '<div class="tl-title">' + esc(a.sourceName || '分析 #' + a.id) +
             pill(STATUS_LABEL[a.status] || a.status, STATUS_TONE[a.status] || 'neutral') + '</div>' +
-          '<div class="tl-meta">' + esc(fmtTime(a.createdAt)) + ' · ' + esc(relTime(a.createdAt)) +
-            (a.summary ? ' · 影响 ' + (a.summary.impactedSymbols || 0) + ' · 高风险 ' + (a.summary.highRisk || 0) : '') + '</div>' +
+          '<div class="tl-meta">' + esc(fmtTime(a.createdAt)) + ' · ' + esc(relTime(a.createdAt)) + meta + '</div>' +
         '</div>' +
         '</div>';
     }).join('') : emptyBlock('还没有事件', '运行一次分析后，这里会出现时间线。');
@@ -863,13 +1177,19 @@ function analysesTable(rows) {
   if (!rows.length) return emptyBlock('暂无分析记录', '添加代码源后运行一次分析。');
   return rows.map(function (a) {
     var s = a.summary || {};
+    var failed = a.status === 'FAILED';
+    // A failed row has no scale to report, so the reason takes that cell: "对比 0 · 契约 0 · 影响 0"
+    // reads as a successful empty run and hides the one thing the row must communicate.
+    var metaCell = failed
+      ? '<div class="cell optional tr-reason" title="' + esc(a.message || '') + '">' + esc(a.message || '未记录失败原因') + '</div>'
+      : '<div class="cell optional" style="font-size:11.5px;color:var(--text-2)">对比 ' + (s.comparedPrograms || 0) +
+        ' · 契约 ' + (s.matchedContracts || 0) + ' · 影响 ' + (s.impactedSymbols || 0) + '</div>';
     return '<div class="tr tr-history" data-analysis-id="' + a.id + '">' +
       '<div class="cell mono" style="color:var(--text-2)">#' + a.id + '</div>' +
       '<div class="cell"><div style="font-weight:550">' + esc(a.sourceName || '') + '</div>' +
         '<div class="sub">' + esc(MODE_LABEL[a.mode] || a.mode || '') + ' · ' + esc(a.targetRef || '') + '</div></div>' +
       '<div class="cell optional">' + pill(STATUS_LABEL[a.status] || a.status, STATUS_TONE[a.status] || 'neutral', true) + '</div>' +
-      '<div class="cell optional" style="font-size:11.5px;color:var(--text-2)">对比 ' + (s.comparedPrograms || 0) +
-        ' · 契约 ' + (s.matchedContracts || 0) + ' · 影响 ' + (s.impactedSymbols || 0) + '</div>' +
+      metaCell +
       '<div class="cell optional" style="font-size:11.5px;color:var(--text-2)">' + esc(fmtTime(a.createdAt)) + '</div>' +
       '<div class="cell" style="text-align:right"><span class="row-arrow">' + icon('i-chevron-right') + '</span></div>' +
       '</div>';
@@ -878,26 +1198,63 @@ function analysesTable(rows) {
 
 /* ------------------------------------------------------------------ sources */
 
+/**
+ * One tag pill in the source list. A button, not a span, because clicking it filters: aria-pressed
+ * tells assistive tech which tag is the active filter.
+ */
+function tagPill(tag, active) {
+  return '<button class="pill brand tag-pill" type="button" data-tag-filter="' + esc(tag) + '"' +
+    ' aria-pressed="' + (active ? 'true' : 'false') + '" title="按标签筛选 ' + esc(tag) + '">' +
+    esc(tag) + '</button>';
+}
+
+/** The tags column of a source row; an em dash keeps the column from collapsing when empty. */
+function sourceTagCell(s) {
+  var tags = sourceTagsOf(s);
+  if (!tags.length) return '<span class="tag-empty">未分类</span>';
+  return '<div class="tag-cell">' + tags.map(function (t) {
+    return tagPill(t, state.tagFilter === t);
+  }).join('') + '</div>';
+}
+
 function renderSourcesPage() {
   var host = $('src-recent');
   if (!host) return;
+  renderTagFilterBar();
+  var list = state.sources;
+  if (state.tagFilter) {
+    list = list.filter(function (s) { return hasTag(sourceTagsOf(s), state.tagFilter); });
+  }
   if (!state.sources.length) {
     host.innerHTML = emptyBlock('还没有代码源', '在上方表单中添加第一个代码源。');
     return;
   }
-  host.innerHTML = state.sources.map(function (s) {
+  if (!list.length) {
+    host.innerHTML = emptyBlock('这个标签下没有代码源', '清除筛选后可以查看全部代码源。');
+    return;
+  }
+  host.innerHTML = list.map(function (s) {
     var last = state.analyses.filter(function (a) { return a.sourceId === s.id; })[0];
     var status = last ? last.status : 'PENDING';
-    return '<div class="tr tr-history" data-source-id="' + s.id + '">' +
+    // MISSING comes from the server (an import whose directory does not exist on this machine),
+    // and it is about the source, not about a run, so it leads the status cell.
+    var missing = s.status === 'MISSING';
+    return '<div class="tr tr-sources" data-source-id="' + s.id + '">' +
       '<div class="cell mono" style="color:var(--text-2)">' + esc(sourceTypeLabel(s.type)) + '</div>' +
       '<div class="cell"><div style="font-weight:550">' + esc(s.name) + '</div>' +
-        '<div class="sub mono">' + esc(s.location) + '</div></div>' +
-      '<div class="cell optional">' + pill(STATUS_LABEL[status] || status, STATUS_TONE[status] || 'neutral', true) + '</div>' +
+        '<div class="sub mono">' + esc(s.location) + '</div>' +
+        (missing && s.message ? '<div class="sub danger-text">' + esc(s.message) + '</div>' : '') + '</div>' +
+      '<div class="cell optional">' + (missing
+        ? pill('目录缺失', 'danger', true)
+        : pill(STATUS_LABEL[status] || status, STATUS_TONE[status] || 'neutral', true)) + '</div>' +
+      '<div class="cell optional">' + sourceTagCell(s) + '</div>' +
       '<div class="cell optional" style="font-size:11.5px;color:var(--text-2)">' +
         (last ? '对比 ' + ((last.summary && last.summary.comparedPrograms) || 0) +
           ' · 影响 ' + ((last.summary && last.summary.impactedSymbols) || 0) : '尚未分析') + '</div>' +
       '<div class="cell optional" style="font-size:11.5px;color:var(--text-2)">' + esc(relTime(s.lastSyncedAt)) + '</div>' +
       '<div class="cell actions">' +
+        '<button class="icon-btn row-edit" data-edit-source="' + s.id + '" title="编辑代码源" aria-label="编辑代码源 ' + esc(s.name) + '">' +
+          icon('i-edit') + '</button>' +
         '<button class="icon-btn row-delete" data-delete-source="' + s.id + '" title="删除代码源" aria-label="删除代码源 ' + esc(s.name) + '">' +
           icon('i-trash') + '</button>' +
         '<span class="row-arrow">' + icon('i-chevron-right') + '</span>' +
@@ -1207,16 +1564,25 @@ function renderAnalysis() {
   var setHtml = function (id, v) { var el = $(id); if (el) el.innerHTML = v; };
 
   var pickedSource = currentSource();
+  var selected = selectedAnalysis();
   renderAnalysisProgress();
-  setText('an-crumb-source', report ? report.sourceName : (pickedSource ? pickedSource.name : '—'));
-  setText('an-title', report ? '分析 #' + state.analysisId + ' · ' + (MODE_LABEL[report.mode] || report.mode) : '分析详情');
+  setText('an-crumb-source', report ? report.sourceName
+    : (selected && selected.sourceName) || (pickedSource ? pickedSource.name : '—'));
+  setText('an-title', report ? '分析 #' + state.analysisId + ' · ' + (MODE_LABEL[report.mode] || report.mode)
+    : (selected ? '分析 #' + selected.id : '分析详情'));
+
+  // A page with no report has three distinct meanings, and conflating them is what made a failed
+  // run look like a source that was never analysed: the user picked a real record, and the page
+  // answered "this source has no records".
+  var failed = !!(selected && selected.status === 'FAILED');
+  var running = !!(selected && (selected.status === 'RUNNING' || selected.status === 'PENDING'));
 
   // One page-level empty state beats five identical per-card ones.
   var emptyHost = $('an-empty');
   var body = $('an-body');
-  if (emptyHost) emptyHost.classList.toggle('hidden', !!report);
+  if (emptyHost) emptyHost.classList.toggle('hidden', !!report || failed || running);
   if (body) body.classList.toggle('hidden', !report);
-  if (!report && emptyHost) {
+  if (!report && !failed && !running && emptyHost) {
     var emptySub = $('an-empty-sub');
     if (emptySub) {
       emptySub.textContent = pickedSource
@@ -1224,15 +1590,30 @@ function renderAnalysis() {
         : '添加代码源并运行一次扫描后，这里会展示变更清单、其他程序影响与风险构成。';
     }
   }
+  // The pill must follow the record on screen, not merely "is there a report": a failed run is a
+  // real status and reading "已完成" next to it is exactly the confusion being fixed here.
   var anState = $('an-state');
   if (anState) {
-    anState.textContent = report ? '已完成' : (state.liveAnalysis ? '分析中' : '暂无数据');
+    var status = report ? 'DONE' : (selected ? selected.status : null);
+    anState.textContent = STATUS_LABEL[status] || '暂无数据';
+    anState.className = 'pill ' + (STATUS_TONE[status] || 'neutral');
+    anState.classList.toggle('hidden', !status);
   }
-  setHtml('an-sub', report
-    ? esc(report.baseLabel || '') + ' → ' + esc(report.headLabel || '') + ' <span class="sep">·</span> ' + esc(fmtTime(report.generatedAt))
-    : '—');
+  // A run with no report still knows when it happened and how long it took, so the header should
+  // not blank out: "— · —" above a real failure reads like missing data rather than a stopped run.
+  var subHtml = '—';
+  if (report) {
+    subHtml = esc(report.baseLabel || '') + ' → ' + esc(report.headLabel || '')
+      + ' <span class="sep">·</span> ' + esc(fmtTime(report.generatedAt));
+  } else if (selected) {
+    subHtml = esc(MODE_LABEL[selected.mode] || selected.mode || '')
+      + (selected.targetRef ? ' <span class="sep">·</span> ' + esc(selected.targetRef) : '')
+      + ' <span class="sep">·</span> ' + esc(fmtTime(selected.createdAt));
+  }
+  setHtml('an-sub', subHtml);
   setText('an-files', report ? fmtNum(s.parsedFiles) : '—');
-  setText('an-duration', report ? fmtDuration(s.indexMillis) : '—');
+  setText('an-duration', report ? fmtDuration(s.indexMillis)
+    : (selected && selected.durationMs != null ? fmtDuration(selected.durationMs) : '—'));
 
   var statsHost = $('an-stats');
   if (statsHost) {
@@ -1291,11 +1672,21 @@ function renderAnalysis() {
   }
 
   var blind = (report && report.blindSpots) || [];
-  setHtml('an-blindspots', blind.length ? blind.slice(0, 30).map(function (b) {
+  var skipped = (report && report.skippedFiles) || [];
+  // A skipped file is a blind spot of a different kind: the analysis is not uncertain about it,
+  // it simply never read it. Listing it above the unresolved calls keeps the two apart, because
+  // "we could not resolve this" and "we never looked" need different follow-up.
+  var skippedRows = skipped.slice(0, 30).map(function (sk) {
+    var size = sk.size < 0 ? '大小未知' : (sk.size / (1024 * 1024)).toFixed(1) + ' MB';
+    return '<div class="ev-row" style="margin-bottom:6px"><div class="ev-type">文件过大未索引</div>' +
+      '<div class="ev-main">' + esc(shortFile(sk.path)) + '</div>' +
+      '<div class="ev-meta">' + esc(size) + ' — 超过单文件读取上限，未参与分析</div></div>';
+  }).join('');
+  setHtml('an-blindspots', (skippedRows + (blind.length ? blind.slice(0, 30).map(function (b) {
     return '<div class="ev-row" style="margin-bottom:6px"><div class="ev-type">未解析调用</div>' +
       '<div class="ev-main">' + esc(b.module) + ' · ' + esc(shortFile(b.file)) + ':' + b.line + '</div>' +
       '<div class="ev-meta">' + esc(b.expression) + ' — ' + esc(b.reason) + '</div></div>';
-  }).join('') : (report
+  }).join('') : '')) || (report
     ? '<div class="callout"><svg><use href="#i-check-circle"/></svg><div>跨程序扫描没有产生盲区记录；本程序内部调用不在本次扫描范围。</div></div>'
     : emptyBlockForSource()));
 
@@ -1310,13 +1701,29 @@ function renderAnalysis() {
 }
 
 /**
+ * Human label for the stage a failed run died in.
+ *
+ * The server overwrites progress_stage with "FAILED" when a run ends badly, so the stage itself is
+ * gone by the time the UI reads it. What survives is the completed/skipped lists, and the first
+ * step missing from both is the one that was interrupted.
+ */
+function failedStageLabel(completed, skipped) {
+  var reached = function (s) { return completed.indexOf(s.id) >= 0 || skipped.indexOf(s.id) >= 0; };
+  var pending = PROGRESS_STEPS.filter(function (s) { return !reached(s); })[0];
+  return pending ? '在「' + pending.title + '」阶段' : '分析进程';
+}
+
+/**
  * Live analysis progress. The server persists the real stage and percentage, so this panel remains
  * correct after a reload and never advances on a client-side timer.
  */
 function renderAnalysisProgress() {
   var host = $('an-progress-card');
   if (!host) return;
-  var live = state.liveAnalysis;
+  // Fall back to the record on screen: after a reload there is no poll running, and a failed run
+  // must still explain itself without anyone having watched it happen.
+  var selected = selectedAnalysis();
+  var live = state.liveAnalysis || (selected && selected.status !== 'DONE' ? selected : null);
   var active = live && (live.status === 'RUNNING' || live.status === 'PENDING');
   var failed = live && live.status === 'FAILED';
   host.classList.toggle('hidden', !(active || failed));
@@ -1325,31 +1732,81 @@ function renderAnalysisProgress() {
   var percent = Math.max(0, Math.min(100, Number(live.progressPercent) || 0));
   var stage = live.progressStage || 'PENDING';
   var label = live.progressLabel || (live.status === 'PENDING' ? '排队中' : '分析中');
+  // progressDetail is overwritten by finishAnalysis() with the failure message, so it is the
+  // reason when the run failed and the currently-parsed file while it is running.
   var detail = live.progressDetail || '';
+  var reason = live.message || (failed ? detail : '');
   var completed = live.progressCompleted || [];
   var skipped = live.progressSkipped || [];
 
+  var titleEl = $('an-progress-title');
+  if (titleEl) titleEl.textContent = failed ? '分析失败' : '分析进度';
+
   var pillEl = $('an-progress-pill');
-  if (pillEl) pillEl.textContent = failed ? '失败' : percent + '% · ' + label;
+  if (pillEl) {
+    pillEl.textContent = failed ? '失败' : percent + '% · ' + label;
+    pillEl.className = 'pill ' + (failed ? 'danger' : 'brand');
+  }
+
+  // The failing stage belongs in the one-line sub, where it reads as "what was happening when it
+  // died"; the reason itself goes in the block below, because it is often a long message.
   var detailEl = $('an-progress-detail');
-  if (detailEl) detailEl.textContent = detail || '正在处理…';
+  if (detailEl) {
+    detailEl.textContent = failed
+      ? failedStageLabel(completed, skipped) + '失败'
+        + (live.durationMs != null ? ' · 耗时 ' + fmtDuration(live.durationMs) : '')
+      : (detail || '正在处理…');
+  }
+  // The percentage alone reads as "nothing is happening" whenever the server has no movement to
+  // report, so say what the numbers mean. The step list below names the stages; this line names
+  // the unit being worked through.
+  var stageLabelEl = $('an-progress-stage');
+  if (stageLabelEl) {
+    var doneSteps = completed.length;
+    stageLabelEl.textContent = failed
+      ? ''
+      : '第 ' + Math.min(doneSteps + 1, PROGRESS_STEPS.length) + ' / ' + PROGRESS_STEPS.length + ' 步'
+        + (label && label !== '分析中' ? ' · ' + label : '');
+    stageLabelEl.classList.toggle('hidden', !!failed);
+  }
+
+  var failureHost = $('an-progress-failure');
+  if (failureHost) {
+    failureHost.classList.toggle('hidden', !failed);
+    var reasonEl = $('an-progress-failure-reason');
+    if (reasonEl) {
+      reasonEl.textContent = failed ? (reason || '服务端没有返回失败原因。') : '';
+    }
+  }
+
   var bar = $('an-progress-bar');
   if (bar) {
     bar.style.width = (failed ? 0 : percent) + '%';
     bar.className = failed ? 'danger' : '';
   }
+  // The "run in background" affordance is meaningless once the run has stopped.
+  var bgBtn = $('an-progress-background');
+  if (bgBtn) bgBtn.classList.toggle('hidden', !!failed);
+
+  // The interrupted step is the first one neither completed nor skipped. progress_stage is
+  // "FAILED" by then, so matching on stage would mark nothing and leave the stepper looking like a
+  // run that simply stopped between steps.
+  var failedStepId = failed ? (PROGRESS_STEPS.filter(function (s) {
+    return completed.indexOf(s.id) < 0 && skipped.indexOf(s.id) < 0;
+  })[0] || {}).id : null;
 
   var stepsHost = $('an-progress-steps');
   if (stepsHost) {
     stepsHost.innerHTML = PROGRESS_STEPS.map(function (step, idx) {
       var isDone = completed.indexOf(step.id) >= 0;
       var isSkipped = skipped.indexOf(step.id) >= 0;
-      var isActive = !isDone && !isSkipped && step.id === stage;
-      var tone = failed && step.id === stage ? 'danger' : (isDone ? 'success' : (isSkipped ? 'neutral' : (isActive ? 'brand' : '')));
+      var isFailed = step.id === failedStepId;
+      var isActive = !isDone && !isSkipped && !isFailed && step.id === stage;
+      var tone = isFailed ? 'danger' : (isDone ? 'success' : (isSkipped ? 'neutral' : (isActive ? 'brand' : '')));
       return '<div class="step ' + tone + '">' +
-        '<div class="step-dot">' + (isDone ? icon('i-check') : (isSkipped ? '—' : (idx + 1))) + '</div>' +
+        '<div class="step-dot">' + (isDone ? icon('i-check') : (isSkipped ? '—' : (isFailed ? icon('i-x') : (idx + 1)))) + '</div>' +
         '<div class="step-body"><div class="step-title">' + esc(step.title) + '</div>' +
-          '<div class="step-meta">' + esc(isSkipped ? '已跳过' : (isActive ? label : step.meta)) + '</div></div>' +
+          '<div class="step-meta">' + esc(isSkipped ? '已跳过' : (isFailed ? '失败于此' : (isActive ? label : step.meta))) + '</div></div>' +
         '</div>';
     }).join('');
   }
@@ -1726,9 +2183,174 @@ var SOURCE_LABEL = {
 
 function updateState() {
   if (!state.update) {
-    state.update = { data: null, error: null, checking: false, busy: false, expanded: {}, pendingMsg: null };
+    state.update = {
+      data: null, error: null, checking: false, busy: false, expanded: {}, pendingMsg: null,
+      // The version ledger is a separate, lazily fetched resource: see loadUpdateHistory().
+      history: { open: false, loaded: false, loading: false, error: null, data: null }
+    };
   }
   return state.update;
+}
+
+/* --------------------------------------------------------- update notice */
+
+/**
+ * The version the user silenced, or null. Only the version string is stored: treating the whole
+ * release list as "seen" would keep quiet about later releases too, which is not what
+ * 「忽略此版本」 promises.
+ */
+function skippedUpdateVersion() {
+  try { return localStorage.getItem(UPDATE_SKIP_KEY) || null; } catch (e) { return null; }
+}
+
+function skipUpdateVersion(version) {
+  try { localStorage.setItem(UPDATE_SKIP_KEY, version); } catch (e) { /* storage blocked: the banner just stays */ }
+}
+
+/**
+ * The notice state, in one place. Three shapes matter:
+ *
+ *   installable  — a newer release that really has a jar: this is the only case that should
+ *                  lead the user to the download button;
+ *   tagOnly      — a newer tag with nothing attached: worth saying once, but pointing the user
+ *                  at "查看" would only walk them into a version they cannot install;
+ *   none         — nothing new, or the user already silenced this exact version.
+ */
+function updateNotice() {
+  var d = updateState().data;
+  if (!d) return { kind: 'none' };
+  var installable = !!(d.installableUpdateAvailable && d.latestInstallableVersion);
+  var version = installable ? d.latestInstallableVersion : (d.latestVersion || null);
+  if (!version) return { kind: 'none' };
+  var newer = installable || !!d.updateAvailable;
+  if (!newer) return { kind: 'none' };
+  if (version === skippedUpdateVersion()) return { kind: 'none' };
+  return { kind: installable ? 'installable' : 'tagOnly', version: version };
+}
+
+/**
+ * One place that decides whether the banner and the rail dot are visible, called only when the
+ * payload changes (boot, check now, loadUpdate) — never from renderAll(), because a poll tick
+ * must not bring back a banner the user just closed.
+ */
+function renderUpdateNotice() {
+  var d = updateState().data;
+  var notice = updateNotice();
+  var pending = notice.kind !== 'none';
+  var banner = $('update-banner');
+  if (banner) {
+    // Shown on every page including settings: the banner is the one place that states the
+    // version at a glance, and the settings card below it may be scrolled out of view.
+    var show = pending && notice.version !== state.updateBannerClosed;
+    banner.classList.toggle('hidden', !show);
+    banner.classList.toggle('tag-only', notice.kind === 'tagOnly');
+    if (show) {
+      var ver = $('update-banner-version');
+      var cur = $('update-banner-current');
+      var lead = $('update-banner-lead');
+      var tail = $('update-banner-tail');
+      var view = banner.querySelector('[data-update-banner-view]');
+      if (ver) ver.textContent = notice.version;
+      if (cur) cur.textContent = d.currentVersion || '—';
+      // A tag-only notice is informational: no "查看" button, because the card cannot offer a
+      // download for it. The 忽略 action stays, so the notice can still be silenced.
+      if (lead) lead.textContent = notice.kind === 'tagOnly' ? '发现更新的标签 ' : '发现新版本 ';
+      if (tail) {
+        tail.textContent = notice.kind === 'tagOnly'
+          ? '，但该版本没有可下载的 jar'
+          : '（当前 ' + (d.currentVersion || '—') + '）';
+      }
+      if (view) view.classList.toggle('hidden', notice.kind !== 'installable');
+    }
+  }
+  var dot = $('rail-update-dot');
+  if (dot) dot.classList.toggle('hidden', !pending);
+}
+
+/**
+ * "查看" goes to the settings card and flashes it. The card lives inside the settings page, so
+ * the page has to be switched first; the flash class is dropped on a timer (and re-triggered by
+ * a forced reflow) so a second click replays the highlight instead of doing nothing visible.
+ */
+function showUpdateCard() {
+  go('settings');
+  renderSettings();
+  var card = $('card-update');
+  if (!card) return;
+  card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  card.classList.remove('flash');
+  void card.offsetWidth;
+  card.classList.add('flash');
+  window.setTimeout(function () { card.classList.remove('flash'); }, 1700);
+}
+
+/** Closing is "not now" for this page load; only 忽略此版本 is remembered. */
+function closeUpdateBanner() {
+  var notice = updateNotice();
+  state.updateBannerClosed = notice.version || '';
+  renderUpdateNotice();
+}
+
+/**
+ * Silences the version the notice is about. For a tag-only notice that is the tag, not the
+ * installable version: those are different strings, and silencing the wrong one would let the
+ * notice reappear on the next payload refresh.
+ */
+function ignoreUpdateVersion() {
+  var notice = updateNotice();
+  if (notice.kind === 'none' || !notice.version) return;
+  skipUpdateVersion(notice.version);
+  state.updateBannerClosed = null;
+  renderUpdateNotice();
+  toast('已忽略 ' + notice.version + '，可在设置页随时查看', 'success');
+}
+
+/**
+ * Boot-time check so the banner and the dot exist before anyone opens settings. Failures are
+ * swallowed: a version check is background information and a toast on every offline start is
+ * noise. updateLoaded stays false on failure so the settings card still retries once.
+ */
+async function primeUpdateNotice() {
+  var s = updateState();
+  try {
+    s.data = await api('/update');
+    s.error = null;
+    state.updateLoaded = true;
+  } catch (e) {
+    s.error = e && e.message ? e.message : String(e);
+  }
+  // Silent on purpose: a version check is background information, and a toast on every offline
+  // start would be noise. The settings card still shows the error when the user goes there.
+  renderUpdateNotice();
+  if (state.page === 'settings') renderUpdateBody();
+}
+
+/**
+ * Orders two version strings the way the server does: numeric segments first, a pre-release last.
+ *
+ * The list used to be ordered by publish date, which fails for the one case this feature now
+ * produces: a tags-only entry has no publishedAt, so the newest version sank to the bottom of a
+ * list sorted newest-first. A version is the identity of a release; it is always present and
+ * always comparable, so it is the honest sort key.
+ */
+function compareVersions(a, b) {
+  var pa = String(a == null ? "" : a).replace(/^v/i, "").split("-");
+  var pb = String(b == null ? "" : b).replace(/^v/i, "").split("-");
+  var na = pa[0].split(".");
+  var nb = pb[0].split(".");
+  var len = Math.max(na.length, nb.length);
+  for (var i = 0; i < len; i++) {
+    var x = parseInt(na[i], 10);
+    var y = parseInt(nb[i], 10);
+    if (isNaN(x)) x = 0;
+    if (isNaN(y)) y = 0;
+    if (x !== y) return x - y;
+  }
+  // A pre-release sorts below its release: 1.0.0-rc1 < 1.0.0.
+  if (pa.length === 1 && pb.length > 1) return 1;
+  if (pa.length > 1 && pb.length === 1) return -1;
+  if (pa.length > 1 && pb.length > 1) return pa[1] < pb[1] ? -1 : pa[1] > pb[1] ? 1 : 0;
+  return 0;
 }
 
 function fmtBytes(bytes) {
@@ -1786,19 +2408,30 @@ function applyBlockedReason(d) {
 function renderUpdateSummary(d) {
   var s = updateState();
   var version = d.currentVersion || '未知';
+  // installableUpdateAvailable is the honest signal: "a newer release exists" and "you can
+  // actually install it" are different facts once tag-only versions are listed.
+  var installable = !!(d.installableUpdateAvailable && d.latestInstallableVersion);
   var right;
-  if (d.updateAvailable && d.latestVersion) {
-    right = pill('有新版本 ' + d.latestVersion, 'brand', true);
+  if (installable) {
+    right = pill('有新版本 ' + d.latestInstallableVersion, 'brand', true);
+  } else if (d.updateAvailable && d.latestVersion) {
+    right = pill('有更新的标签，但没有可下载的 jar', 'warning', true);
   } else if (d.latestVersion) {
     right = pill('已是最新', 'success', true);
   } else {
     right = pill('尚未获取版本信息', 'neutral');
   }
   var rows = [
-    kvRow('最新版本', d.latestVersion || '—'),
-    kvRow('上次检查', d.checkedAt ? fmtTime(d.checkedAt) : '尚未检查'),
-    kvRow('检查来源', SOURCE_LABEL[d.source] || d.source || '—')
+    kvRow('最新版本', d.latestVersion || '—')
   ];
+  // Only worth a second row when the two differ, otherwise it just repeats the line above.
+  if (d.latestInstallableVersion && d.latestInstallableVersion !== d.latestVersion) {
+    rows.push(kvRow('最新可安装版本', d.latestInstallableVersion));
+  } else if (!d.latestInstallableVersion && d.latestVersion) {
+    rows.push(kvRow('最新可安装版本', '没有可下载的 jar'));
+  }
+  rows.push(kvRow('上次检查', d.checkedAt ? fmtTime(d.checkedAt) : '尚未检查'));
+  rows.push(kvRow('检查来源', SOURCE_LABEL[d.source] || d.source || '—'));
   if (d.repo) rows.push(kvRow('发布仓库', d.repo));
   if (d.checkIntervalMinutes) rows.push(kvRow('自动检查间隔', d.checkIntervalMinutes + ' 分钟'));
 
@@ -1857,21 +2490,47 @@ function renderReleaseRow(release, idx) {
   if (release.current) pills.push(pill('当前版本', 'brand'));
   if (release.prerelease) pills.push(pill('预发布', 'warning'));
   if (release.newer && !release.current) pills.push(pill('可更新', 'success'));
+  // A tag-only release has no GitHub release object behind it, so there are no notes and no
+  // assets. Saying so beats an expandable panel that turns out to be empty.
+  if (release.fromTag) pills.push(pill('仅标签', 'neutral'));
+  if (release.downloaded) pills.push(pill('已下载', 'success'));
 
-  var actions = '<button class="btn btn-sm btn-ghost" data-update-notes="' + esc(key) + '" ' +
-    'aria-expanded="' + (open ? 'true' : 'false') + '" aria-label="' +
-    (open ? '收起 ' : '查看 ') + esc(release.version || '') + ' 的更新说明">' +
-    icon(open ? 'i-chevron-down' : 'i-chevron-right') + (open ? '收起说明' : '查看说明') + '</button>';
-
-  if (jar) {
-    var downloaded = s.data && s.data.pending && s.data.pending.version === release.version;
-    actions += '<button class="btn btn-sm" data-update-download="' + esc(release.version || '') + '"' +
-      (s.busy || (s.data && s.data.busy) ? ' disabled' : '') +
-      ' title="下载 ' + esc(jar.name) + '（' + esc(fmtBytes(jar.size)) + '）" aria-label="下载版本 ' + esc(release.version || '') + '">' +
-      icon('i-upload') + (downloaded ? '重新下载' : '下载此版本') + '</button>';
+  var actions = '';
+  // Nothing to expand for a tag-only entry: the notes panel would only ever say "没有填写".
+  if (!release.fromTag) {
+    actions += '<button class="btn btn-sm btn-ghost" data-update-notes="' + esc(key) + '" ' +
+      'aria-expanded="' + (open ? 'true' : 'false') + '" aria-label="' +
+      (open ? '收起 ' : '查看 ') + esc(release.version || '') + ' 的更新说明">' +
+      icon(open ? 'i-chevron-down' : 'i-chevron-right') + (open ? '收起说明' : '查看说明') + '</button>';
   }
 
-  var notes = open
+  // downloadable is the server's verdict on whether a jar really exists for this version. A
+  // tag-only release has no assets at all, so rendering the button from jarAsset() alone would
+  // offer a click that can only fail. The jarAsset() test stays as the fallback for payloads
+  // from a server that predates the flag.
+  var canDownload = release.downloadable === undefined ? !!jar : !!release.downloadable;
+  if (canDownload) {
+    // release.downloaded is the server's ledger; the pending jar is the older single-slot signal.
+    // Either one means "you already have this file", which is what the button label reflects.
+    var downloaded = !!release.downloaded ||
+      !!(s.data && s.data.pending && s.data.pending.version === release.version);
+    var dlTitle = jar
+      ? '下载 ' + jar.name + '（' + fmtBytes(jar.size) + '）'
+      : '下载版本 ' + (release.version || '');
+    actions += '<button class="btn btn-sm" data-update-download="' + esc(release.version || '') + '"' +
+      (s.busy || (s.data && s.data.busy) ? ' disabled' : '') +
+      ' title="' + esc(dlTitle) + '" aria-label="' +
+      (downloaded ? '重新下载版本 ' : '下载版本 ') + esc(release.version || '') + '">' +
+      icon('i-upload') + (downloaded ? '重新下载' : '下载此版本') + '</button>';
+  } else {
+    // Nothing to click, but the reason has to stay readable: a pill plus a title, no dead button.
+    var why = release.fromTag
+      ? '这个版本只有 git tag，没有可下载的 jar 附件'
+      : '这个版本没有可下载的 jar 附件';
+    actions += '<span class="upd-nodl" title="' + esc(why) + '">' + pill('不可下载', 'neutral') + '</span>';
+  }
+
+  var notes = open && !release.fromTag
     ? '<div class="release-notes">' + renderNotes(release.notes) + '</div>' +
       (release.url ? '<div class="upd-notes-foot"><a href="' + esc(release.url) + '" target="_blank" rel="noopener noreferrer">' +
         '在 GitHub 上查看这个版本</a></div>' : '')
@@ -1887,10 +2546,114 @@ function renderReleaseRow(release, idx) {
         '<span>' + esc(release.publishedAt ? fmtTime(release.publishedAt) : '发布时间未知') + '</span>' +
         (release.name && release.name !== release.version ? '<span class="sep"></span><span>' + esc(release.name) + '</span>' : '') +
         (jar ? '<span class="sep"></span><span>' + esc(jar.name) + ' · ' + esc(fmtBytes(jar.size)) + '</span>' : '') +
+        (release.downloadedAt ? '<span class="sep"></span><span>下载于 ' + esc(fmtTime(release.downloadedAt)) + '</span>' : '') +
       '</div>' +
+      (release.fromTag
+        ? '<div class="rel-note">这个版本只有 git tag，没有发布说明/附件。</div>'
+        : '') +
     '</div>' +
     '<div class="rel-actions">' + actions + '</div>' +
     '</div>' + notes;
+}
+
+/* ------------------------------------------------------ local version ledger */
+
+/**
+ * The ledger is fetched on demand only. Entering the settings page happens on every poll tick
+ * while it is open, and the ledger changes only when a check or a download happens, so eager
+ * loading would cost a request per tick for data that cannot have moved.
+ */
+async function loadUpdateHistory() {
+  var h = updateState().history;
+  h.loading = true;
+  h.error = null;
+  renderUpdateBody();
+  try {
+    h.data = await api('/update/history');
+    h.loaded = true;
+  } catch (e) {
+    // The endpoint may be missing on an older server; a failed ledger must not break the card.
+    h.error = e && e.message ? e.message : String(e);
+    h.data = null;
+    h.loaded = false;
+  } finally {
+    h.loading = false;
+    renderUpdateBody();
+  }
+}
+
+function toggleUpdateHistory() {
+  var h = updateState().history;
+  h.open = !h.open;
+  if (h.open && !h.loaded && !h.loading) { loadUpdateHistory(); return; }
+  renderUpdateBody();
+}
+
+function historyTime(iso) {
+  if (!iso) return '—';
+  return '<span title="' + esc(iso) + '">' + esc(fmtTime(iso)) + '</span>';
+}
+
+/** One ledger entry: version plus the five lifecycle stamps the backend tracks. */
+function renderHistoryRow(v) {
+  var cells = [
+    '<div class="cell"><span class="sym">' + esc(v.version || '—') + '</span>' +
+      (v.fromTag ? ' ' + pill('仅标签', 'neutral') : '') + '</div>',
+    '<div class="cell">' + historyTime(v.firstSeenAt) + '</div>',
+    '<div class="cell">' + historyTime(v.lastSeenAt) + '</div>',
+    '<div class="cell">' + historyTime(v.downloadedAt) + '</div>',
+    '<div class="cell">' + historyTime(v.appliedAt) + '</div>',
+    '<div class="cell">' + historyTime(v.rolledBackAt) + '</div>'
+  ];
+  return '<div class="tr tr-ledger">' + cells.join('') + '</div>';
+}
+
+function renderUpdateHistory() {
+  var h = updateState().history;
+  var head = '<div class="upd-ledger-head">' +
+    '<button class="btn btn-sm btn-ghost" data-update-history aria-expanded="' + (h.open ? 'true' : 'false') + '"' +
+    ' aria-label="' + (h.open ? '收起' : '展开') + '本机版本记录">' +
+    icon(h.open ? 'i-chevron-down' : 'i-chevron-right') + (h.open ? '收起本机版本记录' : '展开本机版本记录') +
+    '</button>' +
+    (h.data && h.data.count ? '<span class="upd-ledger-count">' + esc(String(h.data.count)) + ' 个版本</span>' : '') +
+    '</div>';
+  if (!h.open) return head;
+
+  var body;
+  if (h.loading) {
+    body = '<div class="upd-loading"><span class="spinner"></span>正在读取本机版本记录…</div>';
+  } else if (h.error) {
+    body = '<div class="callout warning" style="margin-bottom:10px">' + icon('i-alert') + '<div>' +
+      '<strong>无法读取本机版本记录</strong><br/>' + esc(h.error) + '</div></div>' +
+      '<div style="margin-top:10px"><button class="btn btn-sm" data-update-history-retry>' + icon('i-refresh') + '重试</button></div>';
+  } else if (!h.data || !(h.data.versions || []).length) {
+    body = emptyBlock('本机还没有版本记录', '每次检查更新后，这里会记录见过、下载过、应用过的版本。');
+  } else {
+    body = '<div class="upd-ledger-scroll"><div class="table">' +
+      '<div class="tr tr-ledger head">' +
+        '<div class="cell">版本</div><div class="cell">首次见到</div><div class="cell">最近见到</div>' +
+        '<div class="cell">下载过</div><div class="cell">应用过</div><div class="cell">回滚过</div>' +
+      '</div>' +
+      h.data.versions.map(renderHistoryRow).join('') +
+      '</div></div>' +
+      '<div class="upd-ledger-foot">' +
+        (h.data.firstSeenAt ? '<span>最早记录 ' + esc(fmtTime(h.data.firstSeenAt)) + '</span>' : '') +
+        (h.data.lastUpdatedAt ? '<span>账本更新于 ' + esc(fmtTime(h.data.lastUpdatedAt)) + '</span>' : '') +
+        (h.data.file ? '<span class="mono">' + esc(h.data.file) + '</span>' : '') +
+      '</div>';
+  }
+  return head + '<div class="upd-ledger-body">' + body + '</div>';
+}
+
+/** Non-fatal problems from the source (e.g. the tag API failed): shown, but the card still works. */
+function renderUpdateWarnings(d) {
+  var warnings = (d && d.warnings) || [];
+  if (!warnings.length) return '';
+  return '<div class="callout warning" style="margin-bottom:14px">' + icon('i-alert') + '<div>' +
+    '<strong>版本信息可能不完整</strong>' +
+    '<ul class="upd-warn-list">' + warnings.map(function (w) {
+      return '<li>' + esc(w) + '</li>';
+    }).join('') + '</ul></div></div>';
 }
 
 function renderUpdateBody() {
@@ -1933,12 +2696,13 @@ function renderUpdateBody() {
     return;
   }
 
+  // The version number, not the publish date, is what orders this list. A tags-only entry has no
+  // publishedAt at all (the tags API does not report one), so sorting by date buried the newest
+  // version at the bottom - exactly where nobody looks for it. The server already returns the list
+  // newest-first by version, and re-sorting by date only existed to defend against an unordered
+  // payload; a version comparison keeps that guarantee without losing the tag-only entries.
   var releases = (d.releases || []).slice().sort(function (a, b) {
-    var ta = a.publishedAt ? new Date(a.publishedAt).getTime() : 0;
-    var tb = b.publishedAt ? new Date(b.publishedAt).getTime() : 0;
-    if (isNaN(ta)) ta = 0;
-    if (isNaN(tb)) tb = 0;
-    return tb - ta;
+    return compareVersions(b.version, a.version);
   });
 
   var html = '';
@@ -1964,11 +2728,13 @@ function renderUpdateBody() {
       '<div class="restart-cmd mono">Windows：先运行 <code>stop.bat</code>，再运行 <code>start.bat</code></div>' +
       '</div></div>';
   }
+  html += renderUpdateWarnings(d);
   html += renderUpdateSummary(d);
   html += '<div class="section-label">历史版本</div>';
   html += releases.length
     ? '<div class="rel-list">' + releases.map(renderReleaseRow).join('') + '</div>'
     : emptyBlock('没有版本记录', '检查一次后这里会列出 GitHub 上发布的版本。');
+  html += '<div class="section-label">本机版本记录</div>' + renderUpdateHistory();
   host.innerHTML = html;
 }
 
@@ -1986,9 +2752,16 @@ async function loadUpdate() {
     var data = await api('/update');
     s.data = data;
     s.error = null;
+    // The ledger moves whenever a download or an apply lands, so a refresh of the payload is
+    // also the moment to drop the cached ledger; it is re-fetched only if it is on screen.
+    if (s.history.loaded) {
+      s.history.loaded = false;
+      if (s.history.open) loadUpdateHistory();
+    }
   } catch (e) {
     s.error = e && e.message ? e.message : String(e);
   }
+  renderUpdateNotice();
   renderUpdateBody();
 }
 
@@ -2002,14 +2775,23 @@ async function checkUpdateNow() {
     s.data = data;
     s.error = null;
     state.updateLoaded = true;
+    // A fresh check is an explicit "tell me again", so a banner closed with the X may come back;
+    // the persisted 忽略 choice still wins inside updateNotice().
+    state.updateBannerClosed = null;
+    if (s.history.loaded) {
+      s.history.loaded = false;
+      if (s.history.open) loadUpdateHistory();
+    }
     if (data && data.error) toast('检查完成，但拉取版本信息失败', 'error');
-    else if (data && data.updateAvailable) toast('发现新版本 ' + data.latestVersion, 'success');
+    else if (data && data.installableUpdateAvailable) toast('发现新版本 ' + data.latestInstallableVersion, 'success');
+    else if (data && data.updateAvailable) toast('发现更新的标签 ' + data.latestVersion + '，但没有可下载的 jar');
     else toast('已是最新版本', 'success');
   } catch (e) {
     s.error = e && e.message ? e.message : String(e);
     toast('检查更新失败：' + s.error, 'error');
   } finally {
     s.checking = false;
+    renderUpdateNotice();
     renderUpdateBody();
   }
 }
@@ -2179,8 +2961,10 @@ function openModal(id) { var el = $(id); if (el) el.classList.remove('hidden'); 
 function closeModal(id) { var el = $(id); if (el) el.classList.add('hidden'); }
 
 function openSourceModal() {
-  var err = $('m-error');
-  if (err) err.style.display = 'none';
+  // Always starts in add mode, even if the dialog was last used to edit something.
+  resetSourceModal();
+  renderTagInput('m');
+  syncBrowseButtons();
   openModal('modal-source');
   setTimeout(function () { var f = $('m-location'); if (f) f.focus(); }, 60);
 }
@@ -2212,6 +2996,8 @@ function openDirPicker(targetInputId) {
   if (err) err.style.display = 'none';
   state.picker.target = targetInputId;
   state.picker.selected = null;
+  // Cleared so a failed first load cannot leave 上一级 acting on the previous dialog's folder.
+  state.picker.parent = null;
   $('pk-hidden').checked = false;
   openModal('modal-picker');
 
@@ -2231,10 +3017,15 @@ async function loadDir(path) {
     if ($('pk-hidden').checked) params.push('hidden=true');
     var data = await api('/fs/dirs' + (params.length ? '?' + params.join('&') : ''));
     state.picker.path = data.path;
+    // The parent comes from the server, never from string surgery on the path: "/Users" has no
+    // parent *segment* yet its parent is "/", and Windows paths are separated by backslashes, so
+    // a client-side regex silently stops one level short of the root. The listing is the only
+    // place that knows the real answer, so keep it and let 上一级 just replay it.
+    state.picker.parent = data.parent || null;
     state.picker.selected = data.path;
     $('pk-path').value = data.path;
     $('pk-selected').textContent = '已选：' + data.path;
-    $('pk-up').disabled = !data.parent;
+    $('pk-up').disabled = !state.picker.parent;
     state.picker.currentGit = !!data.git;
     renderPickerRoots(data.roots || []);
     renderPickerList(data.entries || [], data.truncated);
@@ -2572,16 +3363,200 @@ function showModalError(hostId, message) {
   host.innerHTML = '<svg><use href="#i-alert-circle"/></svg><div>' + esc(message) + '</div>';
 }
 
-async function saveSourceForm(type, location, ref, token) {
+/**
+ * Creates or updates a source.
+ *
+ * PUT is a full replacement of tags on the server, so the complete array is always sent — a
+ * partial update would silently drop every tag the user did not touch.
+ */
+async function saveSourceForm(type, location, ref, token, tags) {
   var body = {
     type: type, location: location,
-    defaultRef: ref || null, credentialEnv: token || null
+    defaultRef: ref || null, credentialEnv: token || null,
+    tags: normalizeTags(tags || [])
   };
   if (!body.location) throw new Error('位置必填');
-  var created = await api('/sources', { method: 'POST', body: JSON.stringify(body) });
+  var editing = state.editingSourceId;
+  var saved = editing == null
+    ? await api('/sources', { method: 'POST', body: JSON.stringify(body) })
+    : await api('/sources/' + editing, { method: 'PUT', body: JSON.stringify(body) });
   await loadSources();
+  await loadTags();
   renderAll();
-  return created;
+  return saved;
+}
+
+
+/* --------------------------------------------------- import / export */
+/*
+ * The export is a plain link, not a fetch: the server already sets Content-Disposition, and letting
+ * the browser handle the download keeps a multi-megabyte file out of JS memory. The import reads the
+ * file in the browser and posts only the parsed JSON, so there is no multipart endpoint to secure
+ * and a malformed file is rejected before it ever reaches the server.
+ */
+
+function exportSources() {
+  if (!state.sources.length) {
+    toast('还没有代码源可导出', 'error');
+    return;
+  }
+  // A hidden iframe would be needed for a POST; a GET download is enough here.
+  window.location = '/api/sources/export';
+  toast('已开始下载代码源 JSON');
+}
+
+/**
+ * Sends a parsed import payload and renders the outcome.
+ *
+ * Partial success is the normal case (a file exported from a newer build, or a path that does not
+ * exist on this machine), so the counts are always shown and the errors are listed individually
+ * rather than collapsed into "导入失败".
+ */
+async function importSourcesPayload(payload) {
+  var host = $('xfer-result');
+  if (host) host.innerHTML = '<div class="empty-hint">导入中…</div>';
+  try {
+    var result = await api('/sources/import', { method: 'POST', body: JSON.stringify(payload) });
+    renderImportResult(result);
+    await refreshAll(false);
+    await loadTags();
+    renderNavSources();
+    renderSourcesPage();
+    var touched = (result.created || 0) + (result.updated || 0);
+    toast(touched ? '导入完成：新建 ' + (result.created || 0) + ' 个，更新 ' + (result.updated || 0) + ' 个'
+      : '没有可导入的代码源', touched ? 'success' : 'error');
+  } catch (e) {
+    if (host) {
+      host.innerHTML = '<div class="callout danger"><svg><use href="#i-alert-circle"/></svg><div>' +
+        esc('导入失败：' + e.message) + '</div></div>';
+    }
+    toast('导入失败：' + e.message, 'error');
+  }
+}
+
+/** Renders the per-file summary: three counts plus one row per rejected entry. */
+function renderImportResult(result) {
+  var host = $('xfer-result');
+  if (!host || !result) return;
+  var errors = result.errors || [];
+  var rows = [
+    kvRow('共读取', (result.total || 0) + ' 条'),
+    kvRow('新建', (result.created || 0) + ' 条'),
+    kvRow('更新（已存在，合并标签）', (result.updated || 0) + ' 条'),
+    kvRow('跳过', (result.skipped || 0) + ' 条')
+  ].join('');
+  var detail = errors.length ? '<div class="import-errors">' + errors.map(function (e) {
+    return '<div class="import-error">' +
+      '<span class="idx">#' + esc(e.index == null ? '?' : e.index) + '</span>' +
+      '<span class="nm">' + esc(e.name || '（未命名）') + '</span>' +
+      '<span class="why">' + esc(e.reason || '') + '</span></div>';
+  }).join('') + '</div>' : '';
+  host.innerHTML = '<div class="import-summary">' +
+    '<div class="import-counts">' + rows + '</div>' + detail + '</div>';
+}
+
+/** Reads the chosen file, parses it, and hands it to the import endpoint. */
+function onImportFileChosen(input) {
+  var file = input && input.files ? input.files[0] : null;
+  if (!file) return;
+  var host = $('xfer-result');
+  if (file.size > 8 * 1024 * 1024) {
+    if (host) host.innerHTML = '<div class="callout danger"><svg><use href="#i-alert-circle"/></svg><div>文件超过 8 MB，代码源清单不应该这么大，请确认选的是导出文件。</div></div>';
+    input.value = '';
+    return;
+  }
+  var reader = new FileReader();
+  reader.onload = function () {
+    var payload;
+    try {
+      payload = JSON.parse(String(reader.result || ''));
+    } catch (e) {
+      if (host) host.innerHTML = '<div class="callout danger"><svg><use href="#i-alert-circle"/></svg><div>不是合法的 JSON 文件，请选择由「导出」生成的 .json。</div></div>';
+      toast('不是合法的 JSON 文件', 'error');
+      input.value = '';
+      return;
+    }
+    importSourcesPayload(payload);
+    input.value = '';
+  };
+  reader.onerror = function () {
+    if (host) host.innerHTML = '<div class="callout danger"><svg><use href="#i-alert-circle"/></svg><div>读取文件失败，请重试。</div></div>';
+    input.value = '';
+  };
+  reader.readAsText(file);
+}
+
+/** Static explanation under the transfer card's title. */
+function renderTransferHint() {
+  var host = $('set-transfer-hint');
+  if (!host) return;
+  host.innerHTML = [
+    kvRow('导出内容', '类型、位置、默认分支、凭据环境变量名、标签'),
+    kvRow('不导出', '本机 id、同步状态、时间戳（换机器后无意义）'),
+    kvRow('导入规则', '类型 + 位置相同视为同一代码源，合并标签并更新分支')
+  ].join('');
+}
+
+/* ------------------------------------------------------- source edit mode */
+
+/**
+ * Fills #modal-source with an existing source and switches it to edit mode.
+ *
+ * The draft tags live in state.sourceTags.m, not in the DOM, so a re-render while the modal is
+ * open (a poll tick) cannot lose what the user typed.
+ */
+function openEditSource(sourceId) {
+  var source = state.sources.filter(function (s) { return s.id === Number(sourceId); })[0];
+  if (!source) return;
+  state.editingSourceId = source.id;
+  setModalSourceMode('edit');
+  $('m-type').value = source.type || 'LOCAL_DIR';
+  $('m-location').value = source.location || '';
+  $('m-token').value = source.credentialEnv || '';
+  $('m-name-preview').value = source.name || '';
+  resetRefSelect($('m-ref'), $('m-ref-hint'));
+  // The saved ref may not be in the dropdown yet; keep it selectable until refs are loaded.
+  if (source.defaultRef) {
+    $('m-ref').innerHTML = '<option value="' + esc(source.defaultRef) + '">' + esc(source.defaultRef) + '</option>';
+    $('m-ref').value = source.defaultRef;
+    $('m-ref-hint').textContent = '当前选择 ' + source.defaultRef;
+  }
+  setFormTags('m', sourceTagsOf(source));
+  var err = $('m-error');
+  if (err) err.style.display = 'none';
+  openModal('modal-source');
+  syncBrowseButtons();
+  scheduleRefLookup('m');
+  setTimeout(function () { var f = $('m-location'); if (f) f.focus(); }, 60);
+}
+
+/** Switches the modal between "add" and "edit": title, save label, note and tags draft. */
+function setModalSourceMode(mode) {
+  var editing = mode === 'edit';
+  var title = $('ms-title');
+  if (title) title.textContent = editing ? '编辑代码源' : '添加代码源';
+  var sub = $('ms-sub');
+  if (sub) {
+    sub.textContent = editing
+      ? '保存后立即生效；标签会整体替换为该表单里的内容。'
+      : '保存后可扫描该代码源的变更对其他程序的影响。';
+  }
+  var save = $('m-save');
+  if (save) save.textContent = editing ? '保存修改' : '保存代码源';
+  var note = $('ms-note');
+  if (note) note.textContent = editing ? '位置必填，标签会整体替换' : '位置必填，名称按位置自动识别';
+}
+
+/** Back to add mode with an empty form; called on cancel, close and after a successful save. */
+function resetSourceModal() {
+  state.editingSourceId = null;
+  setModalSourceMode('add');
+  ['m-location', 'm-ref', 'm-token', 'm-name-preview'].forEach(function (f) { if ($(f)) $(f).value = ''; });
+  resetRefSelect($('m-ref'), $('m-ref-hint'));
+  state.sourceTags.m = [];
+  renderTagInput('m');
+  var err = $('m-error');
+  if (err) err.style.display = 'none';
 }
 
 async function runAnalysisFromModal() {
@@ -2705,7 +3680,7 @@ function openDecision(kind, impactId) {
 
 function bindEvents() {
   document.addEventListener('click', function (ev) {
-    var el = ev.target.closest('[data-nav],[data-impact-id],[data-analysis-id],[data-source-id],[data-module],[data-change-id],[data-confirm-impact],[data-dismiss-impact],[data-open-impact],[data-close],[data-open-run],[data-tab],[data-filter],[data-pick-dir],[data-pk-dir],[data-pk-root],[data-delete-source],[data-background-analysis],[data-update-check],[data-update-notes],[data-update-download],[data-update-apply],[data-update-rollback]');
+    var el = ev.target.closest('[data-nav],[data-impact-id],[data-analysis-id],[data-source-id],[data-module],[data-change-id],[data-confirm-impact],[data-dismiss-impact],[data-open-impact],[data-close],[data-open-run],[data-tab],[data-filter],[data-pick-dir],[data-pk-dir],[data-pk-root],[data-delete-source],[data-background-analysis],[data-update-check],[data-update-notes],[data-update-download],[data-update-apply],[data-update-rollback],[data-update-banner-view],[data-update-banner-skip],[data-update-banner-close],[data-update-history],[data-update-history-retry],[data-edit-source],[data-tag-add],[data-tag-remove],[data-tag-group-toggle],[data-tag-filter],[data-tag-filter-clear],[data-export],[data-import-file]');
     if (!el) return;
 
     // Version & update actions live on the settings card; each one is a single async call
@@ -2722,6 +3697,30 @@ function bindEvents() {
     if (el.hasAttribute('data-update-download')) { downloadVersion(el.getAttribute('data-update-download')); return; }
     if (el.hasAttribute('data-update-apply')) { applyUpdate(); return; }
     if (el.hasAttribute('data-update-rollback')) { rollbackUpdate(); return; }
+
+    // The banner sits outside the settings card, so it carries its own three actions.
+    if (el.hasAttribute('data-update-banner-view')) { showUpdateCard(); return; }
+    if (el.hasAttribute('data-update-banner-skip')) { ignoreUpdateVersion(); return; }
+    if (el.hasAttribute('data-update-banner-close')) { closeUpdateBanner(); return; }
+
+    if (el.hasAttribute('data-update-history')) { toggleUpdateHistory(); return; }
+    if (el.hasAttribute('data-update-history-retry')) { loadUpdateHistory(); return; }
+
+    // Tag groups fold on their head; the head is the closest match, so this runs before any
+    // ancestor-based handler could claim the click.
+    if (el.hasAttribute('data-tag-group-toggle')) {
+      toggleNavTagGroup(el.getAttribute('data-tag-group-toggle'));
+      return;
+    }
+    if (el.hasAttribute('data-tag-filter-clear')) { setTagFilter(null); return; }
+    if (el.hasAttribute('data-edit-source')) { openEditSource(Number(el.getAttribute('data-edit-source'))); return; }
+
+    // Chip input: add a candidate, or drop one of the selected tags.
+    if (el.hasAttribute('data-tag-add')) { addFormTag(el.getAttribute('data-tag-add'), el.getAttribute('data-tag-value')); return; }
+    if (el.hasAttribute('data-tag-remove')) { removeFormTag(el.getAttribute('data-tag-remove'), el.getAttribute('data-tag-value')); return; }
+
+    if (el.hasAttribute('data-export')) { exportSources(); return; }
+    if (el.hasAttribute('data-import-file')) { $('xfer-file').click(); return; }
 
     if (el.hasAttribute('data-delete-source')) {
       // The delete control sits inside a clickable row, so stop it from also selecting the source.
@@ -2748,7 +3747,12 @@ function bindEvents() {
     }
     if (el.hasAttribute('data-pk-root')) { loadDir(el.getAttribute('data-pk-root')); return; }
 
-    if (el.hasAttribute('data-close')) { closeModal(el.getAttribute('data-close')); return; }
+    if (el.hasAttribute('data-close')) {
+      // Closing the source dialog is a cancel: drop the edit draft so the next open starts clean.
+      if (el.getAttribute('data-close') === 'modal-source') resetSourceModal();
+      closeModal(el.getAttribute('data-close'));
+      return;
+    }
     if (el.hasAttribute('data-open-run')) { openRunModal(); return; }
 
     if (el.hasAttribute('data-nav')) {
@@ -2777,7 +3781,15 @@ function bindEvents() {
       renderImpact();
       return;
     }
-    if (el.hasAttribute('data-analysis-id')) { openAnalysis(Number(el.getAttribute('data-analysis-id'))); return; }
+    if (el.hasAttribute('data-analysis-id')) {
+      // Clicking a history entry is a request to open that record, so it has to navigate. It used
+      // to only load the report, which left the click looking dead for anything without one -
+      // exactly the failed runs the user was trying to inspect.
+      openAnalysis(Number(el.getAttribute('data-analysis-id'))).then(function () {
+        if (state.page !== 'analysis') go('analysis');
+      });
+      return;
+    }
     if (el.hasAttribute('data-module')) {
       state.selectedModule = state.selectedModule === el.getAttribute('data-module') ? null : el.getAttribute('data-module');
       renderAnalysis();
@@ -2796,6 +3808,7 @@ function bindEvents() {
       go('overview');
       return;
     }
+    if (el.hasAttribute('data-tag-filter')) { setTagFilter(el.getAttribute('data-tag-filter')); return; }
     if (el.hasAttribute('data-impact-id')) {
       state.selectedImpactId = el.getAttribute('data-impact-id');
       if (state.page === 'overview' || state.page === 'triage') {
@@ -2808,15 +3821,23 @@ function bindEvents() {
     }
   });
 
+  // Close overlays on a backdrop click. #modal-source keeps its edit/add draft on state, so it
+  // also needs resetSourceModal() here - otherwise "edit source A" would leak into the next add.
   document.querySelectorAll('.overlay').forEach(function (overlay) {
     overlay.addEventListener('click', function (ev) {
-      if (ev.target === overlay) overlay.classList.add('hidden');
+      if (ev.target !== overlay) return;
+      if (overlay.id === 'modal-source') resetSourceModal();
+      overlay.classList.add('hidden');
     });
   });
 
   document.addEventListener('keydown', function (ev) {
     if (ev.key === 'Escape') {
-      document.querySelectorAll('.overlay:not(.hidden)').forEach(function (o) { o.classList.add('hidden'); });
+      document.querySelectorAll('.overlay:not(.hidden)').forEach(function (o) {
+        // Escape is a cancel: the source form must not keep the edited source's values around.
+        if (o.id === 'modal-source') resetSourceModal();
+        o.classList.add('hidden');
+      });
     }
     if ((ev.metaKey || ev.ctrlKey) && ev.key.toLowerCase() === 'k') {
       ev.preventDefault();
@@ -2828,10 +3849,13 @@ function bindEvents() {
   var pkUp = $('pk-up');
   if (pkUp) {
     pkUp.addEventListener('click', function () {
-      var path = state.picker.path;
-      if (!path) return;
-      var parent = path.replace(/[\/][^\/]+$/, '');
-      loadDir(parent || path);
+      // The server already told us the parent in the listing that produced this view. Deriving it
+      // here from state.picker.path is what broke the button: a trailing segment regex cannot climb
+      // from "/Users" to "/" (no leading segment to strip) and knows nothing about Windows
+      // separators, so the click re-loaded the same directory and looked dead.
+      var parent = state.picker.parent;
+      if (!parent) return;
+      loadDir(parent);
     });
   }
   var pkGo = $('pk-go');
@@ -2907,6 +3931,9 @@ function bindEvents() {
   });
   refreshNamePreview('src');
   refreshNamePreview('m');
+  renderTagInput('src');
+  renderTagInput('m');
+  renderTransferHint();
 
   var search = $('global-search');
   if (search) {
@@ -2942,6 +3969,40 @@ function bindEvents() {
     });
   });
 
+  // The file input is opened by the 导入 button; the change fires once a file is picked.
+  var xferFile = $('xfer-file');
+  if (xferFile) xferFile.addEventListener('change', function () { onImportFileChosen(xferFile); });
+
+  // Tag fields: Enter or comma commits, Backspace on an empty field removes the last chip.
+  // Bound per field rather than through the click delegate because these are keystrokes.
+  document.querySelectorAll('[data-tag-input]').forEach(function (input) {
+    var prefix = input.getAttribute('data-tag-input');
+    input.addEventListener('keydown', function (ev) {
+      if (ev.key === 'Enter' || ev.key === ',' || ev.key === '，') {
+        ev.preventDefault();
+        commitTagInput(prefix);
+        return;
+      }
+      if (ev.key === 'Backspace' && !input.value) {
+        var tags = tagBuffer(prefix);
+        if (tags.length) {
+          ev.preventDefault();
+          removeFormTag(prefix, tags[tags.length - 1]);
+        }
+      }
+    });
+    // Paste of "a,b,c" splits into several chips in one action.
+    input.addEventListener('paste', function (ev) {
+      var text = ev.clipboardData ? ev.clipboardData.getData('text') : '';
+      if (text && /[,，]/.test(text)) {
+        ev.preventDefault();
+        state.sourceTags[prefix] = normalizeTags(tagBuffer(prefix).concat(text.split(/[,，]/)));
+        renderTagInput(prefix);
+      }
+    });
+    input.addEventListener('blur', function () { if (input.value.trim()) commitTagInput(prefix); });
+  });
+
   var srcSave = $('src-save');
   if (srcSave) {
     srcSave.addEventListener('click', async function () {
@@ -2952,11 +4013,12 @@ function bindEvents() {
       renderImportStepper();
       srcSave.disabled = true;
       try {
-        await saveSourceForm($('src-type').value, location, $('src-ref').value.trim(), $('src-token').value.trim());
+        await saveSourceForm($('src-type').value, location, $('src-ref').value.trim(), $('src-token').value.trim(), tagBuffer('src'));
         state.importStep = 4;
         renderImportStepper();
         ['src-location', 'src-ref', 'src-token', 'src-name-preview'].forEach(function (f) { if ($(f)) $(f).value = ''; });
         resetRefSelect($('src-ref'), $('src-ref-hint'));
+        setFormTags('src', []);
         toast('代码源已添加', 'success');
       } catch (e) {
         state.importError = true;
@@ -2974,14 +4036,17 @@ function bindEvents() {
     mSave.addEventListener('click', async function () {
       mSave.disabled = true;
       try {
+        var tags = tagBuffer('m').slice(); // keep a local copy while we close the modal
         await saveSourceForm(
           $('m-type').value, $('m-location').value.trim(),
-          $('m-ref').value.trim(), $('m-token').value.trim()
+          $('m-ref').value.trim(), $('m-token').value.trim(),
+          tags
         );
+        resetSourceModal();
         closeModal('modal-source');
         ['m-location', 'm-ref', 'm-token', 'm-name-preview'].forEach(function (f) { if ($(f)) $(f).value = ''; });
         resetRefSelect($('m-ref'), $('m-ref-hint'));
-        toast('代码源已添加', 'success');
+        toast(state.editingSourceId ? '已保存修改' : '代码源已添加', 'success');
       } catch (e) {
         showModalError('m-error', '保存失败：' + e.message);
       } finally {
@@ -3083,6 +4148,9 @@ function bindEvents() {
   // Before the first render: the persisted layout must not flash open and then fold.
   initNav();
   bindEvents();
+  // Fire-and-forget, in parallel with the first data load: the notice must not delay first paint,
+  // and a failure here is silent on purpose (see primeUpdateNotice).
+  primeUpdateNotice();
   await refreshAll(false);
   var remembered = null;
   try { remembered = localStorage.getItem(PAGE_KEY); } catch (e) { /* ignore */ }

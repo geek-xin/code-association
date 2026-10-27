@@ -17,7 +17,9 @@ import java.sql.SQLException;
 import java.sql.Statement;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * SQLite persistence for sources and analysis runs.
@@ -67,7 +69,8 @@ public class Store {
                         status TEXT,
                         message TEXT,
                         created_at TEXT,
-                        last_synced_at TEXT
+                        last_synced_at TEXT,
+                        tags TEXT
                     )
                     """);
             st.executeUpdate("""
@@ -96,7 +99,7 @@ public class Store {
                         progress_skipped TEXT
                     )
                     """);
-            migrateAnalysisProgress(st);
+            migrate(st);
             initialized = true;
         } catch (SQLException e) {
             throw new IllegalStateException("sqlite init failed", e);
@@ -104,28 +107,40 @@ public class Store {
     }
 
     /**
-     * Existing databases predate progress columns. Adding them on startup keeps upgrades
-     * backward-compatible instead of requiring users to delete their history.
+     * Brings an existing database up to the current schema.
+     *
+     * Columns are added in place rather than by recreating tables: users have analysis history in
+     * these rows, and "upgrade the app" must never mean "lose last month's reports".
      */
-    private void migrateAnalysisProgress(Statement st) throws SQLException {
+    private void migrate(Statement st) throws SQLException {
+        // Existing databases predate the progress columns.
+        List<String> analysisColumns = columnsOf(st, "analysis");
+        addColumnIfMissing(st, "analysis", analysisColumns, "progress_stage", "TEXT");
+        addColumnIfMissing(st, "analysis", analysisColumns, "progress_percent", "INTEGER DEFAULT 0");
+        addColumnIfMissing(st, "analysis", analysisColumns, "progress_label", "TEXT");
+        addColumnIfMissing(st, "analysis", analysisColumns, "progress_detail", "TEXT");
+        addColumnIfMissing(st, "analysis", analysisColumns, "progress_completed", "TEXT");
+        addColumnIfMissing(st, "analysis", analysisColumns, "progress_skipped", "TEXT");
+
+        // Tag classification arrived with 0.5.0; older registries have no column for it.
+        List<String> sourceColumns = columnsOf(st, "repo_source");
+        addColumnIfMissing(st, "repo_source", sourceColumns, "tags", "TEXT");
+    }
+
+    private List<String> columnsOf(Statement st, String table) throws SQLException {
         List<String> columns = new ArrayList<>();
-        try (ResultSet rs = st.executeQuery("PRAGMA table_info(analysis)")) {
+        try (ResultSet rs = st.executeQuery("PRAGMA table_info(" + table + ")")) {
             while (rs.next()) {
                 columns.add(rs.getString("name"));
             }
         }
-        addColumnIfMissing(st, columns, "progress_stage", "TEXT");
-        addColumnIfMissing(st, columns, "progress_percent", "INTEGER DEFAULT 0");
-        addColumnIfMissing(st, columns, "progress_label", "TEXT");
-        addColumnIfMissing(st, columns, "progress_detail", "TEXT");
-        addColumnIfMissing(st, columns, "progress_completed", "TEXT");
-        addColumnIfMissing(st, columns, "progress_skipped", "TEXT");
+        return columns;
     }
 
-    private void addColumnIfMissing(Statement st, List<String> columns, String name, String type)
-            throws SQLException {
+    private void addColumnIfMissing(Statement st, String table, List<String> columns, String name,
+                                    String type) throws SQLException {
         if (!columns.contains(name)) {
-            st.executeUpdate("ALTER TABLE analysis ADD COLUMN " + name + " " + type);
+            st.executeUpdate("ALTER TABLE " + table + " ADD COLUMN " + name + " " + type);
         }
     }
 
@@ -138,8 +153,8 @@ public class Store {
                 source.createdAt = RepoSource.now();
                 try (PreparedStatement ps = c.prepareStatement("""
                         INSERT INTO repo_source (name, type, location, default_ref, credential_env, local_path,
-                                                 status, message, created_at, last_synced_at)
-                        VALUES (?,?,?,?,?,?,?,?,?,?)
+                                                 status, message, created_at, last_synced_at, tags)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?)
                         """, Statement.RETURN_GENERATED_KEYS)) {
                     ps.setString(1, source.name);
                     ps.setString(2, source.type);
@@ -151,6 +166,7 @@ public class Store {
                     ps.setString(8, source.message);
                     ps.setString(9, source.createdAt);
                     ps.setString(10, source.lastSyncedAt);
+                    ps.setString(11, Json.write(tagsOf(source)));
                     ps.executeUpdate();
                     try (ResultSet keys = ps.getGeneratedKeys()) {
                         if (keys.next()) {
@@ -161,7 +177,7 @@ public class Store {
             } else {
                 try (PreparedStatement ps = c.prepareStatement("""
                         UPDATE repo_source SET name=?, type=?, location=?, default_ref=?, credential_env=?,
-                        local_path=?, status=?, message=?, last_synced_at=? WHERE id=?
+                        local_path=?, status=?, message=?, last_synced_at=?, tags=? WHERE id=?
                         """)) {
                     ps.setString(1, source.name);
                     ps.setString(2, source.type);
@@ -172,7 +188,8 @@ public class Store {
                     ps.setString(7, source.status);
                     ps.setString(8, source.message);
                     ps.setString(9, source.lastSyncedAt);
-                    ps.setLong(10, source.id);
+                    ps.setString(10, Json.write(tagsOf(source)));
+                    ps.setLong(11, source.id);
                     ps.executeUpdate();
                 }
             }
@@ -270,7 +287,83 @@ public class Store {
         s.message = rs.getString("message");
         s.createdAt = rs.getString("created_at");
         s.lastSyncedAt = rs.getString("last_synced_at");
+        s.tags = readTags(rs.getString("tags"));
         return s;
+    }
+
+    /**
+     * Every tag currently in use, with how many sources carry it, most used first.
+     *
+     * This backs the autocomplete and the sidebar grouping. It is computed in memory because the
+     * registry is a hand-managed list of programs, not a table that grows without bound; a SQL
+     * JSON query would buy nothing here and would tie the schema to SQLite's JSON extension.
+     */
+    public List<Map<String, Object>> tagCounts() {
+        Map<String, Integer> counts = new LinkedHashMap<>();
+        Map<String, String> spelling = new LinkedHashMap<>();
+        for (RepoSource source : sources()) {
+            for (String tag : tagsOf(source)) {
+                String key = tag.toLowerCase(java.util.Locale.ROOT);
+                counts.merge(key, 1, Integer::sum);
+                spelling.putIfAbsent(key, tag);
+            }
+        }
+        List<Map<String, Object>> out = new ArrayList<>();
+        counts.entrySet().stream()
+                .sorted((a, b) -> {
+                    int byCount = b.getValue() - a.getValue();
+                    return byCount != 0 ? byCount : spelling.get(a.getKey()).compareTo(spelling.get(b.getKey()));
+                })
+                .forEach(e -> {
+                    Map<String, Object> row = new LinkedHashMap<>();
+                    row.put("tag", spelling.get(e.getKey()));
+                    row.put("count", e.getValue());
+                    out.add(row);
+                });
+        return out;
+    }
+
+    /**
+     * Finds a source by type and location, ignoring the differences a human would ignore.
+     *
+     * Import uses this to decide "update" from "create". The comparison happens in memory because
+     * the location needs normalisation (trailing slash, surrounding whitespace) that a plain SQL
+     * equality would treat as a different source, producing a duplicate on every re-import.
+     */
+    public RepoSource findByTypeAndLocation(String type, String location) {
+        String wantedType = type == null ? "" : type.strip().toUpperCase(java.util.Locale.ROOT);
+        String wantedLocation = com.geek.association.transfer.SourceTransfer.normalizeLocation(location);
+        for (RepoSource source : sources()) {
+            String sourceType = source.type == null ? "" : source.type.strip().toUpperCase(java.util.Locale.ROOT);
+            if (!sourceType.equals(wantedType)) {
+                continue;
+            }
+            if (com.geek.association.transfer.SourceTransfer.normalizeLocation(source.location)
+                    .equals(wantedLocation)) {
+                return source;
+            }
+        }
+        return null;
+    }
+
+    private List<String> tagsOf(RepoSource source) {
+        return source == null || source.tags == null ? List.of() : source.tags;
+    }
+
+    /**
+     * Tags are stored as a JSON array in one column. A malformed value degrades to "no tags"
+     * rather than failing the read: losing a filing label is recoverable, losing the source is not.
+     */
+    private List<String> readTags(String json) {
+        if (json == null || json.isBlank()) {
+            return new ArrayList<>();
+        }
+        try {
+            return Json.read(json, new com.fasterxml.jackson.core.type.TypeReference<List<String>>() {
+            });
+        } catch (Exception e) {
+            return new ArrayList<>();
+        }
     }
 
     // ----------------------------------------------------------------- analyses

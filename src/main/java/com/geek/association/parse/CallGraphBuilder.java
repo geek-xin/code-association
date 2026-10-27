@@ -69,24 +69,46 @@ public class CallGraphBuilder {
     private final Map<String, CompilationUnit> units;
     private final TypeResolver resolver;
     private final Map<String, List<TypeInfo>> implCache = new HashMap<>();
+    /** Optional per-file progress; null when the caller does not report it. */
+    private final FileProgress onFile;
     /** Every method name declared anywhere in the project - used to tell a real blind spot from a JDK call. */
     private final Set<String> projectMethodNames = new HashSet<>();
 
     public CallGraphBuilder(FileSource source, CodeIndex index, MavenParser maven,
                             Map<String, CompilationUnit> units, JavaParser parser) {
+        this(source, index, maven, units, parser, null);
+    }
+
+    public CallGraphBuilder(FileSource source, CodeIndex index, MavenParser maven,
+                            Map<String, CompilationUnit> units, JavaParser parser,
+                            FileProgress onFile) {
         this.index = index;
         this.maven = maven;
         this.units = units;
         this.resolver = new TypeResolver(index);
+        this.onFile = onFile;
     }
 
+    /**
+     * Builds the call graph over every parsed compilation unit.
+     *
+     * This is a second full pass across all files and, on a large repository, it costs more than
+     * parsing did. It therefore reports progress the same way: without a signal here the analysis
+     * percentage sat at the parse-stage ceiling for most of the run, which is indistinguishable
+     * from a stall.
+     */
     public void build() {
         for (TypeInfo type : index.types.values()) {
             projectMethodNames.addAll(type.methods.keySet());
         }
+        int total = units.size();
+        int done = 0;
         for (Map.Entry<String, CompilationUnit> entry : units.entrySet()) {
             String file = entry.getKey();
             CompilationUnit cu = entry.getValue();
+            if (onFile != null) {
+                onFile.file(file, ++done, total);
+            }
             for (TypeDeclaration<?> type : cu.getTypes()) {
                 walkType(type, file);
             }

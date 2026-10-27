@@ -27,6 +27,13 @@ public class PeerImpact {
     public String riskLevel = "INFO";
     public int indexedFiles;
     public long indexMillis;
+    /**
+     * Files in this program that were too large to read, so they are absent from the index.
+     *
+     * A peer that "has no impact" may simply have had its relevant file skipped; naming the files
+     * keeps that reading honest.
+     */
+    public List<com.geek.association.source.FileSource.SkippedFile> skippedFiles = new ArrayList<>();
 
     /**
      * One shared contract: the changed thing on this side, and the code on the peer side that

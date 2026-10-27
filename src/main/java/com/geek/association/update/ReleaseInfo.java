@@ -39,6 +39,15 @@ public class ReleaseInfo {
     public boolean downloaded;
     /** When the local jar was downloaded, ISO-8601, or null when it is not downloaded. */
     public String downloadedAt;
+    /**
+     * True when this version carries a jar that could actually be installed.
+     *
+     * A tags-only entry has no assets at all, so it can be listed and compared but not downloaded.
+     * Without this flag the UI would render a download button that is guaranteed to fail - the
+     * user would click it and be told the release has no .jar, which reads like a bug rather than
+     * a property of that version.
+     */
+    public boolean downloadable;
     /** Markdown body; empty string when absent so the UI never has to handle null. */
     public String notes = "";
     public String url;

@@ -28,15 +28,26 @@ public class CodeIndexer {
     public MavenParser maven = new MavenParser();
 
     public CodeIndex index(FileSource source, String revisionLabel, String revisionId) {
-        return index(source, revisionLabel, revisionId, null);
+        return index(source, revisionLabel, revisionId, (FileProgress) null);
+    }
+
+    /** Path-only variant, kept so callers that do not care about counts stay simple. */
+    public CodeIndex index(FileSource source, String revisionLabel, String revisionId,
+                           Consumer<String> onFile) {
+        FileProgress progress = onFile == null ? null : (path, done, total) -> onFile.accept(path);
+        return index(source, revisionLabel, revisionId, progress);
     }
 
     /**
      * Indexes one revision and reports files as they are parsed. The callback is intentionally
      * coarse (file path only): progress must not depend on parser internals or fake timers.
      */
+    /**
+     * Indexes one revision, reporting per-file progress. Prefer this over the path-only overload:
+     * only the total lets a caller turn "parsing file N" into a percentage that actually moves.
+     */
     public CodeIndex index(FileSource source, String revisionLabel, String revisionId,
-                           Consumer<String> onFile) {
+                           FileProgress onFile) {
         long start = System.currentTimeMillis();
         maven = new MavenParser();
         maven.parse(source);

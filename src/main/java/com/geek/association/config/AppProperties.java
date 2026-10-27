@@ -13,6 +13,16 @@ public class AppProperties {
     /** Maximum files parsed per repository (safety valve). */
     private int maxFiles = 20000;
 
+    /**
+     * Largest single file the indexer will read, in megabytes.
+     *
+     * Source files are kilobytes; anything near this limit is a committed SDK, a database dump or
+     * a packaged jar under another extension. Reading those costs memory and time without adding
+     * anything to the analysis, and the report names each one it left out so the omission stays
+     * visible. Zero or negative disables the limit entirely.
+     */
+    private int maxFileMb = 20;
+
     /** Maximum call graph traversal depth. */
     private int maxDepth = 8;
 
@@ -40,6 +50,23 @@ public class AppProperties {
 
     public void setMaxFiles(int maxFiles) {
         this.maxFiles = maxFiles;
+    }
+
+    /** Same limit in bytes, which is the unit the readers compare against. */
+    public int maxFileBytes() {
+        if (maxFileMb <= 0) {
+            return Integer.MAX_VALUE;
+        }
+        // An int holds up to 2 GiB, and the readers pass this value to JGit, which takes an int.
+        return (int) Math.min(Integer.MAX_VALUE, (long) maxFileMb * 1024L * 1024L);
+    }
+
+    public int getMaxFileMb() {
+        return maxFileMb;
+    }
+
+    public void setMaxFileMb(int maxFileMb) {
+        this.maxFileMb = maxFileMb;
     }
 
     public int getMaxDepth() {

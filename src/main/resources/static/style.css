@@ -491,6 +491,10 @@ button:focus:not(:focus-visible), input:focus:not(:focus-visible), select:focus:
 }
 .icon-btn svg { width: 15px; height: 15px; }
 .icon-btn:hover { color: var(--primary); border-color: var(--primary-100); background: var(--primary-50); }
+/* The picker's 上一级 goes disabled at the filesystem root. Without a disabled look it reads as a
+   working button that does nothing, which is exactly how the broken version was reported. */
+.icon-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+.icon-btn:disabled:hover { color: var(--text-2); border-color: var(--border-strong); background: var(--surface); }
 
 .search {
   display: flex;
@@ -720,6 +724,180 @@ button:focus:not(:focus-visible), input:focus:not(:focus-visible), select:focus:
 .meta-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; font-size: 11.5px; color: var(--text-3); }
 .meta-row .sep { width: 3px; height: 3px; border-radius: 50%; background: var(--border-strong); }
 
+/* ------------------------------------------------------------ source tags */
+/*
+ * Tags are a filing aid, so they are styled as the quietest interactive element on the page:
+ * a small pill that only gains affordance on hover. Anything louder would compete with the risk
+ * colours, which carry the actual meaning of the screen.
+ */
+
+.tag-input {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  min-height: 36px;
+  padding: 6px 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-control);
+  background: var(--surface);
+  transition: border-color var(--t-fast) var(--ease), box-shadow var(--t-fast) var(--ease);
+}
+.tag-input:focus-within { border-color: var(--primary); box-shadow: 0 0 0 3px var(--primary-50); }
+.tag-input input {
+  flex: 1 1 140px;
+  min-width: 100px;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 12.5px;
+  padding: 2px 0;
+}
+.tag-input input::placeholder { color: var(--text-3); }
+.tag-chips { display: contents; }
+
+.tag-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 2px 4px 2px 8px;
+  background: var(--primary-50);
+  color: var(--primary-700);
+  border-radius: var(--r-pill);
+  font-size: 11px;
+  font-weight: 550;
+  max-width: 180px;
+}
+.tag-chip-x {
+  display: inline-grid;
+  place-items: center;
+  width: 15px;
+  height: 15px;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--primary-700);
+  cursor: pointer;
+  flex: none;
+  opacity: 0.6;
+}
+.tag-chip-x:hover { opacity: 1; background: var(--primary-100); }
+.tag-chip-x svg { width: 9px; height: 9px; }
+
+.tag-cands { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; margin-top: 6px; min-height: 18px; }
+.tag-cands-label { font-size: 11px; color: var(--text-3); }
+.tag-cands-hint { font-size: 11px; color: var(--text-3); }
+.tag-cand { cursor: pointer; border: 1px dashed var(--border-strong); background: transparent; }
+.tag-cand:hover { background: var(--primary-50); border-color: var(--primary-100); color: var(--primary-700); }
+
+/* A tag on a source row: clickable, and toggles the list filter. */
+.tags { display: inline-flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+.tag-pill {
+  cursor: pointer;
+  border: 1px solid transparent;
+  font-size: 10.5px;
+  padding: 1px 7px;
+  line-height: 1.5;
+}
+.tag-pill:hover { border-color: var(--primary-100); }
+.tag-pill.active { background: var(--primary); color: var(--on-primary); }
+.tag-empty { font-size: 11px; color: var(--text-3); }
+.tag-cell { max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.tag-filter-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 18px 10px;
+  padding: 7px 11px;
+  border-radius: var(--r-control);
+  background: var(--primary-50);
+  color: var(--primary-700);
+  font-size: 11.5px;
+}
+.tag-filter-bar svg { width: 12px; height: 12px; flex: none; }
+.tag-filter-bar .btn { margin-left: auto; }
+
+/* ------------------------------------------- sidebar tag groups */
+.nav-tag-group + .nav-tag-group { margin-top: 2px; }
+.nav-tag-head {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  border: 0;
+  background: transparent;
+  color: var(--text-3);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  cursor: pointer;
+  border-radius: 6px;
+}
+.nav-tag-head:hover { background: var(--nav-hover-bg); color: var(--text-2); }
+.nav-tag-head svg { width: 11px; height: 11px; flex: none; }
+.nav-tag-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.nav-tag-count {
+  margin-left: auto;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-3);
+  background: var(--nav-count-bg);
+  border-radius: var(--r-pill);
+  padding: 0 6px;
+}
+.nav-tag-items { display: flex; flex-direction: column; }
+
+/* Edit button on a source row: the same reveal-on-hover language as delete, but neutral. */
+.tr .row-edit {
+  display: inline-grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 8px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text-3);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity var(--t-fast) var(--ease), background var(--t-fast) var(--ease),
+    color var(--t-fast) var(--ease), border-color var(--t-fast) var(--ease);
+}
+.tr:hover .row-edit, .tr .row-edit:focus-visible { opacity: 1; }
+@media (hover: none) { .tr .row-edit { opacity: 1; } }
+.tr .row-edit:hover { color: var(--primary-700); background: var(--primary-50); border-color: var(--primary-100); }
+.tr .row-edit svg { width: 13px; height: 13px; }
+
+/* ------------------------------------------- import / export results */
+.import-summary { display: flex; flex-direction: column; gap: 10px; }
+.import-counts { display: flex; flex-wrap: wrap; gap: 18px; font-size: 12px; color: var(--text-2); }
+.import-counts .kv-row { display: flex; gap: 6px; align-items: baseline; }
+.import-counts .kv-row .v { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+.import-errors {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 12px;
+  border-radius: var(--r-control);
+  background: var(--danger-bg);
+  border: 1px solid var(--danger-line);
+  max-height: 220px;
+  overflow: auto;
+}
+.import-error { display: flex; gap: 8px; align-items: baseline; font-size: 11.5px; color: var(--danger-strong); }
+.import-error .idx { font-family: var(--mono); font-size: 10.5px; opacity: 0.75; flex: none; }
+.import-error .nm { font-weight: 550; flex: none; max-width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.import-error .why { color: var(--text-2); }
+
+@media (max-width: 860px) {
+  .tag-cell { max-width: 100%; }
+  .tag-filter-bar { margin: 0 10px 10px; }
+}
+
 /* ----------------------------------------------------------------- buttons */
 
 .btn {
@@ -924,6 +1102,27 @@ button:focus:not(:focus-visible), input:focus:not(:focus-visible), select:focus:
 #an-progress-card .progress { margin: 2px 0 18px; }
 #an-progress-card .progress > span.danger { background: var(--danger); }
 #an-progress-card .stepper { gap: 8px; }
+/* "3 / 8 步 · 索引目标版本" next to the percentage: a bare "54%" cannot say which stage the run
+   is in, and the stepper below is too far down to read at a glance. */
+.prog-step-count {
+  font-size: 11.5px;
+  color: var(--text-2);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.prog-step-count.hidden { display: none; }
+
+/* A failed run is not a progress state with a stuck bar: it needs its reason readable in full.
+   Exception messages carry paths and URLs, so they must wrap instead of widening the card. */
+#an-progress-failure { align-items: flex-start; }
+#an-progress-failure strong { display: block; margin-bottom: 3px; }
+#an-progress-failure-reason {
+  font-size: 12px;
+  line-height: 1.65;
+  color: var(--danger-strong);
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
 
 /* -------------------------------------------------------------- flow cards */
 
@@ -1031,6 +1230,17 @@ button:focus:not(:focus-visible), input:focus:not(:focus-visible), select:focus:
 .tr .row-delete svg { width: 13px; height: 13px; }
 .tr .sym { font-family: var(--mono); font-size: 11.5px; color: var(--text); }
 .tr .sub { font-size: 11px; color: var(--text-3); margin-top: 2px; }
+/* A failure reason is long and unbreakable (paths, URLs, ref names), so it clamps instead of
+   pushing the other columns out of the row. The full text stays available as a title tooltip. */
+.tr-reason {
+  font-size: 11.5px;
+  color: var(--danger-strong);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.tl-reason { color: var(--danger-strong); overflow-wrap: anywhere; }
 
 .tr-impacts { grid-template-columns: 86px 104px minmax(0, 1fr) 130px 26px; }
 .tr-changes { grid-template-columns: 124px minmax(0, 1fr) 168px 26px; }
@@ -1384,141 +1594,3 @@ body, .app, .rail, .sidenav, .card, .stat, .modal, .drawer, .toast, .code, .map 
 body.compact .card { padding: 15px; }
 body.compact .card-row { padding: 9px 11px; }
 body.compact .list-row { padding: 10px 11px; }
-body.compact .tr { padding: 7px 12px; }
-body.compact .stat { padding: 11px 14px; }
-body.compact .row-desc { -webkit-line-clamp: 1; }
-
-/* ------------------------------------------------------------ responsive */
-
-@media (max-width: 1400px) {
-  .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .grid-2 { grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr); }
-}
-
-@media (max-width: 1180px) {
-  /* Narrow the menu through the variable, not a literal column: a literal here would win
-     over .app.nav-collapsed and make the collapse button silently stop working. */
-  .app { --nav-w: 220px; grid-template-columns: var(--rail-w) var(--nav-w) minmax(0, 1fr); min-width: 0; }
-  .workspace { padding: 20px 20px 40px; }
-  .grid-2, .grid-2-even, .grid-3 { grid-template-columns: minmax(0, 1fr); }
-  .flow { grid-template-columns: minmax(0, 1fr); }
-  .page-title { font-size: 22px; }
-}
-
-@media (max-width: 860px) {
-  #an-progress-card .stepper { grid-auto-flow: row; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px 10px; }
-  /* Narrow screens start folded (see initNav) but can still be expanded on demand. The old
-     rule hid the menu unconditionally with display:none, which left the expand affordance
-     with nothing to reveal. */
-  .app { --nav-w: 216px; grid-template-columns: var(--rail-w) var(--nav-w) minmax(0, 1fr); }
-  .app.nav-collapsed { grid-template-columns: var(--rail-w) 0 minmax(0, 1fr); }
-  .stats { grid-template-columns: minmax(0, 1fr); }
-  .tr-impacts, .tr-changes, .tr-history { grid-template-columns: minmax(0, 1fr) 26px; }
-  .tr .cell.optional { display: none; }
-}
-
-/* ------------------------------------------------------- version & updates */
-/* Settings card for the self-update flow. Every colour comes from the existing
-   theme tokens so both palettes stay readable; the only structural bits are the
-   hero version number, the release row layout and the pre-formatted notes. */
-
-.upd-hero {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 16px;
-  flex-wrap: wrap;
-  padding-bottom: 14px;
-  margin-bottom: 4px;
-  border-bottom: 1px solid var(--border);
-}
-.upd-version-num {
-  font-size: 30px;
-  line-height: 1.1;
-  font-weight: 600;
-  letter-spacing: -0.03em;
-  color: var(--text);
-  font-variant-numeric: tabular-nums;
-}
-.upd-version-cap { font-size: 11.5px; color: var(--text-3); margin-top: 5px; }
-.upd-hero-side { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.upd-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.upd-loading { display: flex; align-items: center; gap: 10px; font-size: 12.5px; color: var(--text-2); padding: 8px 0; }
-/* the shared .spinner is sized for the 14px icon slot; shrink it to fit a .btn-sm */
-.btn-sm .spinner { width: 11px; height: 11px; border-width: 1.5px; }
-
-/* release list: one row per version, notes expand underneath */
-.rel-list { display: flex; flex-direction: column; }
-.rel-row {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 14px;
-  flex-wrap: wrap;
-  padding: 11px 0;
-}
-.rel-row + .rel-row { border-top: 1px solid var(--border); }
-.rel-main { min-width: 0; flex: 1 1 260px; }
-.rel-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.rel-version {
-  font-family: var(--mono);
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--text);
-  font-variant-numeric: tabular-nums;
-}
-.rel-meta {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
-  font-size: 11px;
-  color: var(--text-3);
-  margin-top: 4px;
-}
-.rel-meta .sep { width: 3px; height: 3px; border-radius: 50%; background: var(--border-strong); }
-.rel-actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
-
-/* Release notes are untrusted markdown shown as escaped text, never rendered. */
-.release-notes {
-  margin: 4px 0 10px;
-  padding: 11px 13px;
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  background: var(--inset-bg);
-  font-family: var(--mono);
-  font-size: 11.5px;
-  line-height: 1.7;
-  color: var(--text-body);
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-  max-height: 320px;
-  overflow-y: auto;
-}
-.release-notes .release-list { margin: 2px 0; padding-left: 16px; list-style: disc; }
-.release-notes .release-list li { margin: 1px 0; }
-.release-notes .release-gap { display: block; height: 6px; }
-.release-notes .release-h { font-weight: 600; color: var(--text); margin: 4px 0 2px; }
-.upd-notes-foot { font-size: 11.5px; margin: -4px 0 10px; }
-.upd-notes-foot a { color: var(--primary-700); text-decoration: none; }
-.upd-notes-foot a:hover { text-decoration: underline; }
-
-/* restart command hint shown after apply / rollback */
-.restart-cmd { margin-top: 6px; font-size: 11.5px; color: var(--text-body); overflow-wrap: anywhere; }
-.restart-cmd code {
-  font-family: var(--mono);
-  background: var(--surface-2);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 1px 5px;
-  color: var(--text);
-}
-
-/* Narrow windows: the release row stacks, so the flex-basis that widens .rel-main
-   horizontally must be dropped — in column direction it would become a 260px height. */
-@media (max-width: 1024px) {
-  .upd-version-num { font-size: 25px; }
-  .rel-row { flex-direction: column; align-items: stretch; gap: 8px; }
-  .rel-main { flex: 0 0 auto; }
-  .rel-actions { justify-content: flex-start; }
-}

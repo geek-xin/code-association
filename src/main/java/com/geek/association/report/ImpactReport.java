@@ -35,6 +35,13 @@ public class ImpactReport {
     public Map<String, String> diffs = new LinkedHashMap<>();
     public List<String> notes = new ArrayList<>();
     public List<BlindSpot> blindSpots = new ArrayList<>();
+    /**
+     * Files on this side that were too large to read, so they were not indexed.
+     *
+     * Kept as a first-class list rather than only a note: a reviewer looking at "no impacts" has to
+     * be able to see that a file was skipped, otherwise the clean result is a lie of omission.
+     */
+    public List<com.geek.association.source.FileSource.SkippedFile> skippedFiles = new ArrayList<>();
     public Map<String, Object> ai = null;
     /** Cross-program impact: what the selected peer programs have to change because of this delta. */
     public List<com.geek.association.model.PeerImpact> peers = new ArrayList<>();

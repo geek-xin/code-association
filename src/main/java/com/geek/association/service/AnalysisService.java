@@ -14,10 +14,13 @@ import com.geek.association.parse.CodeIndexer;
 import com.geek.association.report.AiExplainer;
 import com.geek.association.report.ImpactReport;
 import com.geek.association.report.ReportBuilder;
+import com.geek.association.source.GitSupport;
 import com.geek.association.source.RepositoryPreparer;
 import com.geek.association.source.RevisionPair;
 import com.geek.association.store.Store;
 import com.geek.association.util.Json;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
@@ -34,6 +37,8 @@ import java.util.concurrent.atomic.AtomicInteger;
  */
 @Service
 public class AnalysisService {
+
+    private static final Logger log = LoggerFactory.getLogger(AnalysisService.class);
 
     private final Store store;
     private final AppProperties properties;
@@ -117,11 +122,13 @@ public class AnalysisService {
 
             CodeIndexer indexer = new CodeIndexer(properties.getMaxFiles());
             CodeIndex headIndex = indexer.index(revisions.head, revisions.head.label(), revisions.headCommit,
-                    file -> progress.file("INDEX_HEAD", 20, 55, "索引目标版本", file));
+                    (file, done, total) ->
+                            progress.file("INDEX_HEAD", 20, 55, "索引目标版本", file, done, total));
             progress.complete("INDEX_HEAD", "INDEX_BASE", 55, "索引基线版本", revisions.base.label());
             CodeIndexer baseIndexer = new CodeIndexer(properties.getMaxFiles());
             CodeIndex baseIndex = baseIndexer.index(revisions.base, revisions.base.label(), revisions.baseCommit,
-                    file -> progress.file("INDEX_BASE", 55, 72, "索引基线版本", file));
+                    (file, done, total) ->
+                            progress.file("INDEX_BASE", 55, 72, "索引基线版本", file, done, total));
             progress.complete("INDEX_BASE", "DETECT", 72, "检测语义变更", "比较符号、接口与消息契约");
 
             ChangeDetector detector = new ChangeDetector(baseIndex, headIndex);
@@ -197,6 +204,9 @@ public class AnalysisService {
         private final List<String> skipped = new ArrayList<>();
         private String lastDetail;
         private long lastWriteAt;
+        /** Files seen in the current scanning stage, and how many there are in total. */
+        private int lastSeen;
+        private int lastTotal;
 
         Progress(long analysisId) {
             this.analysisId = analysisId;
@@ -206,14 +216,45 @@ public class AnalysisService {
             update(stage, percent, label, detail);
         }
 
-        void file(String stage, int from, int to, String label, String file) {
-            if (file.equals(lastDetail)) {
+        /**
+         * Reports progress through a file-scanning stage.
+         *
+         * The percentage is interpolated inside [from, to) by the files seen so far. Leaving it at
+         * `from` until the stage ends is what made the panel look frozen: INDEX_HEAD covers most of
+         * the wall-clock time on a large repository, and it displayed one unchanging number the
+         * whole way through, which reads the same as a hung run.
+         *
+         * `to` is exclusive so the stage still ends exactly on its boundary when
+         * {@link #complete} fires.
+         */
+        void file(String stage, int from, int to, String label, String file, int done, int total) {
+            lastSeen = (done > 0 && total > 0) ? done : 0;
+            lastTotal = (done > 0 && total > 0) ? total : 0;
+            // The detail line is what moves on screen between stage boundaries, but the file name
+            // alone says nothing about how far along the run is. Pair it with the counts.
+            String shown = lastTotal > 0 ? file + " (" + lastSeen + "/" + lastTotal + ")" : file;
+            if (shown.equals(lastDetail)) {
                 return;
             }
-            lastDetail = file;
-            // Keep the percentage stable within a stage: file callbacks show what is being parsed,
-            // while the percentage advances only when a whole stage completes.
-            update(stage, from, label, file);
+            lastDetail = shown;
+            int percent = from;
+            if (lastTotal > 0) {
+                int span = Math.max(0, to - from);
+                percent = from + (int) Math.round(span * (lastSeen / (double) lastTotal));
+                // Never reach `to` early: that value belongs to the completed-stage boundary.
+                percent = Math.min(percent, Math.max(from, to - 1));
+            }
+            update(stage, percent, label, shown);
+        }
+
+        /**
+         * How far the current file-scanning stage is, for the completion line.
+         *
+         * Returns "" when no per-file progress was reported (an empty tree, or a stage that does
+         * not scan files), so the caller can fall back to its own detail text.
+         */
+        String scannedSummary() {
+            return lastTotal > 0 ? lastSeen + "/" + lastTotal + " 个文件" : "";
         }
 
         void complete(String stage, String next, int percent, String label, String detail) {
@@ -282,11 +323,17 @@ public class AnalysisService {
                 RevisionPair peerRevisions = preparer.prepare(peerRequest);
                 CodeIndex peerIndex = new CodeIndexer(properties.getMaxFiles())
                         .index(peerRevisions.head, peerRevisions.head.label(), peerRevisions.headCommit);
+                peerInfo.skippedFiles = peerRevisions.head.skippedFiles();
                 long firstImpactId = out.stream().mapToLong(p -> p.impacts.size()).sum() + 1;
                 out.add(new PeerImpactEngine(properties)
                         .analyze(changes, headIndex, peerIndex, peerInfo, firstImpactId));
             } catch (Exception e) {
                 peerInfo.note = "无法读取该程序：" + messageOf(e);
+                // The report only carries one sentence; the log keeps the transport cause chain so
+                // "why could this program not be read" is answerable after the fact.
+                log.warn("peer {} ({}) could not be read: {}",
+                        peerSource.name, GitSupport.maskCredentials(peerSource.location),
+                        GitSupport.describe(e));
                 out.add(peerInfo);
             }
         }

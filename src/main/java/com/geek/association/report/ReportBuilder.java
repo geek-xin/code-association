@@ -196,8 +196,36 @@ public class ReportBuilder {
 
         // Blind spots come from the peer indexes, never from this program's own unresolved calls.
         report.blindSpots = new ArrayList<>();
+        report.skippedFiles = skippedFiles(revisions);
         peerNotes(report, headIndex, peers);
         return report;
+    }
+
+    /**
+     * Files this side left unread because of the per-file size limit.
+     *
+     * Both revisions are collected: a file that exists only in the base is a deletion nobody saw,
+     * and one that exists only in the head is an addition nobody saw, so reporting just one side
+     * would hide half the gap.
+     */
+    private List<com.geek.association.source.FileSource.SkippedFile> skippedFiles(RevisionPair revisions) {
+        List<com.geek.association.source.FileSource.SkippedFile> out = new ArrayList<>();
+        Set<String> seen = new LinkedHashSet<>();
+        for (com.geek.association.source.FileSource source : new com.geek.association.source.FileSource[]{
+                revisions.base, revisions.head}) {
+            if (source == null) {
+                continue;
+            }
+            for (com.geek.association.source.FileSource.SkippedFile skipped : source.skippedFiles()) {
+                // The same path in both revisions is one omission for the reader, and the head
+                // size is the one that describes the state being analysed.
+                if (seen.add(skipped.path())) {
+                    out.add(skipped);
+                }
+            }
+        }
+        out.sort(java.util.Comparator.comparing(com.geek.association.source.FileSource.SkippedFile::path));
+        return out;
     }
 
     private void peerNotes(ImpactReport report, CodeIndex ownHead,
@@ -208,6 +236,17 @@ public class ReportBuilder {
         if (report.summary.unavailablePrograms > 0) {
             ImpactReport.addNote(report.notes, seen,
                     report.summary.unavailablePrograms + " 个对比程序无法读取，已在对应条目中说明原因。");
+        }
+        if (!report.skippedFiles.isEmpty()) {
+            ImpactReport.addNote(report.notes, seen,
+                    "本次有 " + report.skippedFiles.size() + " 个文件超过单文件读取上限，未被索引；"
+                            + "名单见报告末尾，涉及这些文件的改动与影响需人工确认。");
+        }
+        int peerSkipped = peers.stream().mapToInt(p -> p.skippedFiles.size()).sum();
+        if (peerSkipped > 0) {
+            ImpactReport.addNote(report.notes, seen,
+                    "对比程序共有 " + peerSkipped + " 个文件超过单文件读取上限而未被索引，"
+                            + "对应条目中已列出文件名。");
         }
         if (!ownHead.unresolved.isEmpty()) {
             ImpactReport.addNote(report.notes, seen,

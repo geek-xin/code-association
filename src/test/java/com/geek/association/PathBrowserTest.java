@@ -115,4 +115,34 @@ class PathBrowserTest {
         Map<String, Object> listing = browser.browse(top.toString(), false);
         assertNull(listing.get("parent"), "the filesystem root cannot go up");
     }
+
+    /**
+     * The picker's 上一级 button walks the {@code parent} field until it disappears, so the field
+     * has to lead all the way to the filesystem root and stop there.
+     *
+     * This is the contract the client used to ignore: it derived the parent itself by stripping
+     * the last path segment, which cannot express "the parent of /Users is /" and therefore
+     * stranded the user one level above their home directory.
+     */
+    @Test
+    void parentChainReachesTheFilesystemRootAndStops(@TempDir Path root) throws IOException {
+        Path deep = Files.createDirectories(root.resolve("a/b/c"));
+
+        Path current = deep.toAbsolutePath().normalize();
+        int steps = 0;
+        while (true) {
+            String parent = (String) browser.browse(current.toString(), false).get("parent");
+            if (parent == null) {
+                break;
+            }
+            Path next = Path.of(parent);
+            assertEquals(current.getParent(), next, "each step is exactly one level up");
+            assertTrue(next.getNameCount() < current.getNameCount(),
+                    "walking up must strictly shorten the path, or the loop would not terminate");
+            current = next;
+            assertTrue(++steps < 64, "a path this shallow cannot need 64 steps to reach the root");
+        }
+
+        assertEquals(current.getRoot(), current, "the walk ends at the filesystem root");
+    }
 }

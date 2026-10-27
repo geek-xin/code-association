@@ -10,6 +10,8 @@ import com.geek.association.source.PathBrowser;
 import com.geek.association.source.RepositoryPreparer;
 import com.geek.association.source.SourceNames;
 import com.geek.association.store.Store;
+import com.geek.association.transfer.SourceTags;
+import com.geek.association.transfer.SourceTransfer;
 import com.geek.association.update.UpdateService;
 import com.geek.association.util.Json;
 import org.springframework.http.HttpStatus;
@@ -60,6 +62,7 @@ public class ApiController {
         out.put("dataDir", properties.dataPath().toString());
         out.put("maxDepth", properties.getMaxDepth());
         out.put("maxFiles", properties.getMaxFiles());
+        out.put("maxFileMb", properties.getMaxFileMb());
         out.put("aiEnabled", properties.getAi().isEnabled());
         return out;
     }
@@ -149,6 +152,17 @@ public class ApiController {
         return updateService.rollback();
     }
 
+    /**
+     * Every version this installation has seen, downloaded, applied or rolled back.
+     *
+     * Served from the persisted ledger rather than the release list, so it still answers when the
+     * update check is disabled, GitHub is unreachable or the process has just restarted.
+     */
+    @GetMapping("/update/history")
+    public Map<String, Object> updateHistory() {
+        return updateService.history();
+    }
+
     // ------------------------------------------------------------- filesystem
 
     /**
@@ -170,6 +184,61 @@ public class ApiController {
         return store.sources();
     }
 
+    /**
+     * Tags currently in use across the registry, with counts.
+     *
+     * Backs both the sidebar grouping and the autocomplete in the source form, so it answers with
+     * the spelling that is actually stored rather than a client-side guess.
+     */
+    @GetMapping("/tags")
+    public List<Map<String, Object>> tags() {
+        return store.tagCounts();
+    }
+
+    /**
+     * Downloads the whole registry as a JSON file.
+     *
+     * The filename carries a timestamp because the usual destination is a shared folder or a chat
+     * message, where two exports of the same day must not overwrite each other.
+     */
+    @GetMapping("/sources/export")
+    public ResponseEntity<Map<String, Object>> exportSources() {
+        Map<String, Object> payload = SourceTransfer.exportPayload(store.sources(), java.time.Instant.now());
+        String stamp = java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss")
+                .withZone(java.time.ZoneOffset.UTC)
+                .format(java.time.Instant.now());
+        String filename = "code-association-sources-" + stamp + ".json";
+        return ResponseEntity.ok()
+                .header(org.springframework.http.HttpHeaders.CONTENT_DISPOSITION,
+                        "attachment; filename=\"" + filename + "\"")
+                .contentType(org.springframework.http.MediaType.APPLICATION_JSON)
+                .body(payload);
+    }
+
+    /**
+     * Imports a previously exported registry.
+     *
+     * Merges by type+location: an entry that already exists keeps its row, gains the incoming tags
+     * and takes the incoming branch/token when those are present. Local paths are not required to
+     * exist, because carrying a registry to another machine is the main use of the feature; a
+     * missing path is recorded as a MISSING status instead of failing the import.
+     */
+    @PostMapping("/sources/import")
+    public Map<String, Object> importSources(@RequestBody Object body) {
+        SourceTransfer.Sink sink = new SourceTransfer.Sink() {
+            @Override
+            public RepoSource find(String type, String location) {
+                return store.findByTypeAndLocation(type, location);
+            }
+
+            @Override
+            public RepoSource save(RepoSource source) {
+                return store.saveSource(source);
+            }
+        };
+        return SourceTransfer.importPayload(body, sink);
+    }
+
     @PostMapping("/sources")
     public RepoSource createSource(@RequestBody RepoSource source) {
         if (source.type == null || source.type.isBlank()) {
@@ -179,6 +248,7 @@ public class ApiController {
             throw new IllegalArgumentException("location is required");
         }
         source.type = source.type.toUpperCase();
+        source.tags = SourceTags.normalize(source.tags);
         requireLocalDirectory(source);
         // The name is only a label: derive it from the location instead of asking for it.
         SourceNames.withDerivedName(source);
@@ -198,6 +268,11 @@ public class ApiController {
         existing.location = source.location == null ? existing.location : source.location;
         existing.defaultRef = source.defaultRef;
         existing.credentialEnv = source.credentialEnv;
+        // A PUT is a full replacement, so an empty list is how the UI clears the tags. A null
+        // field means "this client does not manage tags" and must leave the stored list alone.
+        if (source.tags != null) {
+            existing.tags = SourceTags.normalize(source.tags);
+        }
         requireLocalDirectory(existing);
         SourceNames.withDerivedName(existing);
         return store.saveSource(existing);

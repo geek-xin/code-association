@@ -33,6 +33,8 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Stream;
 
@@ -49,8 +51,11 @@ import java.util.stream.Stream;
  *       one and reports {@code restartRequired}; the restart belongs to start.sh/stop.sh. Killing
  *       the JVM from inside the request that asked for it would drop the HTTP response and leave
  *       the UI showing a failed update that actually succeeded;</li>
- *   <li><b>State is in memory plus one directory.</b> Update state is transient by nature: after a
- *       restart the running jar is the truth, so a table would only be able to go stale.</li>
+ *   <li><b>Transient state stays in memory.</b> "Is there an update right now" depends on the
+ *       running process and is re-derived on every view, so caching it in a table could only make
+ *       it stale. The one thing worth persisting is the opposite kind of fact - which versions this
+ *       installation has actually been through - and that lives in {@link UpdateHistory}, which
+ *       degrades to a no-op rather than ever failing a check.</li>
  * </ul>
  */
 @Service
@@ -64,6 +69,9 @@ public class UpdateService {
     private static final Duration CONNECT_TIMEOUT = Duration.ofSeconds(10);
     private static final Duration DOWNLOAD_TIMEOUT = Duration.ofMinutes(10);
     private static final String BACKUP_MARKER = ".bak-";
+    /** Downloaded jars are named after the version so they can be matched without opening them. */
+    private static final String JAR_PREFIX = "code-association-";
+    private static final String JAR_SUFFIX = ".jar";
     /** A failed check is retried after this delay, so a poll loop cannot hammer a dead endpoint. */
     private static final long FAILURE_RETRY_SECONDS = 60;
 
@@ -71,6 +79,19 @@ public class UpdateService {
     private final VersionSource versionSource;
     private final HttpClient downloadClient;
     private final Version runningVersion;
+
+    /** What this installation has seen and done; never throws, so it cannot break a check. */
+    private final UpdateHistory history;
+
+    /**
+     * Versions this process already tried to auto-download.
+     *
+     * Without it a failing download (offline, rate limited, a release whose jar is missing) would be
+     * retried on every status poll, which is exactly the kind of background traffic that gets an
+     * installation blocked. One attempt per version per process is enough: the operator can still
+     * press the download button by hand.
+     */
+    private final Set<String> autoDownloadAttempted = ConcurrentHashMap.newKeySet();
 
     /**
      * When this process started, in epoch millis.
@@ -116,6 +137,7 @@ public class UpdateService {
         this.versionSource = versionSource;
         this.downloadClient = downloadClient;
         this.runningVersion = runningVersion;
+        this.history = new UpdateHistory(properties);
     }
 
     // ---------------------------------------------------------------- status
@@ -152,7 +174,15 @@ public class UpdateService {
     private Map<String, Object> view(String source, List<ReleaseInfo> releases, Instant checkedAt, String error) {
         AppProperties.Update update = properties.getUpdate();
         List<ReleaseInfo> list = releases == null ? List.of() : releases;
+        // The downloads directory is listed once per view and never cached: the file on disk is
+        // the fact, and a jar deleted by hand (or fetched by a previous run) must be reported as
+        // it is rather than as it was when the download finished.
+        Map<String, String> localJars = localJars();
         Version latest = null;
+        // The newest version that can actually be installed. It differs from "latest" only when the
+        // newest tag has no release/jar behind it, and that difference is exactly what stops the
+        // banner from advertising an update nobody can install.
+        Version installable = null;
         for (ReleaseInfo release : list) {
             Version version = Version.tryParse(release.version);
             // Derived flags are recomputed on every view instead of being stored: they depend on
@@ -162,8 +192,17 @@ public class UpdateService {
             // stores the same boolean.
             release.current = version != null && version.compareTo(runningVersion) == 0;
             release.newer = version != null && version.isNewerThan(runningVersion);
+            String key = version == null ? null : version.toString();
+            release.downloaded = key != null && localJars.containsKey(key);
+            release.downloadedAt = key == null ? null : localJars.get(key);
+            // A tags-only entry has no assets, so offering it for download would be a button that
+            // can only fail. Saying "not installable" up front is the honest version of that.
+            release.downloadable = hasInstallableJar(release);
             if (latest == null && version != null) {
                 latest = version;
+            }
+            if (installable == null && version != null && release.downloadable) {
+                installable = version;
             }
         }
         Path jar = runningJar();
@@ -177,7 +216,13 @@ public class UpdateService {
         // re-applying the version you already run would look identical to a completed restart.
         out.put("startedAt", startedAt);
         out.put("latestVersion", latest == null ? null : latest.toString());
+        // Kept separate from latestVersion on purpose: "a newer version exists" and "a newer version
+        // can be installed from here" are different claims, and only the second one justifies
+        // offering a download.
+        out.put("latestInstallableVersion", installable == null ? null : installable.toString());
         out.put("updateAvailable", latest != null && latest.isNewerThan(runningVersion));
+        out.put("installableUpdateAvailable",
+                installable != null && installable.isNewerThan(runningVersion));
         out.put("checkedAt", checkedAt == null ? null : checkedAt.toString());
         out.put("checkIntervalMinutes", update.getCheckIntervalMinutes());
         out.put("source", source);
@@ -188,6 +233,12 @@ public class UpdateService {
         out.put("applySupported", jar != null && !isWindows());
         out.put("busy", working.get());
         out.put("pending", pendingView());
+        // Non-fatal source problems (e.g. the tags endpoint failed while releases worked). An
+        // empty list rather than null, so the frontend can iterate without a guard.
+        out.put("warnings", warnings());
+        out.put("includeTags", update.isIncludeTags());
+        out.put("autoDownload", update.isAutoDownload());
+        out.put("historyTracked", history.size());
         out.put("releases", list);
         return out;
     }
@@ -227,14 +278,14 @@ public class UpdateService {
      * releases survive and only the error and the attempt time move.
      */
     private Snapshot refresh() {
+        Snapshot fresh;
         synchronized (snapshotLock) {
             Snapshot previous = snapshot;
             Instant attemptedAt = Instant.now();
             try {
                 List<ReleaseInfo> releases = versionSource.fetch();
-                Snapshot fresh = new Snapshot(List.copyOf(releases), attemptedAt, attemptedAt, null);
+                fresh = new Snapshot(List.copyOf(releases), attemptedAt, attemptedAt, null);
                 snapshot = fresh;
-                return fresh;
             } catch (UpdateException e) {
                 log.warn("update check failed: {}", e.getMessage());
                 return fail(previous, attemptedAt, e.getMessage());
@@ -246,6 +297,18 @@ public class UpdateService {
                 return fail(previous, attemptedAt, message);
             }
         }
+        // Both of these run outside the lock on purpose: it only protects the in-memory snapshot
+        // and is meant to be short, while recording the ledger and starting a download are I/O.
+        // The try/catch is the belt to UpdateHistory's braces: "checking never throws at the
+        // caller" is the contract of this class, and a bookkeeping side effect must never be the
+        // thing that breaks it.
+        try {
+            history.record(fresh.releases, fresh.checkedAt);
+            autoDownload(fresh);
+        } catch (RuntimeException e) {
+            log.warn("could not record the update history: {}", e.toString());
+        }
+        return fresh;
     }
 
     private Snapshot fail(Snapshot previous, Instant attemptedAt, String error) {
@@ -289,12 +352,16 @@ public class UpdateService {
             DownloadResult result = fetchAsset(asset, part, target);
             // Move only after the header check, so a bad file never appears under the real name.
             Files.move(part, file, StandardCopyOption.REPLACE_EXISTING);
+            Instant downloadedAt = Instant.now();
             Pending downloaded = new Pending();
             downloaded.version = target.toString();
             downloaded.jarPath = file.toAbsolutePath().toString();
             downloaded.bytes = result.bytes;
-            downloaded.downloadedAt = Instant.now().toString();
+            downloaded.downloadedAt = downloadedAt.toString();
             pending = downloaded;
+            // The ledger outlives the process, so after a restart the UI still knows which
+            // versions are already fetched; `pending` alone forgets them when the service stops.
+            history.markDownloaded(downloaded.version, downloadedAt);
             log.info("downloaded {} to {} ({} bytes, sha256={})",
                     target, file, result.bytes, result.sha256);
 
@@ -427,6 +494,21 @@ public class UpdateService {
      *       helper jar; the one named after the app is the one that is actually runnable.</li>
      * </ul>
      */
+    /**
+     * Whether {@link #jarAsset(ReleaseInfo)} would succeed, without throwing to find out.
+     *
+     * The status view runs on every poll, so it must not use exceptions as a control-flow probe:
+     * a tags-only release is an ordinary state of the world, not an error.
+     */
+    static boolean hasInstallableJar(ReleaseInfo release) {
+        for (ReleaseInfo.Asset asset : release.assets) {
+            if (asset.isJar() && !isSideArtefact(asset.name)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     public static ReleaseInfo.Asset jarAsset(ReleaseInfo release) {
         ReleaseInfo.Asset fallback = null;
         for (ReleaseInfo.Asset asset : release.assets) {
@@ -462,6 +544,122 @@ public class UpdateService {
         Path directory = properties.dataPath().resolve("updates");
         Files.createDirectories(directory);
         return directory;
+    }
+
+    /**
+     * The jars already present in {@code {dataDir}/updates}, keyed by version.
+     *
+     * Read from the directory rather than remembered, because the file is the fact: a jar removed
+     * by hand, or downloaded by an earlier run, must be reported the way it is. The listing is done
+     * once per status view (not once per release) and the last-modified time stands in for the
+     * download time - a jar from a previous process has no other record of when it arrived.
+     *
+     * An unreadable or absent directory means "nothing downloaded", never an error: the status
+     * endpoint must keep answering on a fresh installation.
+     */
+    private Map<String, String> localJars() {
+        Map<String, String> out = new LinkedHashMap<>();
+        Path directory = properties.dataPath().resolve("updates");
+        if (!Files.isDirectory(directory)) {
+            return out;
+        }
+        try (Stream<Path> files = Files.list(directory)) {
+            for (Path file : files.toList()) {
+                String name = file.getFileName().toString();
+                if (!name.startsWith(JAR_PREFIX) || !name.endsWith(JAR_SUFFIX)) {
+                    // .part files and anything else in there are not installable jars.
+                    continue;
+                }
+                String raw = name.substring(JAR_PREFIX.length(), name.length() - JAR_SUFFIX.length());
+                Version version = Version.tryParse(raw);
+                if (version == null) {
+                    continue;
+                }
+                out.putIfAbsent(version.toString(), lastModifiedIso(file));
+            }
+        } catch (IOException e) {
+            log.warn("could not list downloaded jars in {}: {}", directory, describe(e));
+        }
+        return out;
+    }
+
+    private static String lastModifiedIso(Path file) {
+        try {
+            return Instant.ofEpochMilli(Files.getLastModifiedTime(file).toMillis()).toString();
+        } catch (IOException e) {
+            log.debug("could not read the modification time of {}", file, e);
+            return null;
+        }
+    }
+
+    /**
+     * Fetches a newly discovered release in the background, when the operator asked for that.
+     *
+     * Three deliberate limits:
+     *
+     * <ul>
+     *   <li><b>Daemon thread, no queue.</b> The check that found the release must not wait for a
+     *       40 MB download, and a thread that would keep the JVM alive after stop.sh is not
+     *       acceptable either;</li>
+     *   <li><b>The {@code working} flag is the mutex.</b> If a download or an apply is already
+     *       running the attempt is dropped, not queued: the user is clearly doing something with
+     *       that slot, and a queue would surface as a surprise download minutes later;</li>
+     *   <li><b>One attempt per version per process.</b> A failure (offline, quota, a release whose
+     *       jar is missing) must not be retried on every status poll.</li>
+     * </ul>
+     *
+     * Failures are logged and swallowed: this is an unsolicited background action, and the caller
+     * of status()/checkNow() has no way to react to it. The reason still reaches the UI through the
+     * next download attempt, which does report it.
+     */
+    private void autoDownload(Snapshot fresh) {
+        if (!properties.getUpdate().isAutoDownload() || fresh.releases.isEmpty()) {
+            return;
+        }
+        ReleaseInfo newest = null;
+        Version newestVersion = null;
+        for (ReleaseInfo release : fresh.releases) {
+            Version version = Version.tryParse(release.version);
+            if (version == null || !version.isNewerThan(runningVersion)) {
+                continue;
+            }
+            // Only a version that actually ships a jar can be downloaded; a tags-only entry would
+            // otherwise be picked as the target and fail on every retry.
+            if (!hasInstallableJar(release)) {
+                continue;
+            }
+            if (newestVersion == null || version.isNewerThan(newestVersion)) {
+                newest = release;
+                newestVersion = version;
+            }
+        }
+        if (newest == null) {
+            return;
+        }
+        String target = newestVersion.toString();
+        // Already on disk (perhaps downloaded before this process started): nothing to fetch.
+        if (localJars().containsKey(target)) {
+            return;
+        }
+        if (!autoDownloadAttempted.add(target)) {
+            return;
+        }
+        Thread thread = new Thread(() -> {
+            // The flag itself is taken by download(); asking here only avoids starting a thread
+            // that is certain to be turned away, and keeps the "skip, never queue" rule visible.
+            if (working.get()) {
+                log.debug("skipping auto-download of {}: another download or apply is running", target);
+                return;
+            }
+            try {
+                download(target);
+            } catch (RuntimeException e) {
+                // Including the lost race for the flag: whoever holds it is already doing the work.
+                log.warn("auto-download of {} failed: {}", target, e.getMessage());
+            }
+        }, "update-auto-download-" + target);
+        thread.setDaemon(true);
+        thread.start();
     }
 
     // ----------------------------------------------------------------- apply
@@ -507,6 +705,7 @@ public class UpdateService {
                 throw new IllegalArgumentException("替换 jar 失败，已尝试恢复原文件：" + describe(e), e);
             }
             pending = null;
+            history.markApplied(target.version, Instant.now());
             log.info("applied {} over {} (backup {})", target.version, jar, backup);
 
             Map<String, Object> out = new LinkedHashMap<>();
@@ -556,10 +755,14 @@ public class UpdateService {
             } catch (IOException e) {
                 throw new IllegalArgumentException("回滚失败：" + describe(e), e);
             }
+            // Recorded against the version that is running again, which is what the history list
+            // should show: the mark belongs to the build the installation went back to.
+            String restored = backupVersion(jar, backup);
+            history.markRolledBack(restored, Instant.now());
             log.info("rolled {} back from {}", jar, backup);
             Map<String, Object> out = new LinkedHashMap<>();
             out.put("rolledBack", true);
-            out.put("version", backupVersion(jar, backup));
+            out.put("version", restored);
             out.put("jarPath", jar.toAbsolutePath().toString());
             out.put("restartRequired", true);
             out.put("swappedAt", System.currentTimeMillis());
@@ -693,6 +896,34 @@ public class UpdateService {
 
     public boolean isEnabled() {
         return properties.getUpdate().isEnabled();
+    }
+
+    /**
+     * The persisted version history of this installation, for {@code GET /api/update/history}.
+     *
+     * Separate from {@link #status()} because the two answer different questions: status is about
+     * the outside world right now, history is about this machine over time. History stays readable
+     * when the update check is disabled or GitHub is unreachable, which is exactly when somebody
+     * looks at it.
+     */
+    public Map<String, Object> history() {
+        return history.snapshot();
+    }
+
+    /**
+     * Problems the source reported for the last fetch that did not make it unusable.
+     *
+     * A misbehaving source must not turn a status call into a 500, so an exception from
+     * {@code warnings()} is reduced to an empty list.
+     */
+    private List<String> warnings() {
+        try {
+            List<String> warnings = versionSource.warnings();
+            return warnings == null ? List.of() : List.copyOf(warnings);
+        } catch (RuntimeException e) {
+            log.debug("version source could not report its warnings", e);
+            return List.of();
+        }
     }
 
     public boolean isBusy() {

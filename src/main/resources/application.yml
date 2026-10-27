@@ -21,6 +21,11 @@ spring:
 code-association:
   data-dir: ./.code-association
   max-files: 20000
+  # Largest single file the indexer will read, in megabytes. Source files are kilobytes; anything
+  # near this is a committed SDK, a database dump or a packaged jar under another extension.
+  # The size is checked before the content is loaded, and a file above it is skipped and named in
+  # the report instead of failing the run. Set to 0 to read every file regardless of size.
+  max-file-mb: 20
   max-depth: 8
   # Daily proactive scan: analyse programs that received new commits, without anyone pressing a
   # button. Only programs whose HEAD moved since their last finished analysis are run, and each
