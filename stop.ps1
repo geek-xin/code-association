@@ -6,9 +6,11 @@
 .DESCRIPTION
     查找顺序：pid 文件 -> 端口反查（Get-NetTCPConnection）-> 命令行匹配 code-association.jar 兜底。
 
-    关键点：不能杀完进程就返回。Spring Boot 的优雅关闭需要 1~3 秒，
-    端口在这期间仍处于监听状态，紧接着启动新实例会撞上 "Port already in use"。
-    所以这里会等到端口真正释放后再退出。
+    关键点：不能杀完进程就返回。进程退出与端口真正释放之间有时间差，
+    紧接着启动新实例会撞上 "Port already in use"。所以这里会等到端口真正释放后再退出。
+
+    与 stop.sh 的差别：POSIX 用 SIGTERM，JVM 会跑 shutdown hook；Windows 没有等价信号，
+    只能 TerminateProcess（shutdown hook 不执行）。对本服务无影响，理由见 Stop-ServiceProcess 上方。
 
         .\stop.ps1                # 默认 9996 端口
         .\stop.ps1 8080           # 位置参数指定端口
@@ -25,6 +27,9 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+# 脚本级"停止失败"标记：Stop-ServiceProcess 只能 return，无法直接把退出码带出去。
+$script:stopFailed = $false
 
 $scriptRoot = $PSScriptRoot
 if ([string]::IsNullOrWhiteSpace($scriptRoot)) { $scriptRoot = (Get-Location).Path }
@@ -132,11 +137,36 @@ function Get-JarProcessId {
     return $owners
 }
 
-# 先优雅、再强制。
-# 优雅的方式用 CloseMainWindow：它给进程的主窗口发 WM_CLOSE，JVM 会跑 shutdown hook，
-# Spring 才能正常关连接池、刷盘。对没有窗口的进程（java.exe 在隐藏窗口里运行）它返回
-# False，此时只能 Stop-Process：Windows 没有 POSIX 的 SIGTERM，TerminateProcess 不执行
-# shutdown hook，所以只要有一线可能就先走优雅路径，并给 3 秒让它自己退。
+# Windows 没有 POSIX 的 SIGTERM：TerminateProcess 不执行 JVM 的 shutdown hook。
+# 但 java.exe 是控制台程序，控制台窗口归 conhost.exe 所有，MainWindowHandle 恒为 0，
+# CloseMainWindow() 因此永远返回 False —— 对 java 走这条"优雅"路径从来没有成功过，
+# 代价却是每次停止都白等 3 秒，还打印一句"进程无窗口"让人以为出了问题。
+#
+# 现在先看窗口句柄：有主窗口（包装器或别的启动方式）才尝试投递关闭信号，
+# 没有就直接结束进程。走了哪条路用 -Verbose 看，默认输出只留结果。
+#
+# 直接结束对本服务是可接受的，因为这里没有"关到一半"的状态：
+#   - 应用代码没有注册任何 shutdown hook（也没有 @PreDestroy）；
+#   - Spring 自带的关闭钩子只做上下文关闭，而它在 TerminateProcess 下同样不会执行，
+#     也就是说"优雅"与"直接结束"实际做的事没有区别；
+#   - SQLite 用默认的 rollback journal，进程被杀后下次连接自动回滚，不会留下半个事务；
+#   - 被中断的分析在下次启动时由 recoverStaleAnalyses 标记为失败，不会永远停在 RUNNING。
+
+# 三态：Running / Exited / Unknown。用三态而不是布尔，是因为"读不到状态"既不能当成
+# "还在跑"（会误报失败、白等），也不能当成"已经停了"（会谎报成功）。
+function Get-ProcessState {
+    param([System.Diagnostics.Process]$TargetProcess)
+
+    try {
+        $TargetProcess.Refresh()
+        if ($TargetProcess.HasExited) { return 'Exited' }
+        return 'Running'
+    } catch {
+        # 句柄已失效：绝大多数情况是进程刚好退出了，但脚本无法证明这一点。
+        return 'Unknown'
+    }
+}
+
 # 变量名不能叫 $PID：那是 PowerShell 的自动变量（当前进程 PID），覆盖它会让脚本杀错进程。
 function Stop-ServiceProcess {
     param([int]$TargetId)
@@ -147,35 +177,56 @@ function Stop-ServiceProcess {
         return
     }
 
-    # CloseMainWindow 对隐藏窗口/无窗口的 java.exe 基本都返回 False，
-    # 所以不能"没信号就直接强杀"：仍然给 3 秒，让它在收到 WM_CLOSE 或自行收尾时体面退出。
-    # 这段等待是刻意无条件的，代价最多 3 秒，换来的是尽量不打断 Spring 的关闭流程。
-    $signaled = $false
-    try { $signaled = $targetProcess.CloseMainWindow() } catch { $signaled = $false }
+    # MainWindowHandle 是 IntPtr，与 0 比较在 PowerShell 里能正确得到 Boolean；
+    # 拿不到句柄（权限不足、进程正在退出）时按"没有窗口"处理。
+    $hasWindow = $false
+    try { $hasWindow = ($targetProcess.MainWindowHandle -ne 0) } catch { $hasWindow = $false }
 
-    if ($signaled) {
-        Write-Host "已发送关闭信号 (PID $TargetId)，等待优雅退出…"
+    if ($hasWindow) {
+        $signaled = $false
+        try { $signaled = $targetProcess.CloseMainWindow() } catch { $signaled = $false }
+        if ($signaled) {
+            Write-Host "已发送关闭信号 (PID $TargetId)，等待优雅退出…"
+            # Wait-Process 超时会抛错，这里吞掉，交给下面的强制结束处理。
+            try { Wait-Process -Id $TargetId -Timeout 3 -ErrorAction Stop } catch { }
+        } else {
+            Write-Verbose "PID $TargetId 有主窗口但没有接受关闭信号，改为结束进程"
+        }
     } else {
-        Write-Host "进程无窗口，无法发送关闭信号，先等待 3 秒再强制结束…"
+        Write-Verbose "PID $TargetId 是控制台进程（无主窗口），Windows 无法投递关闭信号，直接结束进程"
     }
 
-    # Wait-Process 超时会抛错，这里吞掉，交给下面的强制结束处理。
-    try { Wait-Process -Id $TargetId -Timeout 3 -ErrorAction Stop } catch { }
+    # 用 HasExited 判定，不要用"刚才发过信号"来推断。HasExited 绑定在已打开的句柄上，
+    # 即使目标退出后 PID 被系统复用，也不会把新进程误判成本进程。
+    # 读不到状态时既不当成"还在跑"，也不当成"已经停了"，而是交给下面的 Unknown 分支。
+    $state = Get-ProcessState -TargetProcess $targetProcess
 
-    # Refresh / HasExited 在进程刚好消失时可能抛异常（句柄已失效），
-    # 这里一律当作"已经退出"，不要让收尾逻辑把脚本搞崩。
-    $stillRunning = $true
-    try {
-        $targetProcess.Refresh()
-        $stillRunning = -not $targetProcess.HasExited
-    } catch {
-        $stillRunning = $false
-    }
-
-    if ($stillRunning) {
-        Write-Host "强制结束 (PID $TargetId)"
-        Stop-Process -Id $TargetId -Force -ErrorAction SilentlyContinue
+    if ($state -eq 'Running') {
+        Write-Verbose "结束进程 (PID $TargetId)"
+        # 优先用句柄上的 Kill()：它在打开句柄的那一刻就绑定了目标，
+        # 而 Stop-Process -Id 会在"取句柄"和"发终止"之间按 PID 重新解析一次，
+        # 恰好在这个窗口里目标退出、PID 又被复用，就会杀掉无关的新进程。
+        try {
+            $targetProcess.Kill()
+        } catch {
+            # 句柄方式失败（权限不足、进程已退出）时退回 Stop-Process，
+            # 它还能覆盖"进程属于别的用户"这类需要走不同路径的情形。
+            Stop-Process -Id $TargetId -Force -ErrorAction SilentlyContinue
+        }
         try { $targetProcess.WaitForExit(5000) | Out-Null } catch { }
+        $state = Get-ProcessState -TargetProcess $targetProcess
+
+        if ($state -eq 'Running') {
+            Write-Host "无法结束进程 (PID $TargetId)：可能权限不足（试试以管理员身份运行）"
+            $script:stopFailed = $true
+            return
+        }
+    }
+
+    if ($state -eq 'Unknown') {
+        # 唯一无法证明"真的停了"的分支：不谎报成功，也不谎报失败。
+        Write-Host "已发出结束请求 (PID $TargetId)，但无法确认进程状态，请用 netstat -ano 复查"
+        return
     }
 
     Write-Host "已停止 (PID $TargetId)"
@@ -201,8 +252,19 @@ if (Test-Path -LiteralPath $pidFile -PathType Leaf) {
 }
 
 # pid 文件没给出可用 PID 时按端口反查，与 POSIX 版用 lsof 反查是同一个思路。
+#
+# 端口上是谁，脚本并不知道：这里必须像 POSIX 版（stop.sh 的 pid_is_ours）一样确认
+# 它真的是本服务，否则 stop.bat 8080 会把恰好占用 8080 的无关程序杀掉。
+# 确认不了（拿不到命令行，通常是权限不足）时按本服务处理——用户既然点名了这个端口，
+# 拒绝执行反而让"停不掉"变成新的问题；但这种情况会明确说出来。
 if ($targets.Count -eq 0) {
-    foreach ($ownerId in (Get-PortOwnerPid -PortNumber $portNumber)) { $targets.Add($ownerId) }
+    foreach ($ownerId in (Get-PortOwnerPid -PortNumber $portNumber)) {
+        if (Test-ServicePid -TargetId $ownerId) {
+            $targets.Add($ownerId)
+        } else {
+            Write-Host "跳过 PID $ownerId：它占用端口 $portNumber 但不是本服务"
+        }
+    }
 }
 
 # 端口上也找不到时，最后按命令行兜底。
@@ -234,6 +296,10 @@ for ($attempt = 0; $attempt -lt 40; $attempt++) {
 
 if ($released) {
     Write-Host "端口 $portNumber 已释放"
+    # 端口释放不代表"该停的都停了"：进程可能还活着，只是不再监听这个端口。
+    # 退出码是自动化（stop.bat && start.bat、CI、服务包装器）唯一能看到的信号，
+    # 所以结束失败必须以非 0 退出，否则它们会以为服务已经关了。
+    if ($script:stopFailed) { exit 1 }
     exit 0
 }
 
