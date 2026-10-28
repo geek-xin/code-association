@@ -3,9 +3,9 @@
 # release.sh — 构建、打包并发布 code-association 到 GitHub Release
 #
 # 用法:
-#   ./release.sh                  # 发布默认版本 0.6.1
-#   ./release.sh 0.6.1            # 发布指定版本
-#   VERSION=0.6.1 ./release.sh    # 同上（环境变量方式）
+#   ./release.sh                  # 发布默认版本 0.7.0
+#   ./release.sh 0.7.0            # 发布指定版本
+#   VERSION=0.7.0 ./release.sh    # 同上（环境变量方式）
 #
 # 产物:
 #   build/release/code-association-<version>/            # 干净的发布目录
@@ -40,7 +40,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 APP="code-association"
-VERSION="${1:-${VERSION:-0.6.1}}"
+VERSION="${1:-${VERSION:-0.7.0}}"
 TAG="v${VERSION}"
 RELEASE_ROOT="build/release"
 STAGE="${RELEASE_ROOT}/${APP}-${VERSION}"
@@ -358,70 +358,65 @@ cat > "$NOTES" <<'NOTES_TEMPLATE'
 跨程序变更影响扫描工具（Java / Maven 多模块仓库）：分析一次提交改动了哪些类、方法、
 SQL、MQ 消息结构，并推导出对其他模块 / 服务的连带影响与风险等级。
 
-这一版没有新功能，全部是 0.6.0「字段级数据库契约」落地之后暴露出来的误报与漏报。
-数据库契约的准入条件现在固定为四步：**同一数据库对象 → 变更可被观察 → 类型兼容 →
-字段级命中**。不满足的不扩散，只计数并在报告里说明，或者进「字段盲区」等人确认。
-此前「同名表就命中」「加一列和删一列一样严重」这类结果不会再出现。
+这一版有两个主题。**日志可运维**：应用日志按天滚动、保留 7 天，关键节点改成可检索的
+结构化事件行，进程原始输出单独收集。**数据库影响判断继续收紧**：一条 `ALTER` 的多个
+动作分别报告；表重命名按旧表名命中；`NOT NULL` 且无默认值的列开始命中省略它的
+`INSERT`，不再只算「盲区」。
 
-### 本次重点：先确认是同一张表
+### 本次重点：日志可运维
 
-- 契约 key 仍是 `表.字段`，但匹配前先比较两侧的数据源身份：从
-  `spring.datasource.url` / `spring.datasource.*.url` / `spring.datasource.hikari.jdbc-url`
-  解析数据库名，从 SQL 与 DDL 的 `schema.table` 读取显式 schema。
-- 两侧都已知且同层级不同 → 排除并计数；一侧未知 → 保留匹配但降低置信度；
-  H2 mem / HSQLDB / Derby / SQLite 视为未知，因为进程内数据库不共享数据。
-- 报告会说明有多少候选因数据库不同被排除、多少条因一侧未声明数据库而无法确认同库，
-  而不是让它们悄悄消失。
+- 应用日志统一写到 `logs/`：`code-association.log` 是 INFO 及以上的完整时间线，
+  `code-association-error.log` 只收 ERROR，`archive/*.log.gz` 是滚动归档。
+  目录由 `code-association.log-dir` 决定（默认 `./logs`，环境变量 `LOG_DIR` 可覆盖），
+  与数据目录 `.code-association/` 分开，日志随时可清空。
+- 按天滚动，单文件超过 50MB 再切；只保留 7 天，`cleanHistoryOnStart=true` 让
+  「停了一周再启动」也立刻清掉过期归档。主日志上限 500MB、错误日志 200MB，上限先于时间生效。
+- 写盘走 `AsyncAppender`：分析线程不为日志 IO 停顿，队列满时阻塞而不是丢日志；
+  主日志与错误日志各用一个异步器（`AsyncAppender` 只接受一个 `appender-ref`）。
+- 会被反复查询的节点统一写成结构化事件行，例如
+  `event=analysis.done analysisId=42 source=order-service status=DONE durationMs=8421 high=1 medium=3 low=2`：
+  事件名小写点分且稳定，字段 camelCase，每条带定位 id 与 `durationMs`，可直接
+  `grep 'event=analysis.done'` 或按空白切字段。覆盖分析链路、定时扫描、代码源增删改与
+  导入导出、版本检查与更新、AI 配置与进程启停。
+- `start.sh` / `start.ps1` 的进程原始输出改到 `logs/console.log`（Windows stderr 为
+  `logs/console.err.log`），每次启动截断，专收 logback 初始化之前的错误与 JVM 崩溃输出。
+- 测试不落盘：`logback-test.xml` 只写控制台，跑测试不会污染 `logs/`。
 
-### 本次重点：DDL 按「变更可被观察」分型
+### 本次重点：数据库跨程序影响
 
-- 会扩散：`DROP COLUMN`、收窄类型（`VARCHAR(64) → VARCHAR(32)`、`BIGINT → INT`）、
-  类型族变化 → 命中读方、写方、映射方。
-- 不扩散只计数：`ADD COLUMN`、`CREATE TABLE`、删除迁移脚本、
-  类型放宽（`VARCHAR(32) → VARCHAR(64)`、`INT → BIGINT`）。加列 / 建表 / 删除迁移脚本
-  以前是「悄悄消失」，现在报告给出「对对方不可观察的变更」计数与示例。
-- 新增 `ColumnTypeCompatibility`：按字符串长度、整数等级、decimal 精度 / scale、
-  可空性与安全提升判断兼容性；判断不了就保留命中并降低置信度，不猜。
-- decimal 的整数位补上了：`DECIMAL(10,2) → DECIMAL(10,4)` 的 scale 变大、precision 不变，
-  但整数位从 8 位降到 6 位，`12345678.99` 放不进去——现在按收窄扩散，不再当成兼容抑制。
-- 加列只对 `SELECT *` / 无列名 INSERT 形成字段盲区；删除迁移脚本不再被当成 schema 回滚。
+- **一条 `ALTER TABLE` 的多个动作按动作报告。** 以前每种动作只抓第一个：
+  `ADD a INT, ADD b INT` 只看得到 `a`，`ADD a, DROP b` 甚至把 `ADD` 的类型留在
+  `DROP` 的记录里。现在按顶层逗号拆出全部动作（括号 / 字符串内的逗号不拆），每个动作记
+  `kind / table / column / type / nullable / default / schema / renamedTo`；变更检测按
+  `kind|table|column` 对齐两侧动作，新增、修改、移除各生成一条 `DDL_CHANGED`，
+  因为加列、删列、改类型对读写方的后果不同，不能共用一条结论。语句级旧字段仍保留第一个
+  动作，旧索引与旧报告继续可读；`ADD INDEX`、`ADD CONSTRAINT`、`ENGINE=` 等非列动作被忽略。
+- **表重命名按旧表名的表级契约命中。** `ALTER TABLE orders RENAME TO orders_archive`
+  （含顶层 `RENAME TABLE ... TO ...`）现在生成 `RENAME_TABLE` 记录：契约写旧表名，
+  风险种子 0.90，对方读、写、映射旧表的代码都会命中。新表名刻意不产生候选——它是这次
+  改名才出现的，报它等于把同一次改名算两遍。列重命名也不再额外产生一条
+  「新列名被当成不可观察加列」的假计数。
+- **`NOT NULL` 且无默认值的列开始命中写入方。** 对方一条
+  `INSERT INTO orders (id) VALUES (?)` 省略了新增必填列，MySQL 严格模式、PostgreSQL、
+  Oracle 都会拒绝——这是真实不兼容，不该只算盲区。规则只命中完整的 `INSERT`
+  （非动态 SQL）且列清单里没有该列的语句；`UPDATE` / `DELETE` 不命中，`SELECT *` 与
+  动态 SQL 仍计入字段盲区且不重复计数。列可空、有默认值，或由数据库自动填充
+  （`AUTO_INCREMENT` / `GENERATED` / `IDENTITY`）时都不算必填。
+- **报告口径**：新增「必填列变更」计数与后果说明；这类变更不再同时计入
+  「对对方不可观察」（否则同一件事既说「对方看不见」又说「对方写入会失败」）。
+  「不可观察变更」的措辞同步覆盖「移除 DDL 动作」。
+- **顺手修掉的解析问题**：多语句 `.sql` 中第二条语句的行号曾被算成上一行，导致
+  `sql:文件#行号` key 撞车、前一条语句被覆盖；现在按第一条非空白字符计算，多语句脚本的
+  每个语句都有独立 key。DDL 定义里的 `DEFAULT 'a,b'` 不再被顶层逗号拆分。
 
-### 本次重点：实体映射与数据库 schema 解耦
+### 已知边界
 
-- `FIELD_ADDED` 不再产生数据库 delta；`FIELD_REMOVED` / `FIELD_TYPE_CHANGED`
-  只对同样映射该列的对方代码给出低置信度 mapping 提示，不再命中 SQL 读写方。
-- `@Transient`、`static`、集合类型不建列映射；显式 `@Column` / `@JoinColumn`
-  优先于隐式命名；隐式命名按 Hibernate 边界转换（`userID → user_id`、`URLPath → url_path`）。
-
-### 本次重点：解析加固
-
-- 解析前剥离 SQL 行注释与块注释：注释掉的 `ALTER TABLE ... DROP COLUMN` 不再生效，
-  纯注释改动不再产生 `SQL_CHANGED`。
-- MySQL 的 `#` 行注释同样识别：`#` 注释里的分号不再把一条 DDL 切成两条。
-  MyBatis 的 `#{id}` 占位符与 PostgreSQL 的 `#>` / `#-` 运算符不受影响。
-- 单引号内的反斜杠转义被识别：`'it\'s'` 不再被当成「字符串到此结束」，
-  后半句不会被当作 SQL 解析。
-- 同一 SQL 从一个 mapper / 迁移文件移到另一个时，按规范化文本配对
-  `SQL_REMOVED` 与 `SQL_ADDED` 并抵消——「文件搬家」不会被读成「本程序停止写这一列」。
-- 动态 SQL（`<if>` / `<choose>` / `<foreach>` / `<include>`、占位符拼接）不再降级为
-  表级契约，对方侧改为计入字段盲区。
-- `src/test/` 下的 mapper、`schema.sql`、`data.sql` 与迁移脚本不参与生产契约。
-- `ADD INDEX` / `ADD CONSTRAINT` / `DROP INDEX` 不再被当成列；`INSERT ... SELECT`
-  读取目标列清单；`ON DUPLICATE KEY UPDATE` 不再凭空造出名为 `status` 的表。
-- ALTER / 迁移脚本：识别 PostgreSQL 风格 `ALTER COLUMN ... SET/DROP NOT NULL / SET DEFAULT`、
-  `ADD/DROP COLUMN IF [NOT] EXISTS`、`RENAME COLUMN`；多动作 ALTER 的类型不再吞掉后续动作；
-  迁移脚本按数值版本排序（V10 在 V2 后）；按引号 / 注释外的分号切分语句；
-  DDL 只在语句开头识别，字符串字面量里的 `CREATE TABLE` 不再污染快照。
-
-### 报告
-
-- 新增「因数据库不同被排除」「因类型兼容被排除」「对对方不可观察」三组计数与说明。
-- 兼容变更与不可观察变更按**变更**计：此前按「变更 × 对比程序」累加，对比的程序越多，
-  同一个数字越大。
-- 字段盲区口径修正为「读写列都没解析出来或语句不完整」，已作为 writer 命中的纯写语句
-  不重复计入。
-- 文档新增 `docs/wiki/数据库影响判断.md`：四个准入条件、DDL 分型对照表、类型兼容规则、
-  字段盲区口径，以及仍然存在的边界（值语义、事务并发、视图 / 触发器 / 存储过程、运行时 SQL）。
+数据库侧仍不分析：写入列集合不变但值语义变了（如 `status 1 → 2`）、事务与锁顺序、
+视图 / 触发器 / 存储过程 / 外键级联、真实数据分布、运行时实际 SQL，以及同一程序
+多数据源 / 多 schema 下同名表的快照键冲突。自动填充列只识别 `ALTER` 列定义文本里的
+`AUTO_INCREMENT` / `GENERATED` / `IDENTITY`，触发器、序列等其他机制未识别。
+报告的「未发现影响」只表示静态契约层没有找到不兼容证据；`SELECT *` 与动态 SQL
+仍以「字段盲区」列出，需要人工确认。
 
 ### 下载
 
@@ -464,9 +459,11 @@ stop.bat
 更早的版本换完只会提示你自己执行 `stop.sh` / `start.sh`。
 0.3.0 及更早的版本没有应用内更新，请手动下载替换 jar（旧 jar 会被备份为 `.bak-<版本>`，可回滚）。
 
-这一版只改分析结果，不改接口、配置与更新机制：升级后不需要改 `application.yml`，
-历史报告也不会被重写——要看到新的判定，请重新分析一次。
-
+本版不改接口与更新机制；新增一个可选的日志目录配置 `code-association.log-dir`
+（默认 `./logs`，环境变量 `LOG_DIR` 可覆盖），不设置也能正常启动。
+但日志位置有变化：应用日志改到 `logs/`，启动脚本的进程输出改到 `logs/console.log`
+（Windows 为 `logs/console.err.log`），旧版写在根目录的 `code-association.log` 不再更新。
+历史报告不会重写——要看到新的判定，请重新分析一次。
 NOTES_TEMPLATE
 render "$NOTES"
 
