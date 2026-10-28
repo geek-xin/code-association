@@ -83,7 +83,7 @@ type：`feat` / `fix` / `docs` / `refactor` / `test` / `build` / `chore`
 ## 发布流程（维护者）
 
 ```bash
-./release.sh 0.2.2     # 构建 + 打标签 + 上传 tar.gz/zip 到 GitHub Release
+./release.sh 0.6.0     # 构建 + 打标签 + 上传 tar.gz/zip/jar 到 GitHub Release
 ```
 
 脚本从 `git archive` 的干净副本构建，不会覆盖运行中的 jar。

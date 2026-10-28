@@ -313,7 +313,11 @@ public class RestartSupervisor {
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("supported", isSupported());
         out.put("unsupportedReason", unsupportedReason());
-        out.put("running", inFlight || isInFlight(phase));
+        // "running" is reported right next to "phase", and neither is read under a lock: an attempt
+        // that finished between the two reads used to come back as "finished and still running" at
+        // the same time. A terminal phase therefore decides - every path that sets one has already
+        // stopped working on the attempt, while the flag is cleared after the status write.
+        out.put("running", isInFlight(phase));
         out.put("phase", phase);
         out.put("startedAt", startedAt);
         out.put("finishedAt", finishedAt);
@@ -403,8 +407,8 @@ public class RestartSupervisor {
         synchronized (statusLock) {
             status = failed;
         }
-        RestartStatus.write(statusFile(), failed);
         running.set(false);
+        RestartStatus.write(statusFile(), failed);
     }
 
     /**
@@ -461,34 +465,37 @@ public class RestartSupervisor {
                 }
                 long timeoutMillis = Math.max(1, properties.getUpdate().getRestartTimeoutSeconds()) * 1000L;
                 if (awaitHealthy(System.currentTimeMillis() + timeoutMillis)) {
+                    // Clear the flag before publishing the terminal phase: the status file write is
+                    // slow enough (ms) for a poller to read the phase and the flag in between.
+                    running.set(false);
                     updateStatus(statusFile, RestartStatus.PHASE_SUCCEEDED,
                             "新版本已启动并通过健康检查", false);
-                    running.set(false);
                     return;
                 }
                 log.warn("the new build did not answer {}; rolling back to {}", healthUrl(), backup);
                 if (backup == null || !Files.isRegularFile(backup)) {
+                    running.set(false);
                     updateStatus(statusFile, RestartStatus.PHASE_FAILED,
                             "新版本未通过健康检查，且没有可用的备份 jar", false);
-                    running.set(false);
                     return;
                 }
                 updateStatus(statusFile, RestartStatus.PHASE_WAITING, "新版本未通过健康检查，正在回滚", true);
                 Files.copy(backup, jar, StandardCopyOption.REPLACE_EXISTING);
                 history.markRolledBack(backupVersion(jar, backup), Instant.now());
                 launcher.start(javaCommand(jar), logFile());
-                if (awaitHealthy(System.currentTimeMillis() + timeoutMillis)) {
+                boolean recovered = awaitHealthy(System.currentTimeMillis() + timeoutMillis);
+                running.set(false);
+                if (recovered) {
                     updateStatus(statusFile, RestartStatus.PHASE_ROLLED_BACK,
                             "新版本未通过健康检查，已回滚并重新启动旧版本", true);
                 } else {
                     updateStatus(statusFile, RestartStatus.PHASE_FAILED,
                             "回滚后旧版本仍未通过健康检查，请查看日志", true);
                 }
-                running.set(false);
             } catch (IOException | RuntimeException e) {
                 log.warn("in-process restart supervision failed: {}", e.toString());
-                updateStatus(statusFile, RestartStatus.PHASE_FAILED, "重启失败：" + describe(e), true);
                 running.set(false);
+                updateStatus(statusFile, RestartStatus.PHASE_FAILED, "重启失败：" + describe(e), true);
             }
         }, "update-restart-watch-" + appliedVersion);
         thread.setDaemon(true);
