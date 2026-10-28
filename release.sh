@@ -3,9 +3,9 @@
 # release.sh — 构建、打包并发布 code-association 到 GitHub Release
 #
 # 用法:
-#   ./release.sh                  # 发布默认版本 0.6.0
-#   ./release.sh 0.6.0            # 发布指定版本
-#   VERSION=0.6.0 ./release.sh    # 同上（环境变量方式）
+#   ./release.sh                  # 发布默认版本 0.6.1
+#   ./release.sh 0.6.1            # 发布指定版本
+#   VERSION=0.6.1 ./release.sh    # 同上（环境变量方式）
 #
 # 产物:
 #   build/release/code-association-<version>/            # 干净的发布目录
@@ -40,7 +40,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 APP="code-association"
-VERSION="${1:-${VERSION:-0.6.0}}"
+VERSION="${1:-${VERSION:-0.6.1}}"
 TAG="v${VERSION}"
 RELEASE_ROOT="build/release"
 STAGE="${RELEASE_ROOT}/${APP}-${VERSION}"
@@ -356,136 +356,61 @@ cat > "$NOTES" <<'NOTES_TEMPLATE'
 跨程序变更影响扫描工具（Java / Maven 多模块仓库）：分析一次提交改动了哪些类、方法、
 SQL、MQ 消息结构，并推导出对其他模块 / 服务的连带影响与风险等级。
 
-### 本次重点：按提交范围评审
+这一版没有新功能，全部是 0.6.0「字段级数据库契约」落地之后暴露出来的误报与漏报。
+数据库契约的准入条件现在固定为四步：**同一数据库对象 → 变更可被观察 → 类型兼容 →
+字段级命中**。不满足的不扩散，只计数并在报告里说明，或者进「字段盲区」等人确认。
+此前「同名表就命中」「加一列和删一列一样严重」这类结果不会再出现。
 
-新增分析模式 `COMMIT_RANGE`：起点「起始提交（不含）」与「结束提交（含）」两端明确指定，
-用于「这 12 个提交是我要合进去的」这类以提交为单位、而不是以分支名为单位的评审。
+### 本次重点：先确认是同一张表
 
-- 弹窗选到该模式后，两个输入框变成起始 / 结束提交，输入时给出该仓库的提交下拉
-  （短 SHA + 提交标题），下方实时预览本次范围**包含哪些提交**（防抖 300ms，
-  读取失败只显示一行提示，不打断表单）。
-- 新增 `GET /api/sources/{id}/commits`：只带 `ref` 时返回该分支最新提交，
-  带 `base` + `target` 时返回该范围内的提交，两种形态同一份响应结构。
-- 报告新增 `commits` / `commitCount` / `rangeNote`，分析页新增「提交范围」卡片，
-  PR 评论（`--format markdown`）在影响明细之前列出本次提交。最多列 200 个
-  （按提交时间倒序），超出时注明「只列出最新的 N 个」，而不是把截断列表当作全部。
-- **范围必须是同一条提交线上的祖先关系**：起始提交不在结束提交的历史里时直接拒绝，
-  并说明是哪一端不成立。否则仍会产出 diff，但那是在比较两个无关快照，
-  报告会显得正常而实际答非所问。
-- **只分析选中的几个提交**：预览里每一行都能勾选，勾中的提交才进分析。
-  基线取最旧那个选中提交的父提交，目标树是选中提交按拓扑从旧到新依次叠加的结果，
-  所以 diff 恰好只包含它们碰过的文件；跨分支的选择描述的是一个从未存在过的树，
-  直接拒绝并指出哪个提交不在线上。报告新增 `selectedCommits`。
-- 命令行新增 `--range <起始>..<结束>`，等价于 `--base` + `--target` 并切到
-  `COMMIT_RANGE`；范围解析失败改为**退出码 2 + 一句人话**，
-  此前是未捕获异常，整段堆栈把原因淹没了。
+- 契约 key 仍是 `表.字段`，但匹配前先比较两侧的数据源身份：从
+  `spring.datasource.url` / `spring.datasource.*.url` / `spring.datasource.hikari.jdbc-url`
+  解析数据库名，从 SQL 与 DDL 的 `schema.table` 读取显式 schema。
+- 两侧都已知且同层级不同 → 排除并计数；一侧未知 → 保留匹配但降低置信度；
+  H2 mem / HSQLDB / Derby / SQLite 视为未知，因为进程内数据库不共享数据。
+- 报告会说明有多少候选因数据库不同被排除、多少条因一侧未声明数据库而无法确认同库，
+  而不是让它们悄悄消失。
 
-### 本次重点：数据库契约的单位从「表」改为「字段」
+### 本次重点：DDL 按「变更可被观察」分型
 
-- 此前只要本程序有一条 SQL 变了，就把这条语句读写的**表**当成变更契约，对方凡是读写
-  同一张表的代码全部命中。「给自己多查一个字段」这种纯内部改动，也会把对方所有碰这张表的
-  模块拉进候选队列，噪声盖住了真正需要通知对方的那几条。
-- 现在本程序侧的数据库变更只收三类：**表结构变更（DDL）**（`ALTER TABLE ... ADD / DROP /
-  MODIFY COLUMN` 落到具体字段）、**写入字段集合变化**（`INSERT` 列清单、`UPDATE SET` 列
-  新增或消失）、**实体字段映射变化**（`@Column` 映射的 Java 字段新增 / 删除 / 类型变化）。
-  只改 `WHERE`、`JOIN`、排序的语句不再产生跨程序数据库影响。
-- 匹配侧改为命中对方 `db:column:<table>.<column>` 上的使用点（读 / 写 / 实体映射），
-  命中条目为 `DB_COLUMN`。**只改读取字段集合不扩散**：读多少列是本程序的内部行为，
-  对方的查询不会因此失败。写入字段集合变化只命中读方；表结构变更命中读方与写方。
-- 风险种子按操作区分：删字段 / 删表 0.95、改字段类型 0.90、写入字段集合变化 0.85、
-  加字段 / 建表 0.60。删比加严重：加一列对方按列名读写通常无害，删一列对方照常运行却读到空值。
-- 对方写 `SELECT *` 或语句无法解析出列名时不再命中字段级契约，但会**计数并在报告里标注
-  「字段盲区」**——「没读到」不能当成「没影响」。
+- 会扩散：`DROP COLUMN`、收窄类型（`VARCHAR(64) → VARCHAR(32)`、`BIGINT → INT`）、
+  类型族变化 → 命中读方、写方、映射方。
+- 不扩散只计数：`ADD COLUMN`、`CREATE TABLE`、删除迁移脚本、
+  类型放宽（`VARCHAR(32) → VARCHAR(64)`、`INT → BIGINT`）。
+- 新增 `ColumnTypeCompatibility`：按字符串长度、整数等级、decimal 精度 / scale、
+  可空性与安全提升判断兼容性；判断不了就保留命中并降低置信度，不猜。
+- 加列只对 `SELECT *` / 无列名 INSERT 形成字段盲区；删除迁移脚本不再被当成 schema 回滚。
 
-### 本次重点：AI 审核从「只能改配置文件」变成可选功能
+### 本次重点：实体映射与数据库 schema 解耦
 
-`AiExplainer` 早已存在，但只能在 `application.yml` 里配置，生成的 `report.ai` 前端从未
-渲染，历史报告无法补生成，也没有测试连接。现在：
+- `FIELD_ADDED` 不再产生数据库 delta；`FIELD_REMOVED` / `FIELD_TYPE_CHANGED`
+  只对同样映射该列的对方代码给出低置信度 mapping 提示，不再命中 SQL 读写方。
+- `@Transient`、`static`、集合类型不建列映射；显式 `@Column` / `@JoinColumn`
+  优先于隐式命名；隐式命名按 Hibernate 边界转换（`userID → user_id`、`URLPath → url_path`）。
 
-- 设置页新增「AI 审核」卡片：启用开关、接口地址、模型、API Key、每条分析最多送审影响、
-  请求超时、是否默认生成。「测试连接」发一个只要求模型回 `pong` 的最小请求并显示实际端点
-  与耗时，配置错误的代价从「等一次分析失败」降到一次点击。三个快捷填充
-  （DeepSeek / OpenAI / Ollama 本地）只填地址与模型，不动 Key。
-- 新增 `GET /api/ai`、`PUT /api/ai`、`POST /api/ai/test`、
-  `POST /api/analyses/{id}/ai-review`；配置持久化到 `{data-dir}/ai-settings.json`
-  （原子写，POSIX 下尽量 `chmod 600`）。
-- `apiKey` 绝不出现在响应、日志与错误信息里，读回的一律是掩码；保存时留空表示不修改，
-  只有显式 `clearApiKey` 才清空。掩码回填的表单若把掩码当明文写回，Key 会在第一次保存后
-  悄悄失效，而界面上看不出任何异常。
-- 分析页新增 AI 卡片，按状态给出不同的下一步；正文走既有简易渲染器（模型输出不直接进
-  innerHTML），上方是随内容一起存下的 `disclaimer`，下方是模型、生成时间与送审条数。
-- 失败只影响这张卡：401、超时、响应无法解析都只把原因写进卡片，静态分析结论与 `--fail-on`
-  退出码不受影响。命令行新增 `--ai`；未配置时打印一行提示并保持原退出码。
-- 关闭（默认）时报告、健康检查与分析流程与改动前完全一致。
+### 本次重点：解析加固
 
-### 本次重点：应用更新后自动重启，失败自动回滚
+- 解析前剥离 SQL 行注释与块注释：注释掉的 `ALTER TABLE ... DROP COLUMN` 不再生效，
+  纯注释改动不再产生 `SQL_CHANGED`。
+- 同一 SQL 从一个 mapper / 迁移文件移到另一个时，按规范化文本配对
+  `SQL_REMOVED` 与 `SQL_ADDED` 并抵消——「文件搬家」不会被读成「本程序停止写这一列」。
+- 动态 SQL（`<if>` / `<choose>` / `<foreach>` / `<include>`、占位符拼接）不再降级为
+  表级契约，对方侧改为计入字段盲区。
+- `src/test/` 下的 mapper、`schema.sql`、`data.sql` 与迁移脚本不参与生产契约。
+- `ADD INDEX` / `ADD CONSTRAINT` / `DROP INDEX` 不再被当成列；`INSERT ... SELECT`
+  读取目标列清单；`ON DUPLICATE KEY UPDATE` 不再凭空造出名为 `status` 的表。
+- ALTER / 迁移脚本：识别 PostgreSQL 风格 `ALTER COLUMN ... SET/DROP NOT NULL / SET DEFAULT`、
+  `ADD/DROP COLUMN IF [NOT] EXISTS`、`RENAME COLUMN`；多动作 ALTER 的类型不再吞掉后续动作；
+  迁移脚本按数值版本排序（V10 在 V2 后）；按引号 / 注释外的分号切分语句；
+  DDL 只在语句开头识别，字符串字面量里的 `CREATE TABLE` 不再污染快照。
 
-- 此前的「应用更新」只把新 jar 覆盖到运行位置，然后提示用户自己执行 `stop.sh` /
-  `start.sh`。那不算更新，只算通知——对无人值守的机器等于要求人恰好在线。
-- 现在 `apply()` 换完 jar 后把重启交给 `RestartSupervisor`：本进程把一个 POSIX 守护脚本
-  写到 `{data-dir}/restart/restart.sh` 并**脱离终端**启动它，脚本 `kill -0` 等旧 PID 退出
-  （端口因此自然释放）→ 起新 jar → 轮询 `GET /api/health` → 超时就用备份 jar 覆盖回去
-  再拉起一次。
-- 本进程延迟约 1.5 秒才退出：延迟是为了让「更新成功」这个 HTTP 响应先写回浏览器。
-  状态写进 `{data-dir}/restart-status.json`，重启完成后新进程仍能报告
-  「上一次是成功了还是回滚了」。
-- 前端在应用更新后轮询轻量端点 `GET /api/update/restart`，见到 `succeeded` 自动刷新页面，
-  见到 `rolled-back` 显示红色告警与日志路径。
-- 新增 `auto-restart`（默认开）、`auto-apply`（默认关）、
-  `restart-timeout-seconds`（默认 90），以及 `PUT /api/update/settings` 供运行时切换。
-  `auto-apply` 要求 `auto-restart` 同时为真：没有热重启的自动应用等于
-  「自动把服务停掉等人来开」，那不是更新，是故障。
+### 报告
 
-### 其他新增
-
-- **后台自动更新的进度可见**：新增 `GET /api/update/progress`（`phase` / `bytes` /
-  `totalBytes` / `percent` / `automatic` / `message`），顶部横幅与设置页各有一条进度条。
-  总大小未知时走不确定态、只显示已接收字节数，不编造百分比；运行中最多显示 99%，
-  100% 只属于真正结束的那一步。
-- **GitHub 网络容错**：`api-base-urls` 多源回退（404 / 401 不降级）、`download-mirror`、
-  只作用于更新流量的 `proxy`、指数退避重试（5xx / 408 / 429 与传输失败可重试），
-  以及全进程共享的 `RateLimitGate`（额度用尽时所有调用方查同一个截止时间）。
-  全部 host 都失败时，每个 host 的失败原因折叠进 `warnings` 展示。
-- **界面规范落成文档**：新增 `docs/wiki/界面规范.md` 与 `docs/wiki/界面实现映射.md`，
-  把视觉与交互约定从 `style.css` 的注释里搬进可检索、可引用的文档（含按 WCAG 2.1 实算的
-  对比度结论），并新增 `UiContractTest` 把关键令牌、类名双向契约、断点、焦点与
-  reduced-motion、图标 sprite 引用固化为断言。
-
-### 修复
-
-- **代码源行的编辑按钮是一块看不见的空白**：按钮调 `icon('i-edit')`，而雪碧图里没有这个
-  `<symbol>`；`<use>` 命中不到绘制内容时不报错、不占位，按钮还在、还能点，
-  只是渲染成什么都没有。改用已有的 `i-pencil`，并新增 `UiContractTest.IconSprite`
-  逐个核对引用。
-- **代码源列表的操作列偏窄，按钮向左压住「同步时间」列**：`.tr-sources` 最后一轨 58px，
-  而内容要 72px；`.cell.actions` 右对齐，轨道不够时不裁切而是向左溢出。统一改成 76px。
-- **编辑保存后的提示恒为「代码源已添加」**：`resetSourceModal()` 在拼提示之前就把
-  `state.editingSourceId` 清成了 `null`，判断读到的永远是「没在编辑」。
-- **编辑代码源后「目录缺失」状态不复位**：可用性只在导入时判定一次，把位置改到正确目录后
-  仍然显示「目录缺失」，还附带一句「导入时目录不存在」。现在编辑保存前显式重判一次。
-- **一次分析跑完会把用户在这期间的编辑整行覆盖掉**：收尾时用提交那一刻的 `RepoSource`
-  快照做整行 UPDATE。现在只更新 `status / message / last_synced_at` 三列——
-  这三列是这次分析产出的，其余列归用户所有。
-- **开发模式下「当前运行版本」显示 `0.0.0-dev`**：版本只从运行中的 jar 的 manifest 读，
-  而 `mvn spring-boot:run` 没有 jar。现在构建生成 `META-INF/build-info.properties` 兜底。
-- **「当前环境不支持自动应用」只写「可能是在 IDE 里启动」**：这句话是前端写死的，
-  最常撞上它的恰恰是终端里的 `mvn spring-boot:run`。现在后端判定启动方式并给出具体原因
-  与一条可复制的命令，设置页新增「启动方式」一行。
-- **`.sql` 脚本里的 DDL 完全不会产生变更记录**：变更识别对 `.sql` 直接返回，
-  用脚本做表结构迁移的项目，加列、删列、删表这些最需要跨程序确认的改动一条都看不到。
-  现在 `.sql` 同样参与比对，产出 `DDL_CHANGED`。
-- **`stop.bat` 每次都提示「进程无窗口」并白等 3 秒**：`java.exe` 是控制台程序，
-  主窗口归 `conhost.exe`，`MainWindowHandle` 恒为 0，`CloseMainWindow()` 永远返回
-  `False`。现在先判断句柄，没有就直接结束；停止只输出一行「已停止 (PID N)」。
-  顺带修掉三处会骗人的输出：`Stop-Process` 权限不足时静默失败却照样打印「已停止」
-  （现在复查并以退出码 1 结束）、结束改用句柄上的 `Kill()`（避免 PID 复用误杀）、
-  按端口反查到的 PID 也要过 `Test-ServicePid`（此前会把恰好占用该端口的**任何**程序杀掉）。
-- **429 带 `x-ratelimit-reset` 时重试与多源回退同时失效**：先记录限流截止时间再判断是否重试，
-  下一轮循环开头的闸门检查立刻把重试打断，连带多源回退也被吃掉，备用源一次都没被请求。
-  现在限流后不再对该 host 重试，但仍会去问下一个 host。
-- **重启状态会自相矛盾（「已回滚」同时「仍在重启」）**：`state()` 分别读 `running` 标志与
-  phase，终态 phase 先写、标志后清，轮询落在窗口里就会拿到一个自相矛盾的响应。
-  现在终态分支先清标志再写状态，`running` 直接由 phase 推导。
+- 新增「因数据库不同被排除」「因类型兼容被排除」计数与说明。
+- 字段盲区口径修正为「读写列都没解析出来或语句不完整」，已作为 writer 命中的纯写语句
+  不重复计入。
+- 文档新增 `docs/wiki/数据库影响判断.md`：四个准入条件、DDL 分型对照表、类型兼容规则、
+  字段盲区口径，以及仍然存在的边界（值语义、事务并发、视图 / 触发器 / 存储过程、运行时 SQL）。
 
 ### 下载
 
@@ -527,6 +452,10 @@ stop.bat
 **0.6.0 起换完 jar 会自己重启**（`auto-restart` 默认开），失败自动回滚到备份 jar；
 更早的版本换完只会提示你自己执行 `stop.sh` / `start.sh`。
 0.3.0 及更早的版本没有应用内更新，请手动下载替换 jar（旧 jar 会被备份为 `.bak-<版本>`，可回滚）。
+
+这一版只改分析结果，不改接口、配置与更新机制：升级后不需要改 `application.yml`，
+历史报告也不会被重写——要看到新的判定，请重新分析一次。
+
 NOTES_TEMPLATE
 render "$NOTES"
 
