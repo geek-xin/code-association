@@ -3,9 +3,9 @@
 # release.sh — 构建、打包并发布 code-association 到 GitHub Release
 #
 # 用法:
-#   ./release.sh                  # 发布默认版本 0.7.0
-#   ./release.sh 0.7.0            # 发布指定版本
-#   VERSION=0.7.0 ./release.sh    # 同上（环境变量方式）
+#   ./release.sh                  # 发布默认版本 0.7.1
+#   ./release.sh 0.7.1            # 发布指定版本
+#   VERSION=0.7.1 ./release.sh    # 同上（环境变量方式）
 #
 # 产物:
 #   build/release/code-association-<version>/            # 干净的发布目录
@@ -40,7 +40,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 APP="code-association"
-VERSION="${1:-${VERSION:-0.7.0}}"
+VERSION="${1:-${VERSION:-0.7.1}}"
 TAG="v${VERSION}"
 RELEASE_ROOT="build/release"
 STAGE="${RELEASE_ROOT}/${APP}-${VERSION}"
@@ -358,65 +358,24 @@ cat > "$NOTES" <<'NOTES_TEMPLATE'
 跨程序变更影响扫描工具（Java / Maven 多模块仓库）：分析一次提交改动了哪些类、方法、
 SQL、MQ 消息结构，并推导出对其他模块 / 服务的连带影响与风险等级。
 
-这一版有两个主题。**日志可运维**：应用日志按天滚动、保留 7 天，关键节点改成可检索的
-结构化事件行，进程原始输出单独收集。**数据库影响判断继续收紧**：一条 `ALTER` 的多个
-动作分别报告；表重命名按旧表名命中；`NOT NULL` 且无默认值的列开始命中省略它的
-`INSERT`，不再只算「盲区」。
+这一版只修一个误报，不改接口、配置与更新机制。
 
-### 本次重点：日志可运维
+### 修复：删除实体字段不再被算成数据库列变化
 
-- 应用日志统一写到 `logs/`：`code-association.log` 是 INFO 及以上的完整时间线，
-  `code-association-error.log` 只收 ERROR，`archive/*.log.gz` 是滚动归档。
-  目录由 `code-association.log-dir` 决定（默认 `./logs`，环境变量 `LOG_DIR` 可覆盖），
-  与数据目录 `.code-association/` 分开，日志随时可清空。
-- 按天滚动，单文件超过 50MB 再切；只保留 7 天，`cleanHistoryOnStart=true` 让
-  「停了一周再启动」也立刻清掉过期归档。主日志上限 500MB、错误日志 200MB，上限先于时间生效。
-- 写盘走 `AsyncAppender`：分析线程不为日志 IO 停顿，队列满时阻塞而不是丢日志；
-  主日志与错误日志各用一个异步器（`AsyncAppender` 只接受一个 `appender-ref`）。
-- 会被反复查询的节点统一写成结构化事件行，例如
-  `event=analysis.done analysisId=42 source=order-service status=DONE durationMs=8421 high=1 medium=3 low=2`：
-  事件名小写点分且稳定，字段 camelCase，每条带定位 id 与 `durationMs`，可直接
-  `grep 'event=analysis.done'` 或按空白切字段。覆盖分析链路、定时扫描、代码源增删改与
-  导入导出、版本检查与更新、AI 配置与进程启停。
-- `start.sh` / `start.ps1` 的进程原始输出改到 `logs/console.log`（Windows stderr 为
-  `logs/console.err.log`），每次启动截断，专收 logback 初始化之前的错误与 JVM 崩溃输出。
-- 测试不落盘：`logback-test.xml` 只写控制台，跑测试不会污染 `logs/`。
+当本程序删除/修改一个 JPA 实体字段，而对比程序也映射同一列时，0.7.0 会把该命中从
+共享的列节点继续传播，把对方所有读该列的 SQL（例如 MyBatis 的
+`ElectricDeviceMapper.getSwitchDevices`）报成 HIGH 的 DATA 影响。实体字段删除并不
+改变数据库列，对方的 SQL 与自己的映射都不会坏——这是误报。
 
-### 本次重点：数据库跨程序影响
+现在这类命中只保留为低置信度**映射提示**：
 
-- **一条 `ALTER TABLE` 的多个动作按动作报告。** 以前每种动作只抓第一个：
-  `ADD a INT, ADD b INT` 只看得到 `a`，`ADD a, DROP b` 甚至把 `ADD` 的类型留在
-  `DROP` 的记录里。现在按顶层逗号拆出全部动作（括号 / 字符串内的逗号不拆），每个动作记
-  `kind / table / column / type / nullable / default / schema / renamedTo`；变更检测按
-  `kind|table|column` 对齐两侧动作，新增、修改、移除各生成一条 `DDL_CHANGED`，
-  因为加列、删列、改类型对读写方的后果不同，不能共用一条结论。语句级旧字段仍保留第一个
-  动作，旧索引与旧报告继续可读；`ADD INDEX`、`ADD CONSTRAINT`、`ENGINE=` 等非列动作被忽略。
-- **表重命名按旧表名的表级契约命中。** `ALTER TABLE orders RENAME TO orders_archive`
-  （含顶层 `RENAME TABLE ... TO ...`）现在生成 `RENAME_TABLE` 记录：契约写旧表名，
-  风险种子 0.90，对方读、写、映射旧表的代码都会命中。新表名刻意不产生候选——它是这次
-  改名才出现的，报它等于把同一次改名算两遍。列重命名也不再额外产生一条
-  「新列名被当成不可观察加列」的假计数。
-- **`NOT NULL` 且无默认值的列开始命中写入方。** 对方一条
-  `INSERT INTO orders (id) VALUES (?)` 省略了新增必填列，MySQL 严格模式、PostgreSQL、
-  Oracle 都会拒绝——这是真实不兼容，不该只算盲区。规则只命中完整的 `INSERT`
-  （非动态 SQL）且列清单里没有该列的语句；`UPDATE` / `DELETE` 不命中，`SELECT *` 与
-  动态 SQL 仍计入字段盲区且不重复计数。列可空、有默认值，或由数据库自动填充
-  （`AUTO_INCREMENT` / `GENERATED` / `IDENTITY`）时都不算必填。
-- **报告口径**：新增「必填列变更」计数与后果说明；这类变更不再同时计入
-  「对对方不可观察」（否则同一件事既说「对方看不见」又说「对方写入会失败」）。
-  「不可观察变更」的措辞同步覆盖「移除 DDL 动作」。
-- **顺手修掉的解析问题**：多语句 `.sql` 中第二条语句的行号曾被算成上一行，导致
-  `sql:文件#行号` key 撞车、前一条语句被覆盖；现在按第一条非空白字符计算，多语句脚本的
-  每个语句都有独立 key。DDL 定义里的 `DEFAULT 'a,b'` 不再被顶层逗号拆分。
+- 仍然报告「对比程序也映射了同一列」，写入报告说明与计数，避免悄悄丢掉；
+- 不再生成跨程序影响项，也不会把该列的其他读写代码拉进影响路径；
+- 如果双方通过 Maven 依赖共用同一个模型类，字段删除仍可能造成编译失败，
+  这种情况请按「Maven 依赖」契约单独确认。
 
-### 已知边界
-
-数据库侧仍不分析：写入列集合不变但值语义变了（如 `status 1 → 2`）、事务与锁顺序、
-视图 / 触发器 / 存储过程 / 外键级联、真实数据分布、运行时实际 SQL，以及同一程序
-多数据源 / 多 schema 下同名表的快照键冲突。自动填充列只识别 `ALTER` 列定义文本里的
-`AUTO_INCREMENT` / `GENERATED` / `IDENTITY`，触发器、序列等其他机制未识别。
-报告的「未发现影响」只表示静态契约层没有找到不兼容证据；`SELECT *` 与动态 SQL
-仍以「字段盲区」列出，需要人工确认。
+真正的数据库列变化（迁移脚本里的 `DROP COLUMN`）不受影响：对方读、写、映射该列
+的代码仍会正常命中。
 
 ### 下载
 
@@ -457,13 +416,9 @@ stop.bat
 从 0.3.0 起可以直接用应用内更新：设置 → 版本与更新 → 应用更新 → 按提示重启。
 **0.6.0 起换完 jar 会自己重启**（`auto-restart` 默认开），失败自动回滚到备份 jar；
 更早的版本换完只会提示你自己执行 `stop.sh` / `start.sh`。
-0.3.0 及更早的版本没有应用内更新，请手动下载替换 jar（旧 jar 会被备份为 `.bak-<版本>`，可回滚）。
 
-本版不改接口与更新机制；新增一个可选的日志目录配置 `code-association.log-dir`
-（默认 `./logs`，环境变量 `LOG_DIR` 可覆盖），不设置也能正常启动。
-但日志位置有变化：应用日志改到 `logs/`，启动脚本的进程输出改到 `logs/console.log`
-（Windows 为 `logs/console.err.log`），旧版写在根目录的 `code-association.log` 不再更新。
-历史报告不会重写——要看到新的判定，请重新分析一次。
+本版不改接口、配置与更新机制；历史报告不会重写——请重新分析一次，0.7.0 里那条
+「实体字段删除 → 对方 mapper 读列」的误报不会再出现。
 NOTES_TEMPLATE
 render "$NOTES"
 
