@@ -323,7 +323,14 @@ public class PeerImpactEngine {
     private List<DbDelta> dbDeltas(ChangeRecord change, CodeIndex ownHead, PeerImpact counter) {
         List<DbDelta> deltas = new ArrayList<>();
         Set<String> seenDeltas = new LinkedHashSet<>();
-        if (change.symbolKey == null) {
+        if (change.symbolKey == null || change.symbolKey.isBlank()) {
+            // A removed DDL statement has no head-side symbol - the record describes the base-side
+            // statement, which no longer exists - so it carries no key and would be skipped by the
+            // dispatch below. It is still a schema change and has to be counted, not dropped.
+            if (ChangeDetector.DDL_CHANGED.equals(change.changeType)
+                    && "true".equals(str(change.extra.get("ddlRemoved")))) {
+                countRemovedMigrationScript(change, counter);
+            }
             return deltas;
         }
         if (change.symbolKey.startsWith("db:column:")) {
@@ -367,7 +374,7 @@ public class PeerImpactEngine {
     private void dbDeltasForDdl(ChangeRecord change, PeerImpact counter,
                                 List<DbDelta> deltas, Set<String> seen) {
         if ("true".equals(str(change.extra.get("ddlRemoved")))) {
-            // Deleting a migration script does not undo the migration in a real database.
+            countRemovedMigrationScript(change, counter);
             return;
         }
         String kind = str(change.extra.get("ddl"));
@@ -392,9 +399,13 @@ public class PeerImpactEngine {
                 // columnless INSERT can observe it, and those are counted as blind spots. A NOT
                 // NULL column without a default can reject a columnless INSERT; that is exactly
                 // the blind spot the count exists to surface, not a reason to flag every writer.
+                // The delta is still emitted so the table reaches the blind-spot pass, but it hits
+                // nothing; the change is counted here instead of vanishing from the report.
                 if (!table.isBlank()) {
                     addTableDelta(deltas, seen, table, kind, false, false, false, 0.5);
                 }
+                countNonObservable(counter, schemaSubject(table, column),
+                        "新增列，命名列的读写方都观察不到");
             }
             case "MODIFY_COLUMN" -> {
                 if (table.isBlank() || column.isBlank()) {
@@ -443,6 +454,9 @@ public class PeerImpactEngine {
             case "CREATE_TABLE" -> {
                 // A new table cannot already be a dependency of another program. If the peer does
                 // reference it, that code is new too; this is not a regression caused by the change.
+                // Counted rather than dropped, for the same reason: the schema did change, and the
+                // report has to say the change was judged rather than skip it silently.
+                countNonObservable(counter, table, "新建表，对方不可能已经依赖它");
             }
             default -> {
                 if (!table.isBlank()) {
@@ -450,6 +464,45 @@ public class PeerImpactEngine {
                 }
             }
         }
+    }
+
+    /**
+     * A deleted migration script does not undo the migration in a real database, so it cannot break
+     * a consumer. Counted instead of dropped: the file change is real, and a change that leaves no
+     * trace in the report reads as one the analyser never saw.
+     */
+    private static void countRemovedMigrationScript(ChangeRecord change, PeerImpact counter) {
+        countNonObservable(counter,
+                schemaSubject(change.extra.get("table"), change.extra.get("column")),
+                "删除迁移脚本，已执行的迁移不会回滚");
+    }
+
+    /**
+     * Counts a schema change no consumer can observe, with one capped example.
+     *
+     * These changes are deliberately not turned into deltas, so without this counter they would
+     * disappear from the report entirely. The count is per change: every peer is analysed against
+     * the same change list, so the report aggregates it with {@code max()}, not a sum.
+     */
+    private static void countNonObservable(PeerImpact counter, String subject, String reason) {
+        if (counter == null) {
+            // The blind-spot pass re-reads the same deltas; it owns no counters of its own.
+            return;
+        }
+        counter.dbNonObservableChanges++;
+        if (!subject.isBlank()) {
+            addExample(counter.dbNonObservableExamples, subject + "（" + reason + "）");
+        }
+    }
+
+    /** {@code table.column} when both are known, otherwise the table alone. */
+    private static String schemaSubject(Object table, Object column) {
+        String normalizedTable = normalizeTable(table);
+        if (normalizedTable.isBlank()) {
+            return "";
+        }
+        String normalizedColumn = normalizeColumn(column);
+        return normalizedColumn.isBlank() ? normalizedTable : normalizedTable + "." + normalizedColumn;
     }
 
     private Set<String> mappedColumns(ChangeRecord change, CodeIndex ownHead) {

@@ -421,6 +421,10 @@ class PeerImpactTest {
 
         assertTrue(result.matches.isEmpty(),
                 "a new table cannot already be a dependency: " + describe(result));
+        assertEquals(1, result.dbNonObservableChanges,
+                "the change must be counted, not silently dropped: " + result.dbNonObservableExamples);
+        assertTrue(result.dbNonObservableExamples.stream().anyMatch(e -> e.startsWith("order_archive")),
+                "the example must name the new table: " + result.dbNonObservableExamples);
     }
 
     /** Deleting a migration script does not roll back a migration that already ran. */
@@ -443,6 +447,10 @@ class PeerImpactTest {
 
         assertTrue(result.matches.isEmpty(),
                 "deleting the script does not undo the migration: " + describe(result));
+        assertEquals(1, result.dbNonObservableChanges,
+                "the removed script must be counted, not silently dropped: " + result.dbNonObservableExamples);
+        assertTrue(result.dbNonObservableExamples.stream().anyMatch(e -> e.startsWith("orders")),
+                "the example must name the table the removed script declared: " + result.dbNonObservableExamples);
     }
 
     @Test
@@ -779,6 +787,10 @@ class PeerImpactTest {
         assertTrue(writeSide.matches.stream().anyMatch(m -> "DB_COLUMN".equals(m.kind)
                         && "orders.remark".equals(m.contract) && "writer".equals(m.usage)),
                 "the program writing the dropped column is impacted too: " + describe(writeSide));
+        assertEquals(0, readSide.dbNonObservableChanges,
+                "a dropped column is observable, so it must not be counted as non-observable");
+        assertEquals(0, writeSide.dbNonObservableChanges,
+                "a dropped column is observable, so it must not be counted as non-observable");
     }
 
     /** Dropping a whole table leaves no column to name, so the table itself becomes the contract. */
@@ -921,6 +933,10 @@ class PeerImpactTest {
         assertTrue(result.matches.isEmpty(),
                 "a named-column reader cannot observe a new column: " + describe(result));
         assertTrue(result.impacts.isEmpty());
+        assertEquals(1, result.dbNonObservableChanges,
+                "the change must be counted, not silently dropped: " + result.dbNonObservableExamples);
+        assertTrue(result.dbNonObservableExamples.stream().anyMatch(e -> e.startsWith("orders.remark")),
+                "the example must name the added column: " + result.dbNonObservableExamples);
     }
 
     /** The same column addition is still visible to a statement whose column list is unknown. */
@@ -1066,6 +1082,51 @@ class PeerImpactTest {
                 "the changed program itself must not be listed as an impacted module");
         assertTrue(report.moduleGraph.stream().allMatch(e -> "CROSS_PROGRAM".equals(e.type)));
         assertTrue(report.blindSpots.isEmpty(), "own-program blind spots are out of scope");
+    }
+
+    /**
+     * A per-change count must not be multiplied by the number of compared programs.
+     *
+     * Every peer is analysed against the same change list, so each peer result carries the same
+     * count for the same one change. The note describes the change list, and the report reads it
+     * back with max() - summing it would say two changes were seen where there was one.
+     */
+    @Test
+    void nonObservableSchemaChangeIsReportedOncePerChangeNotPerPeer(@TempDir Path tmp) throws IOException {
+        Change change = alterChange(tmp,
+                "CREATE TABLE orders (id BIGINT);",
+                "ALTER TABLE orders ADD COLUMN remark VARCHAR(64);");
+
+        PeerImpact first = new PeerImpact();
+        first.peerSourceName = "order-service";
+        PeerImpact second = new PeerImpact();
+        second.peerSourceName = "billing";
+        PeerImpactEngine engine = new PeerImpactEngine(PROPS);
+        engine.analyze(change.records, change.head,
+                readerOfOrders(tmp.resolve("r1"), "SELECT id FROM orders WHERE id = #{id}"), first);
+        engine.analyze(change.records, change.head,
+                readerOfOrders(tmp.resolve("r2"), "SELECT id FROM orders WHERE id = #{id}"), second);
+        assertEquals(1, first.dbNonObservableChanges);
+        assertEquals(1, second.dbNonObservableChanges,
+                "each peer is analysed against the same change, so both count it once");
+
+        RevisionPair revisions = new RevisionPair();
+        revisions.note = "user-service";
+        revisions.base = new DirSource(tmp.resolve("base"), "base", PROPS.getMaxFiles());
+        revisions.head = new DirSource(tmp.resolve("head"), "head", PROPS.getMaxFiles());
+        revisions.mode = "GIT_DIFF";
+        revisions.baseRef = "base";
+        revisions.headRef = "head";
+
+        ImpactReport report = new ReportBuilder().build(revisions, change.head, change.head,
+                change.records, List.of(), Map.of(), List.of(first, second));
+
+        List<String> notes = report.notes.stream()
+                .filter(n -> n.contains("对对比程序不可观察"))
+                .toList();
+        assertEquals(1, notes.size(), "the note must not repeat per peer: " + report.notes);
+        assertTrue(notes.get(0).contains("有 1 条表结构变更"),
+                "the count is the change count, not change x peer: " + notes.get(0));
     }
 
     @Test

@@ -60,6 +60,20 @@ public class PeerImpact {
     public int dbCompatibilitySuppressed;
     /** A few examples behind {@link #dbCompatibilitySuppressed}, capped for display. */
     public List<String> dbCompatibilityExamples = new ArrayList<>();
+    /**
+     * Schema changes no consumer can observe: adding a column, creating a table, deleting a
+     * migration script.
+     *
+     * None of these can break the other program - named-column code does not see a new column, a
+     * new table has no existing consumer, and deleting a script does not undo a migration that
+     * already ran. They are still counted, because a change that simply disappears from the
+     * report reads as "never analysed". Counted once per change, not per usage point: the number
+     * describes the change list, which every peer is measured against, so the report aggregates
+     * it with {@code max()} rather than a sum.
+     */
+    public int dbNonObservableChanges;
+    /** A few examples behind {@link #dbNonObservableChanges}, capped for display. */
+    public List<String> dbNonObservableExamples = new ArrayList<>();
     /** Matches kept although one side's database identity is unknown; confidence is lowered. */
     public int dbIdentityUnknownMatches;
 

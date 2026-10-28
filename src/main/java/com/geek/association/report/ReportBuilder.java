@@ -291,11 +291,24 @@ public class ReportBuilder {
                     "有 " + dbMismatch + " 条数据库候选（按对方使用点计）因两程序声明的数据库不同而被排除；"
                             + "同名表不等于同一张表，若确认两者共享数据库，请核对数据源配置后人工复核。");
         }
-        int dbCompatible = peers.stream().mapToInt(p -> p.dbCompatibilitySuppressed).sum();
+        // Two aggregation rules, because the counters count different things. Every peer is
+        // analysed against the same change list, so a per-change counter is repeated in every peer
+        // result and describes one change N times: max() reads it back as the change count, while
+        // sum() would multiply the change list by the number of compared programs. A usage point
+        // belongs to exactly one peer, so those counters never overlap and must be summed - max()
+        // there would report the busiest peer and hide the rest.
+        int dbCompatible = peers.stream().mapToInt(p -> p.dbCompatibilitySuppressed).max().orElse(0);
         if (dbCompatible > 0) {
             ImpactReport.addNote(report.notes, seen,
                     "有 " + dbCompatible + " 条表结构候选属于兼容变更（字段加宽、可空性放宽等），"
                             + "未作为跨程序影响报告；原有取值与绑定仍然有效。");
+        }
+        int dbNonObservable = peers.stream().mapToInt(p -> p.dbNonObservableChanges).max().orElse(0);
+        if (dbNonObservable > 0) {
+            ImpactReport.addNote(report.notes, seen,
+                    "有 " + dbNonObservable + " 条表结构变更（加列、建表、删除迁移脚本）对对比程序不可观察，"
+                            + "未作为跨程序影响报告；这些变更不会让对方已有代码失效，"
+                            + "但仍需随发布顺序执行，字段盲区处请人工确认。");
         }
         int dbUnknown = peers.stream().mapToInt(p -> p.dbIdentityUnknownMatches).sum();
         if (dbUnknown > 0) {
