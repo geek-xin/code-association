@@ -8,6 +8,7 @@ import com.geek.association.model.Sym;
 import com.geek.association.model.TypeInfo;
 import com.geek.association.parse.JavaIndexer;
 import com.geek.association.parse.TypeResolver;
+import com.geek.association.util.ColumnTypeCompatibility;
 import com.geek.association.util.Texts;
 
 import java.util.ArrayList;
@@ -79,7 +80,60 @@ public class ChangeDetector {
         List<ChangeRecord> out = new ArrayList<>();
         detectInto(files, out);
         out.removeIf(java.util.Objects::isNull);
+        // A CREATE TABLE edit does not always produce a DDL record through the per-file comparison:
+        // the statement key can move with the file/line, and the column definition is not the
+        // statement's ddl metadata. Comparing the schema snapshots catches those changes.
+        detectSchemaChanges(out);
+        suppressMovedStatements(out);
         return out;
+    }
+
+    /**
+     * A statement that moved to another file is not a contract change.
+     *
+     * SQL symbols are keyed by file and line, so renaming a mapper or moving an insert into a
+     * shared XML fragment used to produce a SQL_REMOVED plus a SQL_ADDED. The removed side then
+     * looked like "this program stopped writing orders.remark", which is exactly the kind of
+     * confident-looking false positive the report cannot afford.
+     *
+     * Pairing is deliberately conservative: only an added and a removed statement with the same
+     * normalized text are cancelled. If the text also changed, both records stay.
+     */
+    private void suppressMovedStatements(List<ChangeRecord> out) {
+        Map<String, ChangeRecord> added = new LinkedHashMap<>();
+        for (ChangeRecord cr : out) {
+            if (SQL_ADDED.equals(cr.changeType)) {
+                String sql = normalizeSql(cr.newValue);
+                if (!sql.isBlank()) {
+                    added.putIfAbsent(safe(cr.modulePath) + "|" + sql, cr);
+                }
+            }
+        }
+        if (added.isEmpty()) {
+            return;
+        }
+        Set<ChangeRecord> cancelled = new LinkedHashSet<>();
+        for (ChangeRecord cr : out) {
+            if (!SQL_REMOVED.equals(cr.changeType)) {
+                continue;
+            }
+            String sql = normalizeSql(cr.oldValue);
+            if (sql.isBlank()) {
+                continue;
+            }
+            ChangeRecord pair = added.remove(safe(cr.modulePath) + "|" + sql);
+            if (pair != null) {
+                cancelled.add(cr);
+                cancelled.add(pair);
+            }
+        }
+        out.removeAll(cancelled);
+    }
+
+    private static String normalizeSql(String sql) {
+        // Case is preserved: SQL string literals are case-sensitive, and conflating 'A' with 'a'
+        // would cancel a real edit. Whitespace is the only difference a file move introduces.
+        return sql == null ? "" : sql.replaceAll("\\s+", " ").trim();
     }
 
     private void detectInto(List<FileChange> files, List<ChangeRecord> out) {
@@ -591,6 +645,11 @@ public class ChangeDetector {
      * the DDL comparison runs first.
      */
     private void detectSql(FileChange fc, List<ChangeRecord> out) {
+        // A test schema or a test fixture is not a production contract. Its DDL must not become a
+        // cross-program schema change, and its statements must not become production SQL changes.
+        if (isTestPath(fc.path) || isTestPath(fc.oldPath)) {
+            return;
+        }
         List<Sym> oldSyms = sqlOf(baseIndex, fc.oldPath);
         List<Sym> newSyms = sqlOf(headIndex, fc.path);
         Map<String, Sym> oldByKey = byKey(oldSyms);
@@ -617,6 +676,213 @@ public class ChangeDetector {
         }
     }
 
+    /**
+     * Compares the schema snapshot of the two revisions.
+     *
+     * Per-file comparison sees a CREATE TABLE only when its symbol key stays put, and even then the
+     * column definition is not part of the statement's DDL metadata. This pass compares the column
+     * maps the SQL analyzer built from CREATE / ALTER statements, so a column added, dropped,
+     * retyped or made NOT NULL is found regardless of which migration file or line it moved to.
+     *
+     * Only tables present on both sides are compared: a brand-new table cannot already be a
+     * dependency of another program, and a dropped table is reported as DROP_TABLE instead.
+     */
+    private void detectSchemaChanges(List<ChangeRecord> out) {
+        Map<String, Map<String, String>> baseTables = byTable(baseIndex.columnTypes);
+        Map<String, Map<String, String>> headTables = byTable(headIndex.columnTypes);
+        if (baseTables.isEmpty() || headTables.isEmpty()) {
+            return;
+        }
+        Set<String> existing = new LinkedHashSet<>();
+        for (ChangeRecord cr : out) {
+            if (!DDL_CHANGED.equals(cr.changeType)) {
+                continue;
+            }
+            String table = normalizeTable(cr.extra.get("table"));
+            String column = safe(cr.extra.get("column")).toLowerCase(java.util.Locale.ROOT);
+            String kind = safe(cr.extra.get("ddl"));
+            String reason = safe(cr.extra.get("schemaChange"));
+            if (!table.isBlank() && !column.isBlank()) {
+                existing.add(table + "." + column + "|" + kind + "|" + reason);
+            }
+        }
+        for (Map.Entry<String, Map<String, String>> tableEntry : headTables.entrySet()) {
+            String table = tableEntry.getKey();
+            Map<String, String> oldColumns = baseTables.get(table);
+            if (oldColumns == null) {
+                continue; // a new table: CREATE_TABLE already describes it, and it cannot be a dependency yet
+            }
+            Map<String, String> newColumns = tableEntry.getValue();
+            for (Map.Entry<String, String> columnEntry : newColumns.entrySet()) {
+                String column = columnEntry.getKey();
+                String newType = columnEntry.getValue();
+                if (!oldColumns.containsKey(column)) {
+                    addSchemaRecord(out, existing, "ADD_COLUMN", table, column,
+                            null, newType, null, null, "TYPE");
+                    continue;
+                }
+                String oldType = oldColumns.get(column);
+                String oldNullable = baseIndex.columnNullability.get(table + "." + column);
+                String newNullable = headIndex.columnNullability.get(table + "." + column);
+                String oldDefault = baseIndex.columnDefaults.get(table + "." + column);
+                String newDefault = headIndex.columnDefaults.get(table + "." + column);
+                // Type, nullability and default are independent contracts. A MODIFY can widen
+                // the type and tighten NOT NULL at the same time; an else-if chain would report
+                // the safe widening and silently drop the write-side break.
+                if (!ColumnTypeCompatibility.compare(oldType, newType).equals(ColumnTypeCompatibility.Result.SAME)) {
+                    addSchemaRecord(out, existing, "MODIFY_COLUMN", table, column,
+                            oldType, newType, oldNullable, newNullable, "TYPE");
+                }
+                if (!Objects.equals(oldNullable, newNullable)) {
+                    addSchemaRecord(out, existing, "MODIFY_COLUMN", table, column,
+                            oldType, newType, oldNullable, newNullable, "NULLABILITY");
+                }
+                if (!Objects.equals(oldDefault, newDefault)) {
+                    addSchemaRecord(out, existing, "MODIFY_COLUMN", table, column,
+                            oldType, newType, oldNullable, newNullable, "DEFAULT");
+                }
+            }
+            for (Map.Entry<String, String> columnEntry : oldColumns.entrySet()) {
+                String column = columnEntry.getKey();
+                if (newColumns.containsKey(column)) {
+                    continue;
+                }
+                addSchemaRecord(out, existing, "DROP_COLUMN", table, column,
+                        columnEntry.getValue(), null, null, null, "TYPE");
+            }
+        }
+    }
+
+    private void addSchemaRecord(List<ChangeRecord> out, Set<String> existing, String kind,
+                                 String table, String column, String oldType, String newType,
+                                 String oldNullable, String newNullable, String reason) {
+        String key = table + "." + column + "|" + kind + "|" + reason;
+        if (!existing.add(key)) {
+            return;
+        }
+        Sym source = findSqlSymbol(table, kind);
+        ChangeRecord cr = baseRecord(DDL_CHANGED, "SQL_STATEMENT",
+                source == null ? null : source.filePath,
+                source == null ? table + "." + column : source.qualifiedName + " " + table + "." + column,
+                source == null ? 0 : source.startLine,
+                source == null ? 0 : source.endLine);
+        cr.modulePath = source == null ? null : source.modulePath;
+        cr.symbolKey = source == null ? "sql:schema-diff#" + table + "." + column : source.key;
+        cr.oldValue = safe(oldType);
+        cr.newValue = safe(newType);
+        cr.riskSeed = schemaRisk(kind, reason, oldType, newType, oldNullable, newNullable);
+        cr.semanticSummary = schemaSummary(kind, reason, table, column, oldType, newType, oldNullable, newNullable);
+        cr.tags.add("DATA");
+        cr.tags.add("CONTRACT");
+        cr.extra.put("ddl", kind);
+        cr.extra.put("table", table);
+        cr.extra.put("column", column);
+        cr.extra.put("oldType", safe(oldType));
+        cr.extra.put("newType", safe(newType));
+        cr.extra.put("oldNullable", safe(oldNullable));
+        cr.extra.put("newNullable", safe(newNullable));
+        cr.extra.put("schemaChange", reason);
+        cr.extra.put("schemaDiff", "true");
+        cr.extra.put("ddlSchema", source == null ? "" : safe(source.meta.get("ddlSchema")));
+        out.add(cr);
+    }
+
+    private double schemaRisk(String kind, String reason, String oldType, String newType,
+                              String oldNullable, String newNullable) {
+        if ("DROP_COLUMN".equals(kind)) {
+            return 0.95;
+        }
+        if ("ADD_COLUMN".equals(kind)) {
+            return 0.4;
+        }
+        if ("DEFAULT".equals(reason)) {
+            return 0.3;
+        }
+        if ("NULLABILITY".equals(reason)) {
+            return "true".equalsIgnoreCase(newNullable) ? 0.45 : 0.8;
+        }
+        ColumnTypeCompatibility.Result result = ColumnTypeCompatibility.compare(oldType, newType);
+        return switch (result) {
+            case SAME -> 0.3;
+            case WIDENING -> 0.45;
+            case NARROWING, INCOMPATIBLE -> 0.9;
+            case UNKNOWN -> 0.7;
+        };
+    }
+
+    private String schemaSummary(String kind, String reason, String table, String column,
+                                 String oldType, String newType, String oldNullable, String newNullable) {
+        if ("DROP_COLUMN".equals(kind)) {
+            return "删除数据库字段：" + table + "." + column
+                    + (safe(oldType).isBlank() ? "" : "（原类型 " + oldType + "）");
+        }
+        if ("ADD_COLUMN".equals(kind)) {
+            return "新增数据库字段：" + table + "." + column
+                    + (safe(newType).isBlank() ? "" : "（" + newType + "）");
+        }
+        if ("DEFAULT".equals(reason)) {
+            return "修改数据库字段默认值：" + table + "." + column;
+        }
+        if ("NULLABILITY".equals(reason)) {
+            return "修改数据库字段可空性：" + table + "." + column
+                    + "（" + safe(oldNullable) + " → " + safe(newNullable) + "）";
+        }
+        return "修改数据库字段类型：" + table + "." + column
+                + "（" + safe(oldType) + " → " + safe(newType) + "）";
+    }
+
+    private Sym findSqlSymbol(String table, String kind) {
+        Sym best = null;
+        Sym fallback = null;
+        for (Sym sym : headIndex.symbols.values()) {
+            if (!"SQL_STATEMENT".equals(sym.type) || sym.test || sym.meta.get("ddl") == null) {
+                continue;
+            }
+            if (!table.equals(normalizeTable(sym.meta.get("ddlTable")))) {
+                continue;
+            }
+            if (kind.equals(sym.meta.get("ddl"))) {
+                if (best == null || earlier(sym, best)) {
+                    best = sym;
+                }
+            } else if (fallback == null || earlier(sym, fallback)) {
+                fallback = sym;
+            }
+        }
+        return best != null ? best : fallback;
+    }
+
+    /** Deterministic pick when several statements describe the same column. */
+    private boolean earlier(Sym left, Sym right) {
+        String a = safe(left.filePath);
+        String b = safe(right.filePath);
+        int byFile = a.compareTo(b);
+        return byFile != 0 ? byFile < 0 : left.startLine < right.startLine;
+    }
+
+    private Map<String, Map<String, String>> byTable(Map<String, String> columns) {
+        Map<String, Map<String, String>> out = new LinkedHashMap<>();
+        for (Map.Entry<String, String> entry : columns.entrySet()) {
+            String key = entry.getKey();
+            int dot = key.indexOf('.');
+            if (dot <= 0) {
+                continue;
+            }
+            String table = key.substring(0, dot);
+            String column = key.substring(dot + 1);
+            out.computeIfAbsent(table, k -> new LinkedHashMap<>()).put(column, entry.getValue());
+        }
+        return out;
+    }
+
+    private static String normalizeTable(Object value) {
+        return com.geek.association.parse.SqlAnalyzer.normalizeTable(value == null ? "" : String.valueOf(value));
+    }
+
+    private static String safe(Object value) {
+        return value == null ? "" : String.valueOf(value);
+    }
+
     private ChangeRecord sqlChange(String changeType, Sym now, Sym before, double risk, String summary) {
         ChangeRecord cr = baseRecord(changeType, "SQL_STATEMENT", now.filePath, now.qualifiedName,
                 now.startLine, now.endLine);
@@ -631,7 +897,14 @@ public class ChangeDetector {
         columnExtras(cr, before, now);
         // A statement edit only reaches the other program when the write set moved, and that is a
         // sharper contract break than a body tweak: name it and raise the seed to match.
-        if (writeColumnsMoved(cr)) {
+        //
+        // Dynamic SQL is the exception: <if> / <include> / placeholder syntax means the write set
+        // we parsed is a lower bound, not the truth. Treating "I could not see the columns" as
+        // "the columns moved" is exactly how a dynamic mapper used to drag every reader of the
+        // table into the report.
+        boolean incomplete = "true".equals(before.meta.get("sqlIncomplete"))
+                || "true".equals(now.meta.get("sqlIncomplete"));
+        if (!incomplete && writeColumnsMoved(cr)) {
             cr.riskSeed = 0.85;
             cr.semanticSummary = summary + "（写入字段集合发生变化）";
         }
@@ -651,6 +924,9 @@ public class ChangeDetector {
      * stopped writing; that comparison is the whole difference between a noisy statement edit and a
      * database contract change, and it cannot be made from the statement symbol alone once the
      * statement is gone from the head revision.
+     *
+     * The {@code sqlIncomplete} flags travel with the record for the same reason: the peer engine
+     * must not turn an unparseable write set into a table-level match.
      */
     private void columnExtras(ChangeRecord cr, Sym before, Sym now) {
         Sym b = before == null ? new Sym() : before;
@@ -663,6 +939,10 @@ public class ChangeDetector {
         cr.extra.put("newWritesTables", safe(n.meta.get("writesTables")));
         cr.extra.put("oldReadsTables", safe(b.meta.get("readsTables")));
         cr.extra.put("newReadsTables", safe(n.meta.get("readsTables")));
+        cr.extra.put("oldSqlIncomplete", safe(b.meta.get("sqlIncomplete")));
+        cr.extra.put("newSqlIncomplete", safe(n.meta.get("sqlIncomplete")));
+        cr.extra.put("oldSelectAll", safe(b.meta.get("selectAll")));
+        cr.extra.put("newSelectAll", safe(n.meta.get("selectAll")));
     }
 
     /**
@@ -678,11 +958,19 @@ public class ChangeDetector {
         String oldTable = before.meta.get("ddlTable");
         String newColumn = now.meta.get("ddlColumn");
         String oldColumn = before.meta.get("ddlColumn");
+        String renamedTo = now.meta.get("ddlRenamedTo");
         if (newKind == null && oldKind == null) {
             return null;
         }
+        // A statement whose key did not move can still have changed shape: an in-place MODIFY
+        // (common when the table itself is managed outside the repository) must not degrade to a
+        // plain SQL_CHANGED. Compare the DDL metadata, not only the identity.
         boolean same = Objects.equals(newKind, oldKind) && Objects.equals(newTable, oldTable)
-                && Objects.equals(newColumn, oldColumn);
+                && Objects.equals(newColumn, oldColumn)
+                && Objects.equals(now.meta.get("ddlType"), before.meta.get("ddlType"))
+                && Objects.equals(now.meta.get("ddlNullable"), before.meta.get("ddlNullable"))
+                && Objects.equals(now.meta.get("ddlDefault"), before.meta.get("ddlDefault"))
+                && Objects.equals(now.meta.get("ddlRenamedTo"), before.meta.get("ddlRenamedTo"));
         if (same) {
             return null;
         }
@@ -690,7 +978,54 @@ public class ChangeDetector {
         String column = newColumn != null ? newColumn : oldColumn;
         String kind = newKind != null ? newKind : oldKind;
         boolean removed = newKind == null;
+        String tableKey = com.geek.association.parse.SqlAnalyzer.normalizeTable(table);
+        String columnKey = safe(column).toLowerCase(java.util.Locale.ROOT);
+        String oldType = firstNonBlank(before.meta.get("ddlType"), baseIndex.columnTypes.get(tableKey + "." + columnKey));
+        String newType = firstNonBlank(now.meta.get("ddlType"), headIndex.columnTypes.get(tableKey + "." + columnKey));
+        String oldNullable = firstNonBlank(before.meta.get("ddlNullable"),
+                baseIndex.columnNullability.get(tableKey + "." + columnKey));
+        String newNullable = firstNonBlank(now.meta.get("ddlNullable"),
+                headIndex.columnNullability.get(tableKey + "." + columnKey));
+        String oldDefault = firstNonBlank(before.meta.get("ddlDefault"),
+                baseIndex.columnDefaults.get(tableKey + "." + columnKey));
+        String newDefault = firstNonBlank(now.meta.get("ddlDefault"),
+                headIndex.columnDefaults.get(tableKey + "." + columnKey));
+        if ("DROP_COLUMN".equals(kind)) {
+            newType = "";
+        }
+        // A MODIFY can change three different things. Naming the one that moved is what lets the
+        // peer engine apply the right rule: a type narrowing hits readers and writers, NOT NULL
+        // hits writers, and a default change is invisible to named-column code.
+        String schemaChange = "TYPE";
+        if ("MODIFY_COLUMN".equals(kind)) {
+            if (!oldType.isBlank() && !newType.isBlank() && !oldType.equalsIgnoreCase(newType)) {
+                schemaChange = "TYPE";
+            } else if (oldType.isBlank() || newType.isBlank()) {
+                // The type is unknown, so a nullability/default difference cannot be promoted
+                // over it: keep the conservative "type changed or unknown" path.
+                schemaChange = "TYPE";
+            } else if (!Objects.equals(oldNullable, newNullable)) {
+                schemaChange = "NULLABILITY";
+            } else if (!Objects.equals(oldDefault, newDefault)) {
+                schemaChange = "DEFAULT";
+            }
+        }
         double seed = ddlRisk(kind, risk);
+        if ("MODIFY_COLUMN".equals(kind)) {
+            if ("DEFAULT".equals(schemaChange)) {
+                seed = 0.3;
+            } else if ("NULLABILITY".equals(schemaChange)) {
+                seed = ColumnTypeCompatibility.safe(
+                        ColumnTypeCompatibility.compareNullability(oldNullable, newNullable)) ? 0.45 : 0.8;
+            } else if (!oldType.isBlank() && !newType.isBlank()) {
+                seed = switch (ColumnTypeCompatibility.compare(oldType, newType)) {
+                    case SAME -> 0.5;
+                    case WIDENING -> 0.45;
+                    case NARROWING, INCOMPATIBLE -> 0.9;
+                    case UNKNOWN -> 0.9;
+                };
+            }
+        }
         String verb = removed ? "移除" : "";
         String summary;
         if ("DROP_TABLE".equals(kind)) {
@@ -698,12 +1033,28 @@ public class ChangeDetector {
         } else if ("CREATE_TABLE".equals(kind)) {
             summary = removed ? "移除建表脚本：" + table : "新建数据库表：" + table;
         } else if ("DROP_COLUMN".equals(kind)) {
-            summary = verb + "删除数据库字段：" + table + "." + column;
+            if (renamedTo != null && !renamedTo.isBlank()) {
+                summary = verb + "重命名数据库字段：" + table + "." + column + " → " + table + "." + renamedTo;
+            } else {
+                summary = verb + "删除数据库字段：" + table + "." + column
+                        + (oldType.isBlank() ? "" : "（原类型 " + oldType + "）");
+            }
         } else if ("ADD_COLUMN".equals(kind)) {
-            summary = verb + "新增数据库字段：" + table + "." + column;
+            summary = verb + "新增数据库字段：" + table + "." + column
+                    + (newType.isBlank() ? "" : "（" + newType + "）");
         } else if ("MODIFY_COLUMN".equals(kind)) {
-            summary = verb + "修改数据库字段：" + table + "." + column
-                    + (oldColumn != null && !Objects.equals(oldColumn, newColumn) ? "（原 " + oldColumn + "）" : "");
+            if ("NULLABILITY".equals(schemaChange)) {
+                summary = verb + "修改数据库字段可空性：" + table + "." + column
+                        + "（" + safe(oldNullable) + " → " + safe(newNullable) + "）";
+            } else if ("DEFAULT".equals(schemaChange)) {
+                summary = verb + "修改数据库字段默认值：" + table + "." + column;
+            } else if (!oldType.isBlank() && !newType.isBlank() && !oldType.equalsIgnoreCase(newType)) {
+                summary = verb + "修改数据库字段类型：" + table + "." + column
+                        + "（" + oldType + " → " + newType + "）";
+            } else {
+                summary = verb + "修改数据库字段：" + table + "." + column
+                        + (oldColumn != null && !Objects.equals(oldColumn, newColumn) ? "（原 " + oldColumn + "）" : "");
+            }
         } else {
             summary = "表结构发生变化：" + table;
         }
@@ -711,8 +1062,10 @@ public class ChangeDetector {
                 now.startLine, now.endLine);
         cr.modulePath = now.modulePath;
         cr.symbolKey = now.key;
-        cr.oldValue = oldKind == null ? "" : oldKind + " " + safe(oldTable) + "." + safe(oldColumn);
-        cr.newValue = newKind + " " + safe(table) + "." + safe(column);
+        cr.oldValue = oldKind == null ? "" : oldKind + " " + safe(oldTable) + "." + safe(oldColumn)
+                + (oldType.isBlank() ? "" : " " + oldType);
+        cr.newValue = newKind == null ? "" : newKind + " " + safe(table) + "." + safe(column)
+                + (newType.isBlank() ? "" : " " + newType);
         cr.semanticSummary = summary;
         cr.riskSeed = seed;
         cr.tags.add("DATA");
@@ -723,7 +1076,26 @@ public class ChangeDetector {
         cr.extra.put("column", safe(column));
         cr.extra.put("oldColumn", safe(oldColumn));
         cr.extra.put("ddlSql", safe(now.meta.get("ddlSql")));
+        cr.extra.put("oldType", oldType);
+        cr.extra.put("newType", newType);
+        cr.extra.put("oldNullable", oldNullable);
+        cr.extra.put("newNullable", newNullable);
+        cr.extra.put("oldDefault", oldDefault);
+        cr.extra.put("newDefault", newDefault);
+        cr.extra.put("schemaChange", schemaChange);
+        cr.extra.put("renamedTo", safe(renamedTo));
+        cr.extra.put("ddlSchema", firstNonBlank(now.meta.get("ddlSchema"), before.meta.get("ddlSchema")));
+        if (removed) {
+            // Deleting a migration script does not undo the migration in a real database. Keeping
+            // the record explains the file change, but the peer engine must not treat it as a
+            // schema rollback.
+            cr.extra.put("ddlRemoved", "true");
+        }
         return cr;
+    }
+
+    private static String firstNonBlank(String first, String second) {
+        return first != null && !first.isBlank() ? first : (second == null ? "" : second);
     }
 
     /**
@@ -736,7 +1108,7 @@ public class ChangeDetector {
             case "DROP_TABLE" -> 0.95;
             case "MODIFY_COLUMN" -> 0.9;
             case "CREATE_TABLE" -> 0.6;
-            case "ADD_COLUMN" -> 0.6;
+            case "ADD_COLUMN" -> 0.4;
             default -> fallback;
         };
     }
@@ -929,6 +1301,10 @@ public class ChangeDetector {
 
     private static String safe(String s) {
         return s == null ? "" : s;
+    }
+
+    private static boolean isTestPath(String file) {
+        return file != null && (file.contains("/src/test/") || file.startsWith("src/test/"));
     }
 
     private static String statusText(String status) {

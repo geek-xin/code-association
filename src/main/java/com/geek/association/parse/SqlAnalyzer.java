@@ -8,6 +8,9 @@ import com.geek.association.source.FileSource;
 import com.geek.association.util.Hashes;
 import com.geek.association.util.Texts;
 
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
@@ -30,11 +33,58 @@ public class SqlAnalyzer {
     private static final Pattern SELECT_COLUMNS = Pattern.compile(
             "\\bselect\\s+(.*?)\\s+from\\b", Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
     private static final Pattern ALTER_ADD = Pattern.compile(
-            "\\balter\\s+table\\s+([\\w.]+)\\s+add\\s+(?:column\\s+)?([\\w]+)", Pattern.CASE_INSENSITIVE);
+            "\\balter\\s+table\\s+([\\w.]+)\\s+add\\s+(?:column\\s+)?(?:if\\s+not\\s+exists\\s+)?([\\w]+)",
+            Pattern.CASE_INSENSITIVE);
     private static final Pattern ALTER_DROP = Pattern.compile(
-            "\\balter\\s+table\\s+([\\w.]+)\\s+drop\\s+(?:column\\s+)?([\\w]+)", Pattern.CASE_INSENSITIVE);
+            "\\balter\\s+table\\s+([\\w.]+)\\s+drop\\s+(?:column\\s+)?(?:if\\s+exists\\s+)?([\\w]+)",
+            Pattern.CASE_INSENSITIVE);
     private static final Pattern ALTER_MODIFY = Pattern.compile(
-            "\\balter\\s+table\\s+([\\w.]+)\\s+(?:modify|alter)\\s+(?:column\\s+)?([\\w]+)", Pattern.CASE_INSENSITIVE);
+            "\\balter\\s+table\\s+([\\w.]+)\\s+(?:modify|alter)\\s+(?:column\\s+)?(?:if\\s+exists\\s+)?([\\w]+)",
+            Pattern.CASE_INSENSITIVE);
+    /** ALTER TABLE ... ADD [COLUMN] c <definition>; the definition carries type/nullability/default. */
+    private static final Pattern ALTER_ADD_DEF = Pattern.compile(
+            "\\balter\\s+table\\s+([\\w.\\x60\\[\\]]+)\\s+add\\s+(?:column\\s+)?(?:if\\s+not\\s+exists\\s+)?"
+                    + "([\\w\\x60\\[\\]]+)\\s+([^;]+?)"
+                    + "(?=,\\s*(?:add|drop|modify|alter|rename|change)\\b|$)",
+            Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
+    /** ALTER TABLE ... MODIFY/ALTER [COLUMN] c <definition>. */
+    private static final Pattern ALTER_MODIFY_DEF = Pattern.compile(
+            "\\balter\\s+table\\s+([\\w.\\x60\\[\\]]+)\\s+(?:modify|alter)\\s+(?:column\\s+)?(?:if\\s+exists\\s+)?"
+                    + "([\\w\\x60\\[\\]]+)\\s+([^;]+?)"
+                    + "(?=,\\s*(?:add|drop|modify|alter|rename|change)\\b|$)",
+            Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
+    private static final Pattern CREATE_TABLE_HEAD = Pattern.compile(
+            "\\bcreate\\s+table\\s+(?:if\\s+not\\s+exists\\s+)?([\\w.\\x60\\[\\]]+)\\s*\\(",
+            Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
+    private static final Pattern CREATE_TABLE_ANY = Pattern.compile(
+            "\\bcreate\\s+table\\s+(?:if\\s+not\\s+exists\\s+)?([\\w.\\x60\\[\\]]+)",
+            Pattern.CASE_INSENSITIVE);
+    /** PostgreSQL / standard SQL: ALTER TABLE t ALTER COLUMN c SET NOT NULL. */
+    private static final Pattern ALTER_RENAME_COLUMN = Pattern.compile(
+            "\\balter\\s+table\\s+([\\w.\\x60\\[\\]]+)\\s+rename\\s+(?:column\\s+)?"
+                    + "([\\w\\x60\\[\\]]+)\\s+to\\s+([\\w\\x60\\[\\]]+)",
+            Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
+    private static final Pattern ALTER_SET_NOT_NULL = Pattern.compile(
+            "\\balter\\s+table\\s+([\\w.\\x60\\[\\]]+)\\s+alter\\s+(?:column\\s+)?"
+                    + "([\\w\\x60\\[\\]]+)\\s+set\\s+not\\s+null",
+            Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
+    private static final Pattern ALTER_DROP_NOT_NULL = Pattern.compile(
+            "\\balter\\s+table\\s+([\\w.\\x60\\[\\]]+)\\s+alter\\s+(?:column\\s+)?"
+                    + "([\\w\\x60\\[\\]]+)\\s+drop\\s+not\\s+null",
+            Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
+    private static final Pattern ALTER_SET_DEFAULT = Pattern.compile(
+            "\\balter\\s+table\\s+([\\w.\\x60\\[\\]]+)\\s+alter\\s+(?:column\\s+)?"
+                    + "([\\w\\x60\\[\\]]+)\\s+set\\s+default\\s+([^;]+)",
+            Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
+    private static final Pattern ALTER_DROP_DEFAULT = Pattern.compile(
+            "\\balter\\s+table\\s+([\\w.\\x60\\[\\]]+)\\s+alter\\s+(?:column\\s+)?"
+                    + "([\\w\\x60\\[\\]]+)\\s+drop\\s+default",
+            Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
+    private static final Pattern SELECT_STAR = Pattern.compile(
+            "\\bselect\\s+(?:[a-zA-Z_][\\w]*\\s*\\.\\s*)?\\*", Pattern.CASE_INSENSITIVE);
+    private static final Pattern DYNAMIC_SQL = Pattern.compile(
+            "<\\s*(?:if|choose|when|otherwise|foreach|include|sql|bind|trim|where|set)\\b|\\$\\{",
+            Pattern.CASE_INSENSITIVE);
     /** A table reference with an optional alias: {@code from orders o}, {@code join order_item as i}. */
     private static final Pattern TABLE_REF = Pattern.compile(
             "\\b(?:from|join|into|update)\\s+([a-zA-Z_][\\w.]*)(?:\\s+(?:as\\s+)?([a-zA-Z_][\\w]*))?",
@@ -50,7 +100,7 @@ public class SqlAnalyzer {
     private static final Pattern INSERT_INTO = Pattern.compile(
             "\\binsert\\s+into\\s+([a-zA-Z_][\\w.]*)", Pattern.CASE_INSENSITIVE);
     private static final Pattern UPDATE_TABLE = Pattern.compile(
-            "\\bupdate\\s+([a-zA-Z_][\\w.]*)", Pattern.CASE_INSENSITIVE);
+            "(?:^|;)\\s*update\\s+([a-zA-Z_][\\w.]*)", Pattern.CASE_INSENSITIVE);
     private static final Pattern DELETE_FROM = Pattern.compile(
             "\\bdelete\\s+from\\s+([a-zA-Z_][\\w.]*)", Pattern.CASE_INSENSITIVE);
     private static final Pattern FROM_JOIN = Pattern.compile(
@@ -60,6 +110,10 @@ public class SqlAnalyzer {
             "where", "set", "values", "select", "from", "join", "left", "right", "inner", "outer", "full",
             "cross", "on", "group", "order", "by", "having", "limit", "offset", "union", "and", "or",
             "as", "insert", "update", "delete", "into", "duplicate", "ignore", "returning", "for");
+    /** ALTER TABLE actions that are not a column and must never become a column contract. */
+    private static final Set<String> NON_COLUMN_DDL = Set.of(
+            "INDEX", "KEY", "CONSTRAINT", "PRIMARY", "FOREIGN", "UNIQUE", "CHECK", "FULLTEXT", "SPATIAL",
+            "SET", "DROP");
 
     private final FileSource source;
     private final MavenParser maven;
@@ -98,7 +152,7 @@ public class SqlAnalyzer {
                 String id = m.group(2);
                 String body = m.group(3);
                 String resultType = attr(m.group(0), "<" + m.group(1), "resultType");
-                String sqlText = stripTags(body);
+                String sqlText = stripSqlComments(stripTags(body));
                 String key = "sql:" + file + "#" + (namespace == null ? "" : namespace + ".") + id;
                 Sym sym = new Sym();
                 sym.key = key;
@@ -115,6 +169,7 @@ public class SqlAnalyzer {
                 sym.meta.put("sql", Texts.truncate(JavaIndexer.normalize(sqlText), 4000));
                 sym.meta.put("mapper", namespace == null ? "" : namespace);
                 sym.meta.put("resultType", resultType == null ? "" : resultType);
+                markStatementShape(sym, body, sqlText);
                 index.addSymbol(sym);
                 linkTables(sym, sqlText, kind);
                 linkMapperMethod(sym, namespace, id);
@@ -153,7 +208,7 @@ public class SqlAnalyzer {
 
     private void analyzeJavaSql() {
         Pattern annotation = Pattern.compile(
-                "@(Select|Insert|Update|Delete|Query)\\s*\\(\\s*(?:value\\s*=\\s*)?\\{?\\s*((?:\"[^\"]*\"\\s*,?\\s*)+)\\}?\\s*\\)");
+                "@(Select|Insert|Update|Delete|Query)\\s*\\(\\s*(?:value\\s*=\\s*)?\\{?\\s*((?:\"[^\"]*\"\\s*,?\\s*)+)\\}?[^)]*\\)");
         for (TypeInfo t : index.types.values()) {
             String content = source.read(t.filePath);
             if (content == null || !(content.contains("@Select") || content.contains("@Insert")
@@ -166,7 +221,7 @@ public class SqlAnalyzer {
                     Matcher matcher = annotation.matcher(snippet);
                     while (matcher.find()) {
                         String kind = matcher.group(1).toLowerCase(Locale.ROOT);
-                        String sqlText = matcher.group(2).replaceAll("\"", "").replaceAll("\\s*,\\s*", " ");
+                        String sqlText = stripSqlComments(matcher.group(2).replaceAll("\"", "").replaceAll("\\s*,\\s*", " "));
                         Sym sym = new Sym();
                         sym.key = "sql:" + t.filePath + "#" + m.key;
                         sym.type = "SQL_STATEMENT";
@@ -182,6 +237,7 @@ public class SqlAnalyzer {
                         sym.meta.put("sqlKind", realKind);
                         sym.meta.put("sql", Texts.truncate(JavaIndexer.normalize(sqlText), 4000));
                         sym.meta.put("mapper", t.qualifiedName);
+                        markStatementShape(sym, sqlText, sqlText);
                         index.addSymbol(sym);
                         linkTables(sym, sqlText, realKind);
                         Edge edge = new Edge();
@@ -257,10 +313,18 @@ public class SqlAnalyzer {
             e.detail = "@Entity " + t.simpleName;
             index.addEdge(e);
             for (TypeInfo.FieldInfo f : t.fields.values()) {
-                String column = annotationAttributeForField(content, f.name, "Column", "name");
-                if (column == null) {
-                    column = camelToSnake(f.name);
+                // @Transient and static fields are not columns. A collection is a relation
+                // (@OneToMany / @ManyToMany), not a scalar column mapping.
+                if (f.annotations.contains("Transient") || f.modifiers.contains("static")
+                        || f.annotations.contains("OneToMany") || f.annotations.contains("ManyToMany")
+                        || f.annotations.contains("ElementCollection") || isCollectionType(f.type)) {
+                    continue;
                 }
+                String explicit = annotationAttributeForField(content, f.name, "Column", "name");
+                if (explicit == null) {
+                    explicit = annotationAttributeForField(content, f.name, "JoinColumn", "name");
+                }
+                String column = explicit == null ? camelToSnake(f.name) : explicit;
                 Sym colSym = columnSymbol(table, column, t.modulePath, t.filePath, f.line);
                 Edge fe = new Edge();
                 fe.from = f.key;
@@ -268,8 +332,11 @@ public class SqlAnalyzer {
                 fe.relation = "MAPS_COLUMN";
                 fe.filePath = t.filePath;
                 fe.line = f.line;
-                fe.confidence = 0.8;
-                fe.detail = f.name + " -> " + table + "." + column;
+                // An explicit @Column(name=...) is evidence; a naming-strategy guess is a hint.
+                // The peer matcher uses this to lower confidence instead of pretending both are equal.
+                fe.confidence = explicit == null ? 0.6 : 0.9;
+                fe.detail = f.name + " -> " + table + "." + column
+                        + (explicit == null ? "（隐式命名）" : "");
                 index.addEdge(fe);
             }
         }
@@ -278,22 +345,27 @@ public class SqlAnalyzer {
     // --------------------------------------------------------------- .sql files
 
     private void analyzeSqlFiles() {
+        List<String> files = new ArrayList<>();
         for (String file : source.files()) {
-            if (!file.endsWith(".sql")) {
-                continue;
+            if (file.endsWith(".sql")) {
+                files.add(file);
             }
+        }
+        // Migration order matters for the schema snapshot: V1 creates, V2 alters. Numeric version
+        // order keeps V10 after V2; plain string order used to put it before.
+        files.sort(Comparator.comparingInt(SqlAnalyzer::migrationVersion)
+                .thenComparing(Comparator.naturalOrder()));
+        for (String file : files) {
             String content = source.read(file);
             if (content == null) {
                 continue;
             }
-            int offset = 0;
-            for (String raw : content.split(";")) {
-                String sqlText = raw.strip();
-                int line = lineOf(content, offset);
-                offset += raw.length() + 1;
+            for (SqlChunk chunk : splitSqlStatements(content)) {
+                String sqlText = stripSqlComments(chunk.text.strip());
                 if (sqlText.isEmpty()) {
                     continue;
                 }
+                int line = lineOf(content, chunk.start);
                 String kind = guessKind(sqlText);
                 Sym sym = new Sym();
                 sym.key = "sql:" + file + "#" + line;
@@ -309,52 +381,477 @@ public class SqlAnalyzer {
                 sym.meta.put("sqlKind", kind);
                 sym.meta.put("sql", Texts.truncate(JavaIndexer.normalize(sqlText), 4000));
                 sym.meta.put("script", "true");
+                markStatementShape(sym, sqlText, sqlText);
                 index.addSymbol(sym);
                 linkTables(sym, sqlText, kind);
                 detectDdl(sym, sqlText);
+                // Test schema must not become the production schema snapshot: a testcontainers
+                // DDL change says nothing about what other programs will see at runtime.
+                if (!sym.test) {
+                    applySchema(sqlText);
+                }
             }
         }
     }
 
     private void detectDdl(Sym sym, String sqlText) {
+        sqlText = sqlText.strip();
         String upper = sqlText.toUpperCase(Locale.ROOT);
-        if (upper.contains("ALTER TABLE")) {
-            Matcher add = ALTER_ADD.matcher(sqlText);
-            if (add.find()) {
+        if (upper.startsWith("ALTER TABLE")) {
+            Matcher add = ALTER_ADD_DEF.matcher(sqlText);
+            boolean addColumn = false;
+            if (add.find() && !isNonColumnDefinition(add.group(2)) && !isNonColumnDefinition(add.group(3))) {
                 sym.meta.put("ddl", "ADD_COLUMN");
                 sym.meta.put("ddlTable", add.group(1));
-                sym.meta.put("ddlColumn", add.group(2));
+                sym.meta.put("ddlColumn", stripIdent(add.group(2)));
+                putDefinitionMeta(sym, alterDefinition(add.group(3)));
+                putSchemaMeta(sym, add.group(1));
+                addColumn = true;
+            }
+            if (!addColumn) {
+                Matcher fallback = ALTER_ADD.matcher(sqlText);
+                if (fallback.find() && !isNonColumnDefinition(fallback.group(2))) {
+                    sym.meta.put("ddl", "ADD_COLUMN");
+                    sym.meta.put("ddlTable", fallback.group(1));
+                    sym.meta.put("ddlColumn", stripIdent(fallback.group(2)));
+                    putSchemaMeta(sym, fallback.group(1));
+                }
             }
             Matcher drop = ALTER_DROP.matcher(sqlText);
-            if (drop.find()) {
+            if (drop.find() && !isNonColumnDefinition(drop.group(2))) {
                 sym.meta.put("ddl", "DROP_COLUMN");
                 sym.meta.put("ddlTable", drop.group(1));
-                sym.meta.put("ddlColumn", drop.group(2));
+                sym.meta.put("ddlColumn", stripIdent(drop.group(2)));
+                putSchemaMeta(sym, drop.group(1));
             }
-            Matcher modify = ALTER_MODIFY.matcher(sqlText);
-            if (modify.find()) {
+            Matcher modify = ALTER_MODIFY_DEF.matcher(sqlText);
+            boolean modifyColumn = false;
+            if (modify.find() && !isNonColumnDefinition(modify.group(2)) && !isNonColumnDefinition(modify.group(3))) {
                 sym.meta.put("ddl", "MODIFY_COLUMN");
                 sym.meta.put("ddlTable", modify.group(1));
-                sym.meta.put("ddlColumn", modify.group(2));
+                sym.meta.put("ddlColumn", stripIdent(modify.group(2)));
+                putDefinitionMeta(sym, alterDefinition(modify.group(3)));
+                putSchemaMeta(sym, modify.group(1));
+                modifyColumn = true;
+            }
+            if (!modifyColumn) {
+                Matcher fallback = ALTER_MODIFY.matcher(sqlText);
+                if (fallback.find() && !isNonColumnDefinition(fallback.group(2))) {
+                    sym.meta.put("ddl", "MODIFY_COLUMN");
+                    sym.meta.put("ddlTable", fallback.group(1));
+                    sym.meta.put("ddlColumn", stripIdent(fallback.group(2)));
+                    putSchemaMeta(sym, fallback.group(1));
+                }
+            }
+            // A rename is a drop of the old name plus an add of the new one. Reporting the old
+            // name as DROP_COLUMN is what protects existing readers/writers; the new name cannot
+            // already be a dependency of another program.
+            Matcher rename = ALTER_RENAME_COLUMN.matcher(sqlText);
+            if (rename.find()) {
+                sym.meta.put("ddl", "DROP_COLUMN");
+                sym.meta.put("ddlTable", rename.group(1));
+                sym.meta.put("ddlColumn", stripIdent(rename.group(2)));
+                sym.meta.put("ddlRenamedTo", stripIdent(rename.group(3)));
+                putSchemaMeta(sym, rename.group(1));
+            }
+            // PostgreSQL / standard SQL: ALTER COLUMN c SET/DROP NOT NULL / DEFAULT.
+            // The generic MODIFY pattern deliberately rejects SET/DROP as an action, so these
+            // forms need their own branch; without it a NOT NULL tightening silently disappears.
+            Matcher setNotNull = ALTER_SET_NOT_NULL.matcher(sqlText);
+            Matcher dropNotNull = ALTER_DROP_NOT_NULL.matcher(sqlText);
+            Matcher setDefault = ALTER_SET_DEFAULT.matcher(sqlText);
+            Matcher dropDefault = ALTER_DROP_DEFAULT.matcher(sqlText);
+            if (setNotNull.find()) {
+                sym.meta.put("ddl", "MODIFY_COLUMN");
+                sym.meta.put("ddlTable", setNotNull.group(1));
+                sym.meta.put("ddlColumn", stripIdent(setNotNull.group(2)));
+                sym.meta.put("ddlNullable", "false");
+                putSchemaMeta(sym, setNotNull.group(1));
+            } else if (dropNotNull.find()) {
+                sym.meta.put("ddl", "MODIFY_COLUMN");
+                sym.meta.put("ddlTable", dropNotNull.group(1));
+                sym.meta.put("ddlColumn", stripIdent(dropNotNull.group(2)));
+                sym.meta.put("ddlNullable", "true");
+                putSchemaMeta(sym, dropNotNull.group(1));
+            } else if (setDefault.find()) {
+                sym.meta.put("ddl", "MODIFY_COLUMN");
+                sym.meta.put("ddlTable", setDefault.group(1));
+                sym.meta.put("ddlColumn", stripIdent(setDefault.group(2)));
+                sym.meta.put("ddlDefault", setDefault.group(3).strip());
+                putSchemaMeta(sym, setDefault.group(1));
+            } else if (dropDefault.find()) {
+                sym.meta.put("ddl", "MODIFY_COLUMN");
+                sym.meta.put("ddlTable", dropDefault.group(1));
+                sym.meta.put("ddlColumn", stripIdent(dropDefault.group(2)));
+                sym.meta.put("ddlDefault", "");
+                putSchemaMeta(sym, dropDefault.group(1));
             }
             sym.meta.put("ddlSql", Texts.truncate(JavaIndexer.normalize(sqlText), 500));
         }
-        if (upper.startsWith("CREATE TABLE")) {
-            Matcher create = Pattern.compile("CREATE\\s+TABLE\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?([\\w.]+)",
-                    Pattern.CASE_INSENSITIVE).matcher(sqlText);
-            if (create.find()) {
-                sym.meta.put("ddl", "CREATE_TABLE");
-                sym.meta.put("ddlTable", create.group(1));
-            }
+        Matcher create = CREATE_TABLE_HEAD.matcher(sqlText);
+        if (create.lookingAt()) {
+            sym.meta.put("ddl", "CREATE_TABLE");
+            sym.meta.put("ddlTable", create.group(1));
+            putSchemaMeta(sym, create.group(1));
+            return;
+        }
+        Matcher any = CREATE_TABLE_ANY.matcher(sqlText);
+        if (any.lookingAt()) {
+            sym.meta.put("ddl", "CREATE_TABLE");
+            sym.meta.put("ddlTable", any.group(1));
+            putSchemaMeta(sym, any.group(1));
+            return;
         }
         if (upper.startsWith("DROP TABLE")) {
-            Matcher dropTable = Pattern.compile("DROP\\s+TABLE\\s+(?:IF\\s+EXISTS\\s+)?([\\w.]+)",
+            Matcher dropTable = Pattern.compile("DROP\\s+TABLE\\s+(?:IF\\s+EXISTS\\s+)?([\\w.\\x60\\[\\]]+)",
                     Pattern.CASE_INSENSITIVE).matcher(sqlText);
             if (dropTable.find()) {
                 sym.meta.put("ddl", "DROP_TABLE");
                 sym.meta.put("ddlTable", dropTable.group(1));
+                putSchemaMeta(sym, dropTable.group(1));
             }
         }
+    }
+
+    /** True for ADD INDEX / ADD CONSTRAINT / DROP KEY ...: a DDL action, but not a column. */
+    /** PostgreSQL/Oracle spell a type change as ALTER COLUMN c TYPE <type>; keep the type only. */
+    private String alterDefinition(String definition) {
+        String def = definition == null ? "" : definition.strip();
+        if (def.regionMatches(true, 0, "TYPE ", 0, 5)) {
+            return def.substring(5).strip();
+        }
+        return def;
+    }
+
+    private boolean isNonColumnDefinition(String definition) {
+        if (definition == null || definition.isBlank()) {
+            return false;
+        }
+        String first = firstToken(definition.strip()).toUpperCase(Locale.ROOT);
+        return NON_COLUMN_DDL.contains(first);
+    }
+
+    /** Records the shape of a statement that field-level matching has to treat as a blind spot. */
+    private void markStatementShape(Sym sym, String raw, String sqlText) {
+        if (raw != null && DYNAMIC_SQL.matcher(raw).find()) {
+            sym.meta.put("sqlIncomplete", "true");
+        }
+        if (sqlText != null && SELECT_STAR.matcher(sqlText).find()) {
+            sym.meta.put("selectAll", "true");
+        }
+        if (isTestPath(sym.filePath)) {
+            sym.test = true;
+        }
+    }
+
+    private void putDefinitionMeta(Sym sym, String definition) {
+        String def = definition == null ? "" : definition.strip();
+        String type = typeOf(def);
+        if (!type.isBlank()) {
+            sym.meta.put("ddlType", type);
+        }
+        Boolean nullable = nullableOf(def);
+        if (nullable != null) {
+            sym.meta.put("ddlNullable", nullable.toString());
+        }
+        String defaultValue = defaultValueOf(def);
+        if (defaultValue != null) {
+            sym.meta.put("ddlDefault", defaultValue);
+        }
+    }
+
+    private void putSchemaMeta(Sym sym, String tableRef) {
+        String schema = schemaOf(tableRef);
+        if (schema != null) {
+            sym.meta.put("ddlSchema", schema);
+        }
+    }
+
+    /**
+     * Applies CREATE / ALTER statements to the schema snapshot of this revision.
+     *
+     * Only the parts needed for compatibility decisions are kept: type, nullability and default.
+     * The snapshot is a static approximation, not a database: it lets a MODIFY be compared with the
+     * column it is modifying, and lets a widened column be recognised instead of reported as a break.
+     */
+    private void applySchema(String sqlText) {
+        sqlText = sqlText.strip();
+        // DDL only counts at the start of a statement. A string literal such as
+        // INSERT ... VALUES ('create table fake (x int)') must not pollute the schema snapshot.
+        String upper = sqlText.toUpperCase(Locale.ROOT);
+        if (!upper.startsWith("CREATE TABLE") && !upper.startsWith("ALTER TABLE")
+                && !upper.startsWith("DROP TABLE")) {
+            return;
+        }
+        Matcher rename = ALTER_RENAME_COLUMN.matcher(sqlText);
+        if (rename.find()) {
+            String oldKey = columnKey(rename.group(1), rename.group(2));
+            String newKey = columnKey(rename.group(1), rename.group(3));
+            String type = index.columnTypes.remove(oldKey);
+            String nullable = index.columnNullability.remove(oldKey);
+            String defaultValue = index.columnDefaults.remove(oldKey);
+            if (type != null) {
+                index.columnTypes.put(newKey, type);
+            }
+            if (nullable != null) {
+                index.columnNullability.put(newKey, nullable);
+            }
+            if (defaultValue != null) {
+                index.columnDefaults.put(newKey, defaultValue);
+            }
+            return;
+        }
+        Matcher setNotNull = ALTER_SET_NOT_NULL.matcher(sqlText);
+        Matcher dropNotNull = ALTER_DROP_NOT_NULL.matcher(sqlText);
+        Matcher setDefault = ALTER_SET_DEFAULT.matcher(sqlText);
+        Matcher dropDefault = ALTER_DROP_DEFAULT.matcher(sqlText);
+        if (setNotNull.find()) {
+            index.columnNullability.put(columnKey(setNotNull.group(1), setNotNull.group(2)), "false");
+            return;
+        }
+        if (dropNotNull.find()) {
+            index.columnNullability.put(columnKey(dropNotNull.group(1), dropNotNull.group(2)), "true");
+            return;
+        }
+        if (setDefault.find()) {
+            index.columnDefaults.put(columnKey(setDefault.group(1), setDefault.group(2)), setDefault.group(3).strip());
+            return;
+        }
+        if (dropDefault.find()) {
+            index.columnDefaults.remove(columnKey(dropDefault.group(1), dropDefault.group(2)));
+            return;
+        }
+        Matcher create = CREATE_TABLE_HEAD.matcher(sqlText);
+        if (create.lookingAt()) {
+            String table = normalizeTable(create.group(1));
+            String body = parenthesesBody(sqlText, create.end() - 1);
+            for (ColumnDef def : parseColumnDefs(body)) {
+                remember(table, def);
+            }
+            return;
+        }
+        Matcher add = ALTER_ADD_DEF.matcher(sqlText);
+        if (add.find()) {
+            if (!isNonColumnDefinition(add.group(2)) && !isNonColumnDefinition(add.group(3))) {
+                ColumnDef def = parseColumnDef(add.group(2), alterDefinition(add.group(3)));
+                if (def != null) {
+                    remember(normalizeTable(add.group(1)), def);
+                }
+            }
+            return;
+        }
+        Matcher modify = ALTER_MODIFY_DEF.matcher(sqlText);
+        if (modify.find()) {
+            if (!isNonColumnDefinition(modify.group(2)) && !isNonColumnDefinition(modify.group(3))) {
+                ColumnDef def = parseColumnDef(modify.group(2), alterDefinition(modify.group(3)));
+                if (def != null) {
+                    remember(normalizeTable(modify.group(1)), def);
+                }
+            }
+            return;
+        }
+        Matcher drop = ALTER_DROP.matcher(sqlText);
+        if (drop.find() && !isNonColumnDefinition(drop.group(2))) {
+            String key = columnKey(drop.group(1), drop.group(2));
+            index.columnTypes.remove(key);
+            index.columnNullability.remove(key);
+            index.columnDefaults.remove(key);
+        }
+    }
+
+    private String columnKey(String tableRef, String column) {
+        return normalizeTable(tableRef) + "." + stripIdent(column).toLowerCase(Locale.ROOT);
+    }
+
+    private void remember(String table, ColumnDef def) {
+        String key = table + "." + def.name;
+        index.columnTypes.put(key, def.type);
+        // A definition that omits nullability/default does not preserve the previous value: the
+        // column's shape is now unknown, and keeping the old value would hide a later tightening.
+        if (def.nullable != null) {
+            index.columnNullability.put(key, def.nullable.toString());
+        } else {
+            index.columnNullability.remove(key);
+        }
+        if (def.defaultValue != null) {
+            index.columnDefaults.put(key, def.defaultValue);
+        } else {
+            index.columnDefaults.remove(key);
+        }
+    }
+
+    private List<ColumnDef> parseColumnDefs(String body) {
+        List<ColumnDef> out = new ArrayList<>();
+        for (String part : splitTopLevel(body)) {
+            String def = part.strip();
+            if (def.isEmpty()) {
+                continue;
+            }
+            String lower = def.toLowerCase(Locale.ROOT);
+            if (lower.startsWith("primary ") || lower.startsWith("unique ") || lower.startsWith("key ")
+                    || lower.startsWith("index ") || lower.startsWith("constraint ") || lower.startsWith("foreign ")
+                    || lower.startsWith("check ") || lower.startsWith("fulltext ") || lower.startsWith("spatial ")) {
+                continue;
+            }
+            String name = firstToken(def);
+            if (name.isEmpty()) {
+                continue;
+            }
+            ColumnDef column = parseColumnDef(name, def.substring(name.length()).strip());
+            if (column != null) {
+                out.add(column);
+            }
+        }
+        return out;
+    }
+
+    private ColumnDef parseColumnDef(String rawName, String definition) {
+        String name = stripIdent(rawName);
+        if (name.isEmpty()) {
+            return null;
+        }
+        String def = definition == null ? "" : definition.strip();
+        String type = typeOf(def);
+        if (type.isBlank()) {
+            return null;
+        }
+        ColumnDef out = new ColumnDef();
+        out.name = name.toLowerCase(Locale.ROOT);
+        out.type = type;
+        out.nullable = nullableOf(def);
+        out.defaultValue = defaultValueOf(def);
+        return out;
+    }
+
+    private String typeOf(String def) {
+        String upper = def.toUpperCase(Locale.ROOT);
+        int cut = upper.length();
+        for (String keyword : List.of(" NOT ", " NULL", " DEFAULT ", " PRIMARY ", " UNIQUE ",
+                " AUTO_INCREMENT", " COMMENT ", " REFERENCES ", " CHECK ", " COLLATE ",
+                " GENERATED ", " ON ", " AS ")) {
+            int idx = upper.indexOf(keyword);
+            if (idx >= 0) {
+                cut = Math.min(cut, idx);
+            }
+        }
+        return def.substring(0, cut).strip().replaceAll("\\s+", " ");
+    }
+
+    private Boolean nullableOf(String def) {
+        String upper = def.toUpperCase(Locale.ROOT);
+        if (upper.matches("(?s).*\\bPRIMARY\\s+KEY\\b.*") || upper.matches("(?s).*\\bNOT\\s+NULL\\b.*")) {
+            return Boolean.FALSE;
+        }
+        if (upper.matches("(?s).*\\bNULL\\b.*")) {
+            return Boolean.TRUE;
+        }
+        return null;
+    }
+
+    private String defaultValueOf(String def) {
+        Matcher m = Pattern.compile(
+                "(?i)\\bDEFAULT\\s+(.+?)(?=\\s+(?:NOT|NULL|PRIMARY|UNIQUE|AUTO_INCREMENT|COMMENT|REFERENCES|CHECK|COLLATE|GENERATED|ON)\\b|$)",
+                Pattern.DOTALL).matcher(def);
+        if (!m.find()) {
+            return null;
+        }
+        String value = m.group(1).strip();
+        return value.isEmpty() ? null : value;
+    }
+
+    private List<String> splitTopLevel(String body) {
+        List<String> out = new ArrayList<>();
+        int depth = 0;
+        int start = 0;
+        for (int i = 0; i < body.length(); i++) {
+            char c = body.charAt(i);
+            if (c == '(') {
+                depth++;
+            } else if (c == ')') {
+                depth--;
+            } else if (c == ',' && depth == 0) {
+                out.add(body.substring(start, i));
+                start = i + 1;
+            }
+        }
+        out.add(body.substring(start));
+        return out;
+    }
+
+    private String parenthesesBody(String text, int openIndex) {
+        if (openIndex < 0 || openIndex >= text.length() || text.charAt(openIndex) != '(') {
+            return "";
+        }
+        int depth = 0;
+        for (int i = openIndex; i < text.length(); i++) {
+            char c = text.charAt(i);
+            if (c == '(') {
+                depth++;
+            } else if (c == ')') {
+                depth--;
+                if (depth == 0) {
+                    return text.substring(openIndex + 1, i);
+                }
+            }
+        }
+        return text.substring(openIndex + 1);
+    }
+
+    private String firstToken(String text) {
+        int i = 0;
+        while (i < text.length() && !Character.isWhitespace(text.charAt(i))) {
+            i++;
+        }
+        return text.substring(0, i);
+    }
+
+    private String stripIdent(String raw) {
+        if (raw == null) {
+            return "";
+        }
+        return raw.strip().replace("`", "").replace("\"", "").replace("[", "").replace("]", "");
+    }
+
+    private String schemaOf(String tableRef) {
+        String ref = stripIdent(tableRef);
+        int dot = ref.lastIndexOf('.');
+        return dot > 0 ? ref.substring(0, dot).toLowerCase(Locale.ROOT) : null;
+    }
+
+    private static int migrationVersion(String file) {
+        String name = file == null ? "" : file.replace('\\', '/');
+        int slash = name.lastIndexOf('/');
+        if (slash >= 0) {
+            name = name.substring(slash + 1);
+        }
+        Matcher flyway = Pattern.compile("(?i)^V(\\d+)__").matcher(name);
+        if (flyway.find()) {
+            try {
+                return Integer.parseInt(flyway.group(1));
+            } catch (NumberFormatException e) {
+                return Integer.MAX_VALUE;
+            }
+        }
+        Matcher numeric = Pattern.compile("^(\\d+)[-_]").matcher(name);
+        if (numeric.find()) {
+            try {
+                return Integer.parseInt(numeric.group(1));
+            } catch (NumberFormatException e) {
+                return Integer.MAX_VALUE;
+            }
+        }
+        return Integer.MAX_VALUE;
+    }
+
+    private boolean isTestPath(String file) {
+        return file != null && (file.contains("/src/test/") || file.startsWith("src/test/"));
+    }
+
+    private static final class ColumnDef {
+        String name;
+        String type;
+        Boolean nullable;
+        String defaultValue;
     }
 
     // ---------------------------------------------------------------- linking
@@ -370,41 +867,44 @@ public class SqlAnalyzer {
      * engine need to know which columns a statement reads and writes without walking the graph.
      */
     private void linkTables(Sym sym, String sqlText, String kind) {
-        String lower = sqlText.toLowerCase(Locale.ROOT);
+        // "ON DUPLICATE KEY UPDATE remark = ..." is an assignment, not an UPDATE statement.
+        // Removing the clause from the table scan avoids inventing a table called "remark".
+        String parseText = sqlText.replaceAll("(?is)\\bon\\s+duplicate\\s+key\\s+update\\b", " ");
+        String lower = parseText.toLowerCase(Locale.ROOT);
         Set<String> reads = new LinkedHashSet<>();
         Set<String> writes = new LinkedHashSet<>();
-        Matcher insert = INSERT_INTO.matcher(sqlText);
+        Matcher insert = INSERT_INTO.matcher(parseText);
         while (insert.find()) {
             writes.add(normalizeTable(insert.group(1)));
         }
-        Matcher update = UPDATE_TABLE.matcher(sqlText);
+        Matcher update = UPDATE_TABLE.matcher(parseText);
         while (update.find()) {
             if (!lower.startsWith("select")) {
                 writes.add(normalizeTable(update.group(1)));
             }
         }
-        Matcher delete = DELETE_FROM.matcher(sqlText);
+        Matcher delete = DELETE_FROM.matcher(parseText);
         while (delete.find()) {
             writes.add(normalizeTable(delete.group(1)));
         }
-        Matcher from = FROM_JOIN.matcher(sqlText);
+        Matcher from = FROM_JOIN.matcher(parseText);
         while (from.find()) {
             reads.add(normalizeTable(from.group(1)));
         }
         if (reads.isEmpty()) {
-            Matcher t = TABLE_AFTER.matcher(sqlText);
+            Matcher t = TABLE_AFTER.matcher(parseText);
             while (t.find()) {
                 reads.add(normalizeTable(t.group(1)));
             }
         }
         reads.removeAll(writes);
-        Map<String, String> aliases = tableAliases(sqlText);
+        Map<String, String> aliases = tableAliases(parseText);
         Set<String> readColumns = new LinkedHashSet<>();
         Set<String> writeColumns = new LinkedHashSet<>();
         for (String table : reads) {
             link(sym, tableSymbol(table, sym.modulePath, sym.filePath, sym.startLine), "READS_TABLE", "select from " + table);
         }
-        for (String ref : selectColumnRefs(sqlText)) {
+        for (String ref : selectColumnRefs(parseText)) {
             String table = ownerTable(ref, reads, aliases);
             if (table == null) {
                 continue; // cannot tell which table the column belongs to; a blind spot, not a guess
@@ -430,6 +930,28 @@ public class SqlAnalyzer {
         sym.meta.put("writesTables", String.join(",", writes));
         sym.meta.put("readsColumns", String.join(",", readColumns));
         sym.meta.put("writesColumns", String.join(",", writeColumns));
+        // Explicit schema qualifiers are evidence of which database the statement addresses.
+        // Without them the program-level JDBC URL is the only identity; both are compared by the
+        // peer matcher before a table/column name is allowed to become a cross-program contract.
+        Map<String, String> tableSchemas = new LinkedHashMap<>();
+        Matcher ref = TABLE_REF.matcher(parseText);
+        while (ref.find()) {
+            String table = normalizeTable(ref.group(1));
+            String schema = schemaOf(ref.group(1));
+            if (schema != null) {
+                tableSchemas.putIfAbsent(table, schema);
+            }
+        }
+        if (!tableSchemas.isEmpty()) {
+            StringBuilder encoded = new StringBuilder();
+            for (Map.Entry<String, String> entry : tableSchemas.entrySet()) {
+                if (encoded.length() > 0) {
+                    encoded.append(',');
+                }
+                encoded.append(entry.getKey()).append('=').append(entry.getValue());
+            }
+            sym.meta.put("tableSchemas", encoded.toString());
+        }
     }
 
     /**
@@ -536,6 +1058,25 @@ public class SqlAnalyzer {
                 addColumnRef(out, part.split("=")[0].strip());
             }
         }
+        // INSERT INTO t (a, b) SELECT ... has its target column list before SELECT, not before
+        // VALUES. Without this it looked like a columnless write and fell back to a table contract.
+        Matcher insertSelect = Pattern.compile(
+                "\\binsert\\s+into\\s+[\\w.]+\\s*\\(([^()]*)\\)\\s*select\\b",
+                Pattern.CASE_INSENSITIVE | Pattern.DOTALL).matcher(sqlText);
+        if (insertSelect.find()) {
+            for (String c : insertSelect.group(1).split(",")) {
+                addColumnRef(out, c.strip());
+            }
+        }
+        // ON DUPLICATE KEY UPDATE remark = ... writes remark even though it has no SET keyword.
+        Matcher duplicate = Pattern.compile(
+                "\\bon\\s+duplicate\\s+key\\s+update\\s+(.*?)(?:\\bwhere\\b|$)",
+                Pattern.CASE_INSENSITIVE | Pattern.DOTALL).matcher(sqlText);
+        if (duplicate.find()) {
+            for (String part : duplicate.group(1).split(",")) {
+                addColumnRef(out, part.split("=")[0].strip());
+            }
+        }
         return out;
     }
 
@@ -597,6 +1138,125 @@ public class SqlAnalyzer {
         return t.toLowerCase(Locale.ROOT);
     }
 
+    /**
+     * Splits a script on semicolons that are outside quotes and comments.
+     *
+     * {@code String.split(";")} cuts a DEFAULT 'a;b' in half and also splits inside block
+     * comments. This scanner keeps the original offsets so line numbers remain correct.
+     */
+    private List<SqlChunk> splitSqlStatements(String content) {
+        List<SqlChunk> out = new ArrayList<>();
+        boolean singleQuote = false;
+        boolean doubleQuote = false;
+        boolean lineComment = false;
+        boolean blockComment = false;
+        int start = 0;
+        for (int i = 0; i < content.length(); i++) {
+            char c = content.charAt(i);
+            char next = i + 1 < content.length() ? content.charAt(i + 1) : '\0';
+            if (lineComment) {
+                if (c == '\n') {
+                    lineComment = false;
+                }
+                continue;
+            }
+            if (blockComment) {
+                if (c == '*' && next == '/') {
+                    blockComment = false;
+                    i++;
+                }
+                continue;
+            }
+            if (!singleQuote && !doubleQuote) {
+                if (c == '-' && next == '-') {
+                    lineComment = true;
+                    i++;
+                    continue;
+                }
+                if (c == '/' && next == '*') {
+                    blockComment = true;
+                    i++;
+                    continue;
+                }
+            }
+            if (c == '\'' && !doubleQuote) {
+                singleQuote = !singleQuote;
+            } else if (c == '"' && !singleQuote) {
+                doubleQuote = !doubleQuote;
+            } else if (c == ';' && !singleQuote && !doubleQuote) {
+                out.add(new SqlChunk(content.substring(start, i), start));
+                start = i + 1;
+            }
+        }
+        out.add(new SqlChunk(content.substring(start), start));
+        return out;
+    }
+
+    private static final class SqlChunk {
+        final String text;
+        final int start;
+
+        SqlChunk(String text, int start) {
+            this.text = text;
+            this.start = start;
+        }
+    }
+
+    /**
+     * Removes SQL line and block comments while respecting quoted strings.
+     *
+     * A commented-out {@code -- ALTER TABLE orders DROP COLUMN remark} used to be parsed as a real
+     * schema change and matched every reader of the column. Comment-only edits also changed the
+     * statement hash, producing a SQL_CHANGED with no semantic difference.
+     */
+    private String stripSqlComments(String sql) {
+        if (sql == null || sql.isEmpty()) {
+            return "";
+        }
+        StringBuilder out = new StringBuilder(sql.length());
+        boolean singleQuote = false;
+        boolean doubleQuote = false;
+        boolean lineComment = false;
+        boolean blockComment = false;
+        for (int i = 0; i < sql.length(); i++) {
+            char c = sql.charAt(i);
+            char next = i + 1 < sql.length() ? sql.charAt(i + 1) : '\0';
+            if (lineComment) {
+                if (c == '\n') {
+                    lineComment = false;
+                    out.append(c);
+                }
+                continue;
+            }
+            if (blockComment) {
+                if (c == '*' && next == '/') {
+                    blockComment = false;
+                    i++;
+                }
+                continue;
+            }
+            if (!singleQuote && !doubleQuote) {
+                if (c == '-' && next == '-') {
+                    lineComment = true;
+                    i++;
+                    continue;
+                }
+                if (c == '/' && next == '*') {
+                    blockComment = true;
+                    i++;
+                    continue;
+                }
+            }
+            if (c == '\'' && !doubleQuote) {
+                singleQuote = !singleQuote;
+            } else if (c == '"' && !singleQuote) {
+                doubleQuote = !doubleQuote;
+            }
+            out.append(c);
+        }
+        return out.toString();
+    }
+
     private String stripTags(String xml) {
         return xml.replaceAll("<[^>]+>", " ")
                 .replaceAll("&lt;", "<").replaceAll("&gt;", ">")
@@ -619,7 +1279,14 @@ public class SqlAnalyzer {
     }
 
     private String annotationAttributeForField(String content, String fieldName, String annotation, String name) {
-        Matcher m = Pattern.compile("@" + annotation + "\\s*\\(([^)]*)\\)\\s*(?:private|protected|public)?\\s+[\\w<>,\\[\\]]+\\s+"
+        // Another annotation may sit between @Column and the field:
+        //   @Column(name = "created_at")
+        //   @JsonFormat(...)
+        //   private Instant createdAt;
+        // Requiring the field to be adjacent fell back to camelToSnake and produced a wrong column.
+        String between = "(?:\\s*@[\\w.]+(?:\\s*\\([^)]*\\))?)*";
+        Matcher m = Pattern.compile("@" + annotation + "\\s*\\(([^)]*)\\)" + between
+                + "\\s*(?:private|protected|public)?\\s+[\\w<>,\\[\\].]+\\s+"
                 + Pattern.quote(fieldName) + "\\b").matcher(content);
         if (!m.find()) {
             return null;
@@ -633,19 +1300,21 @@ public class SqlAnalyzer {
         if (name == null) {
             return "";
         }
-        StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < name.length(); i++) {
-            char c = name.charAt(i);
-            if (Character.isUpperCase(c)) {
-                if (i > 0) {
-                    sb.append('_');
-                }
-                sb.append(Character.toLowerCase(c));
-            } else {
-                sb.append(c);
-            }
+        // Hibernate's implicit naming splits on lower->upper and acronym->word boundaries, so
+        // userID is user_id (not user_i_d) and URLPath is url_path. The old per-character loop
+        // guessed the wrong column for every acronym, which is a false mapping either way.
+        String snake = name.replaceAll("([a-z0-9])([A-Z])", "$1_$2")
+                .replaceAll("([A-Z]+)([A-Z][a-z])", "$1_$2");
+        return snake.toLowerCase(Locale.ROOT);
+    }
+
+    private boolean isCollectionType(String type) {
+        if (type == null) {
+            return false;
         }
-        return sb.toString();
+        String t = type.trim();
+        return t.contains("List<") || t.contains("Set<") || t.contains("Collection<")
+                || t.contains("Map<") || t.endsWith("[]");
     }
 
     private int lineOf(String content, int offset) {

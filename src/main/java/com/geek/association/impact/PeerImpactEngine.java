@@ -2,12 +2,14 @@ package com.geek.association.impact;
 
 import com.geek.association.config.AppProperties;
 import com.geek.association.diff.ChangeDetector;
+import com.geek.association.parse.DatabaseIdentity;
 import com.geek.association.model.ChangeRecord;
 import com.geek.association.model.CodeIndex;
 import com.geek.association.model.Edge;
 import com.geek.association.model.ImpactResult;
 import com.geek.association.model.PeerImpact;
 import com.geek.association.model.Sym;
+import com.geek.association.util.ColumnTypeCompatibility;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -67,7 +69,7 @@ public class PeerImpactEngine {
         Set<String> seen = new LinkedHashSet<>();
         for (ChangeRecord change : changes) {
             collectApiMatches(change, ownHead, peer, matches, seen);
-            collectSqlMatches(change, ownHead, peer, matches, seen);
+            collectSqlMatches(change, ownHead, peer, matches, seen, out);
             collectConfigMatches(change, peer, matches, seen);
             collectMessagingMatches(change, ownHead, peer, matches, seen);
         }
@@ -188,8 +190,9 @@ public class PeerImpactEngine {
      * own business, and treating it as a contract change is what used to flood the review queue.
      */
     private void collectSqlMatches(ChangeRecord change, CodeIndex ownHead, CodeIndex peer,
-                                   List<PeerImpact.ContractMatch> out, Set<String> seen) {
-        for (ColumnDelta delta : columnDeltas(change, ownHead)) {
+                                   List<PeerImpact.ContractMatch> out, Set<String> seen,
+                                   PeerImpact peerInfo) {
+        for (DbDelta delta : dbDeltas(change, ownHead, peerInfo)) {
             Sym shared = peer.symbol(delta.symbolKey);
             if (shared == null) {
                 continue;
@@ -199,18 +202,46 @@ public class PeerImpactEngine {
                 if (!delta.accepts(relation)) {
                     continue;
                 }
-                add(out, seen, delta.kind, delta.contract, change, shared.key, e.from, peer, e, delta.usageOf(relation),
-                        delta.confidence);
+                Sym consumer = peer.symbol(e.from);
+                if (consumer != null && consumer.test) {
+                    // A test mapper or test entity is not a production consumer of the contract.
+                    continue;
+                }
+                DbIdentity peerIdentity = peerIdentity(peer, e.from, delta.table);
+                if (!DbIdentity.compatible(delta.ownIdentity, peerIdentity)) {
+                    peerInfo.dbMismatchSuppressed++;
+                    addExample(peerInfo.dbMismatchExamples,
+                            delta.contract + "（本程序 " + delta.ownIdentity + "，对方 " + peerIdentity + "）");
+                    continue;
+                }
+                double confidence = delta.confidence;
+                boolean uncertainIdentity = !DbIdentity.known(delta.ownIdentity)
+                        || !DbIdentity.known(peerIdentity)
+                        || delta.ownIdentity.database != peerIdentity.database;
+                if (uncertainIdentity) {
+                    // Unknown, or a database name compared with a schema name: not a mismatch,
+                    // but a weaker match. It must not look as certain as two equal JDBC URLs.
+                    peerInfo.dbIdentityUnknownMatches++;
+                    confidence *= 0.85;
+                }
+                if ("MAPS_COLUMN".equals(relation) && e.confidence > 0) {
+                    confidence = Math.min(confidence, e.confidence);
+                }
+                add(out, seen, delta.kind, delta.contract, change, shared.key, e.from, peer, e,
+                        delta.usageOf(relation), confidence);
             }
         }
     }
 
-    /** One database delta this program introduced: either a column or a whole table. */
-    private static final class ColumnDelta {
+    /** One database delta this program introduced: a column, a table, or a blind-spot table. */
+    private static final class DbDelta {
         String symbolKey;
         String contract;
         String kind;
-        /** Which relations on the peer side count as a use of this delta. */
+        /** WRITE_SET | ADD_COLUMN | DROP_COLUMN | MODIFY_COLUMN | DROP_TABLE | CREATE_TABLE | MAPPING | SCHEMA. */
+        String operation;
+        String table;
+        DbIdentity ownIdentity;
         boolean hitsReaders = true;
         boolean hitsWriters = true;
         boolean hitsMappings = true;
@@ -221,7 +252,9 @@ public class PeerImpactEngine {
                 case "READS_COLUMN" -> hitsReaders;
                 case "WRITES_COLUMN" -> hitsWriters;
                 case "MAPS_COLUMN" -> hitsMappings;
-                case "READS_TABLE", "WRITES_TABLE", "USES_TABLE" -> "DB_TABLE".equals(kind);
+                case "READS_TABLE" -> hitsReaders;
+                case "WRITES_TABLE" -> hitsWriters;
+                case "USES_TABLE" -> hitsMappings;
                 default -> false;
             };
         }
@@ -236,74 +269,202 @@ public class PeerImpactEngine {
     }
 
     /**
+     * A database namespace, at the level it was declared.
+     *
+     * A JDBC URL names a database; a schema qualifier names a schema. They are not comparable
+     * across levels: two programs can reach the same schema through a URL and an explicit
+     * qualifier respectively. Comparing only same-level identities avoids turning that into a
+     * false negative while still suppressing two different declared databases.
+     */
+    private static final class DbIdentity {
+        final String value;
+        final boolean database;
+
+        private DbIdentity(String value, boolean database) {
+            this.value = value;
+            this.database = database;
+        }
+
+        static DbIdentity database(String value) {
+            return value == null || value.isBlank() ? null : new DbIdentity(value.trim(), true);
+        }
+
+        static DbIdentity schema(String value) {
+            return value == null || value.isBlank() ? null : new DbIdentity(value.trim(), false);
+        }
+
+        static boolean known(DbIdentity identity) {
+            return identity != null && identity.value != null && !identity.value.isBlank();
+        }
+
+        static boolean compatible(DbIdentity left, DbIdentity right) {
+            if (!known(left) || !known(right)) {
+                return true;
+            }
+            if (left.database != right.database) {
+                return true;
+            }
+            return left.value.equalsIgnoreCase(right.value);
+        }
+
+        @Override
+        public String toString() {
+            return (database ? "database:" : "schema:") + value;
+        }
+    }
+
+    /**
      * The database deltas carried by one change record.
      *
      * A change record points at the SQL statement, never at the column: the columns have to be read
      * back from the statement's own metadata (and from the base metadata, for the "which write
      * columns disappeared" comparison).
      */
-    private List<ColumnDelta> columnDeltas(ChangeRecord change, CodeIndex ownHead) {
-        List<ColumnDelta> deltas = new ArrayList<>();
+    private List<DbDelta> dbDeltas(ChangeRecord change, CodeIndex ownHead, PeerImpact counter) {
+        List<DbDelta> deltas = new ArrayList<>();
         Set<String> seenDeltas = new LinkedHashSet<>();
         if (change.symbolKey == null) {
             return deltas;
         }
         if (change.symbolKey.startsWith("db:column:")) {
-            String column = change.symbolKey.substring("db:column:".length());
-            addColumnDelta(deltas, seenDeltas, column, true, true, true);
-            return deltas;
-        }
-        if (change.symbolKey.startsWith("db:table:")) {
-            addTableDelta(deltas, seenDeltas, change.symbolKey.substring("db:table:".length()));
-            return deltas;
-        }
-        // An entity field mapped onto a column: the mapping is the contract.
-        if (ChangeDetector.FIELD_REMOVED.equals(change.changeType)
-                || ChangeDetector.FIELD_ADDED.equals(change.changeType)
+            addColumnDelta(deltas, seenDeltas, change.symbolKey.substring("db:column:".length()),
+                    "SCHEMA", true, true, true, 0.9);
+        } else if (change.symbolKey.startsWith("db:table:")) {
+            addTableDelta(deltas, seenDeltas, change.symbolKey.substring("db:table:".length()),
+                    "SCHEMA", true, true, true, 0.75);
+        } else if (ChangeDetector.FIELD_REMOVED.equals(change.changeType)
                 || ChangeDetector.FIELD_TYPE_CHANGED.equals(change.changeType)) {
-            // The detector captured the mapping, because a removed field only exists in the base
-            // index and its edges are gone from the head graph the peer analysis runs against.
-            for (String column : splitColumns(str(change.extra.get("mappedColumns")))) {
-                addColumnDelta(deltas, seenDeltas, column, true, true, true);
+            // An entity mapping is not a schema change. Removing a field changes what this program
+            // reads, not what the other program reads; adding one changes nothing at all. Only a
+            // peer that maps the same column is worth a low-confidence mapping hint.
+            for (String column : mappedColumns(change, ownHead)) {
+                addColumnDelta(deltas, seenDeltas, column, "MAPPING", false, false, true, 0.5);
             }
-            for (Edge e : ownHead.outgoing.getOrDefault(change.symbolKey, List.of())) {
-                if (!"MAPS_COLUMN".equals(e.relation) || !e.to.startsWith("db:column:")) {
-                    continue;
-                }
-                addColumnDelta(deltas, seenDeltas, e.to.substring("db:column:".length()), true, true, true);
-            }
-            if (!deltas.isEmpty()) {
-                return deltas;
-            }
-        }
-        if (!change.symbolKey.startsWith("sql:")) {
+        } else if (ChangeDetector.FIELD_ADDED.equals(change.changeType)) {
+            // Adding a mapping is internal; it cannot break a consumer.
+        } else if (!change.symbolKey.startsWith("sql:")) {
             return deltas;
-        }
-        if (ChangeDetector.DDL_CHANGED.equals(change.changeType)) {
-            String table = str(change.extra.get("table"));
-            String column = str(change.extra.get("column"));
-            String kind = str(change.extra.get("ddl"));
-            if (!column.isBlank() && !table.isBlank()) {
-                // A column whose shape moved: whoever reads or writes it is affected.
-                addColumnDelta(deltas, seenDeltas, table + "." + column, true, true, true);
-            } else if (!table.isBlank()) {
-                // CREATE / DROP TABLE: no column to name, so the table itself is the contract.
-                addTableDelta(deltas, seenDeltas, table);
+        } else if (ChangeDetector.DDL_CHANGED.equals(change.changeType)) {
+            dbDeltasForDdl(change, counter, deltas, seenDeltas);
+        } else if (!isIncomplete(change)) {
+            // A plain statement edit: only the columns this program writes can reach the other side.
+            for (String column : changedWriteColumns(change)) {
+                addColumnDelta(deltas, seenDeltas, column, "WRITE_SET", true, false, false, 0.85);
             }
-            if (!deltas.isEmpty()) {
-                return deltas;
+            for (String table : changedWriteTables(change)) {
+                // The statement started or stopped writing a whole table and named no column: this
+                // is a table-level change of the write contract, and readers see new rows. Writers
+                // are excluded: two programs writing the same table do not conflict through this.
+                addTableDelta(deltas, seenDeltas, table, "WRITE_SET", true, false, false, 0.65);
             }
         }
-        // A plain statement edit: only the columns this program writes can reach the other side.
-        for (String column : changedWriteColumns(change)) {
-            addColumnDelta(deltas, seenDeltas, column, true, false, false);
-        }
-        for (String table : changedWriteTables(change)) {
-            // The statement started or stopped writing a whole table and named no column: this is a
-            // table-level change of the write contract, and readers of the table see new rows.
-            addTableDelta(deltas, seenDeltas, table);
+        for (DbDelta delta : deltas) {
+            delta.ownIdentity = ownIdentity(ownHead, change, delta.table);
         }
         return deltas;
+    }
+
+    private void dbDeltasForDdl(ChangeRecord change, PeerImpact counter,
+                                List<DbDelta> deltas, Set<String> seen) {
+        if ("true".equals(str(change.extra.get("ddlRemoved")))) {
+            // Deleting a migration script does not undo the migration in a real database.
+            return;
+        }
+        String kind = str(change.extra.get("ddl"));
+        String table = normalizeTable(change.extra.get("table"));
+        String column = normalizeColumn(change.extra.get("column"));
+        String oldType = str(change.extra.get("oldType"));
+        String newType = str(change.extra.get("newType"));
+        String oldNullable = str(change.extra.get("oldNullable"));
+        String newNullable = str(change.extra.get("newNullable"));
+        String reason = str(change.extra.get("schemaChange"));
+        if (reason.isBlank()) {
+            reason = "TYPE";
+        }
+        switch (kind) {
+            case "DROP_COLUMN" -> {
+                if (!table.isBlank() && !column.isBlank()) {
+                    addColumnDelta(deltas, seen, table + "." + column, kind, true, true, true, 0.95);
+                }
+            }
+            case "ADD_COLUMN" -> {
+                // A named-column reader or writer is unaffected by a new column. Only SELECT * and
+                // columnless INSERT can observe it, and those are counted as blind spots. A NOT
+                // NULL column without a default can reject a columnless INSERT; that is exactly
+                // the blind spot the count exists to surface, not a reason to flag every writer.
+                if (!table.isBlank()) {
+                    addTableDelta(deltas, seen, table, kind, false, false, false, 0.5);
+                }
+            }
+            case "MODIFY_COLUMN" -> {
+                if (table.isBlank() || column.isBlank()) {
+                    break;
+                }
+                if ("DEFAULT".equals(reason)) {
+                    // A default only affects writes that omit the column; named-column code does
+                    // not observe it. Columnless INSERT / SELECT * are still counted as blind spots.
+                    addTableDelta(deltas, seen, table, kind, false, false, false, 0.3);
+                    break;
+                }
+                if ("NULLABILITY".equals(reason)) {
+                    ColumnTypeCompatibility.Result result =
+                            ColumnTypeCompatibility.compareNullability(oldNullable, newNullable);
+                    if (ColumnTypeCompatibility.safe(result)) {
+                        if (counter != null) {
+                            counter.dbCompatibilitySuppressed++;
+                            addExample(counter.dbCompatibilityExamples, table + "." + column
+                                    + "（可空性 " + safeNullable(oldNullable) + " → "
+                                    + safeNullable(newNullable) + "）");
+                        }
+                        break;
+                    }
+                    // Readers still see the same values; only writers can fail on NOT NULL.
+                    addColumnDelta(deltas, seen, table + "." + column, kind, false, true, false, 0.8);
+                    break;
+                }
+                ColumnTypeCompatibility.Result result = ColumnTypeCompatibility.compare(oldType, newType);
+                if (ColumnTypeCompatibility.safe(result)) {
+                    if (counter != null) {
+                        counter.dbCompatibilitySuppressed++;
+                        addExample(counter.dbCompatibilityExamples, table + "." + column
+                                + "（" + oldType + " → " + newType + "）");
+                    }
+                    break;
+                }
+                boolean known = !oldType.isBlank() && !newType.isBlank();
+                addColumnDelta(deltas, seen, table + "." + column, kind, true, true, true,
+                        known ? 0.9 : 0.6);
+            }
+            case "DROP_TABLE" -> {
+                if (!table.isBlank()) {
+                    addTableDelta(deltas, seen, table, kind, true, true, true, 0.95);
+                }
+            }
+            case "CREATE_TABLE" -> {
+                // A new table cannot already be a dependency of another program. If the peer does
+                // reference it, that code is new too; this is not a regression caused by the change.
+            }
+            default -> {
+                if (!table.isBlank()) {
+                    addTableDelta(deltas, seen, table, kind, true, true, true, 0.6);
+                }
+            }
+        }
+    }
+
+    private Set<String> mappedColumns(ChangeRecord change, CodeIndex ownHead) {
+        Set<String> columns = new LinkedHashSet<>();
+        for (String column : splitColumns(str(change.extra.get("mappedColumns")))) {
+            if (column.contains(".")) {
+                columns.add(column.toLowerCase(java.util.Locale.ROOT));
+            }
+        }
+        for (Edge e : ownHead.outgoing.getOrDefault(change.symbolKey, List.of())) {
+            if ("MAPS_COLUMN".equals(e.relation) && e.to.startsWith("db:column:")) {
+                columns.add(e.to.substring("db:column:".length()).toLowerCase(java.util.Locale.ROOT));
+            }
+        }
+        return columns;
     }
 
     /**
@@ -315,33 +476,55 @@ public class PeerImpactEngine {
      */
     private void collectColumnBlindSpots(List<ChangeRecord> changes, CodeIndex ownHead, CodeIndex peer,
                                          PeerImpact out) {
-        Set<String> tables = new LinkedHashSet<>();
+        Map<String, DbDelta> tables = new LinkedHashMap<>();
         for (ChangeRecord change : changes) {
-            for (ColumnDelta delta : columnDeltas(change, ownHead)) {
-                if (delta.symbolKey.startsWith("db:table:")) {
-                    tables.add(delta.symbolKey.substring("db:table:".length()));
-                } else if (delta.symbolKey.startsWith("db:column:")) {
-                    String column = delta.symbolKey.substring("db:column:".length());
-                    int dot = column.indexOf('.');
-                    if (dot > 0) {
-                        tables.add(column.substring(0, dot));
-                    }
+            for (DbDelta delta : dbDeltas(change, ownHead, null)) {
+                if (delta.table == null || delta.table.isBlank() || "MAPPING".equals(delta.operation)) {
+                    continue;
                 }
+                tables.putIfAbsent(delta.table, delta);
             }
         }
         if (tables.isEmpty()) {
             return;
         }
+        // A statement that already matched as a reader/writer is not a blind spot: the report's
+        // note says blind spots are neither confirmed nor excluded, and double-counting them
+        // contradicts that.
+        Set<String> matchedConsumers = new LinkedHashSet<>();
+        for (PeerImpact.ContractMatch match : out.matches) {
+            if (match.peerSymbolKey != null) {
+                matchedConsumers.add(match.peerSymbolKey);
+            }
+        }
         int count = 0;
         Set<String> files = new LinkedHashSet<>();
         for (Sym sym : peer.symbols.values()) {
-            if (!"SQL_STATEMENT".equals(sym.type)) {
+            if (!"SQL_STATEMENT".equals(sym.type) || sym.test || matchedConsumers.contains(sym.key)) {
                 continue;
             }
             Set<String> statementTables = splitColumns(sym.meta.get("readsTables"));
             statementTables.addAll(splitColumns(sym.meta.get("writesTables")));
-            statementTables.retainAll(tables);
-            if (statementTables.isEmpty() || !splitColumns(sym.meta.get("readsColumns")).isEmpty()) {
+            statementTables.retainAll(tables.keySet());
+            if (statementTables.isEmpty()) {
+                continue;
+            }
+            boolean noColumns = splitColumns(sym.meta.get("readsColumns")).isEmpty()
+                    && splitColumns(sym.meta.get("writesColumns")).isEmpty();
+            boolean incomplete = "true".equals(sym.meta.get("sqlIncomplete"));
+            if (!noColumns && !incomplete) {
+                continue;
+            }
+            boolean sameDatabase = true;
+            for (String table : statementTables) {
+                DbDelta delta = tables.get(table);
+                DbIdentity peerIdentity = peerIdentity(peer, sym.key, table);
+                if (!DbIdentity.compatible(delta.ownIdentity, peerIdentity)) {
+                    sameDatabase = false;
+                    break;
+                }
+            }
+            if (!sameDatabase) {
                 continue;
             }
             count++;
@@ -353,44 +536,61 @@ public class PeerImpactEngine {
         out.unparsedColumnFiles = new ArrayList<>(files);
     }
 
-    private void addColumnDelta(List<ColumnDelta> out, Set<String> seen, String contract,
-                                boolean readers, boolean writers, boolean mappings) {
+    private DbDelta addColumnDelta(List<DbDelta> out, Set<String> seen, String contract,
+                                   String operation, boolean readers, boolean writers, boolean mappings,
+                                   double confidence) {
         if (contract == null || contract.isBlank() || !contract.contains(".")) {
-            return;
+            return null;
         }
-        String key = "db:column:" + contract;
+        String normalized = contract.trim().toLowerCase(java.util.Locale.ROOT);
+        String key = "db:column:" + normalized;
         if (!seen.add(key)) {
-            return;
+            return null;
         }
-        ColumnDelta d = new ColumnDelta();
+        DbDelta d = new DbDelta();
         d.symbolKey = key;
-        d.contract = contract;
+        d.contract = normalized;
         d.kind = "DB_COLUMN";
+        d.operation = operation;
+        d.table = normalized.substring(0, normalized.indexOf('.'));
         d.hitsReaders = readers;
         d.hitsWriters = writers;
         d.hitsMappings = mappings;
-        d.confidence = 0.85;
+        d.confidence = confidence;
         out.add(d);
+        return d;
     }
 
-    private void addTableDelta(List<ColumnDelta> out, Set<String> seen, String table) {
-        if (table == null || table.isBlank()) {
-            return;
+    private DbDelta addTableDelta(List<DbDelta> out, Set<String> seen, String table,
+                                  String operation, boolean readers, boolean writers, boolean mappings,
+                                  double confidence) {
+        String normalized = normalizeTable(table);
+        if (normalized.isBlank()) {
+            return null;
         }
-        String key = "db:table:" + table;
+        String key = "db:table:" + normalized;
         if (!seen.add(key)) {
-            return;
+            return null;
         }
-        ColumnDelta d = new ColumnDelta();
+        DbDelta d = new DbDelta();
         d.symbolKey = key;
-        d.contract = table;
+        d.contract = normalized;
         d.kind = "DB_TABLE";
-        d.confidence = 0.75;
+        d.operation = operation;
+        d.table = normalized;
+        d.hitsReaders = readers;
+        d.hitsWriters = writers;
+        d.hitsMappings = mappings;
+        d.confidence = confidence;
         out.add(d);
+        return d;
     }
 
     /** Columns this program started or stopped writing, as {@code table.column}. */
     private Set<String> changedWriteColumns(ChangeRecord change) {
+        if (isIncomplete(change)) {
+            return Set.of();
+        }
         Set<String> before = splitColumns(str(change.extra.get("oldWritesColumns")));
         Set<String> after = splitColumns(str(change.extra.get("newWritesColumns")));
         Set<String> out = new LinkedHashSet<>(after);
@@ -407,9 +607,13 @@ public class PeerImpactEngine {
      * When the columns are known they are the contract, and the table-level fallback would drag in
      * every reader of the table - exactly the noise column matching exists to remove. The fallback
      * is only for a write with no column list at all ({@code insert into t values (...)}), where the
-     * statement genuinely moved at table granularity.
+     * statement genuinely moved at table granularity. Dynamic SQL is excluded: its parsed column
+     * list is a lower bound, not evidence that the table-level contract moved.
      */
     private Set<String> changedWriteTables(ChangeRecord change) {
+        if (isIncomplete(change)) {
+            return Set.of();
+        }
         if (!splitColumns(str(change.extra.get("newWritesColumns"))).isEmpty()) {
             return Set.of();
         }
@@ -421,6 +625,87 @@ public class PeerImpactEngine {
         Set<String> out = new LinkedHashSet<>(after);
         out.removeAll(before);
         return out;
+    }
+
+    private boolean isIncomplete(ChangeRecord change) {
+        return "true".equals(str(change.extra.get("oldSqlIncomplete")))
+                || "true".equals(str(change.extra.get("newSqlIncomplete")));
+    }
+
+    private DbIdentity ownIdentity(CodeIndex own, ChangeRecord change, String table) {
+        String explicit = str(change.extra.get("ddlSchema"));
+        if (explicit.isBlank()) {
+            explicit = statementSchema(own.symbol(change.symbolKey), table);
+        }
+        if (!explicit.isBlank()) {
+            return DbIdentity.schema(explicit);
+        }
+        if (DatabaseIdentity.known(own.databaseName)) {
+            return DbIdentity.database(own.databaseName);
+        }
+        if (DatabaseIdentity.known(own.defaultSchema)) {
+            return DbIdentity.schema(own.defaultSchema);
+        }
+        return null;
+    }
+
+    private DbIdentity peerIdentity(CodeIndex peer, String fromKey, String table) {
+        Sym from = peer.symbol(fromKey);
+        String explicit = statementSchema(from, table);
+        if (!explicit.isBlank()) {
+            return DbIdentity.schema(explicit);
+        }
+        if (DatabaseIdentity.known(peer.databaseName)) {
+            return DbIdentity.database(peer.databaseName);
+        }
+        if (DatabaseIdentity.known(peer.defaultSchema)) {
+            return DbIdentity.schema(peer.defaultSchema);
+        }
+        return null;
+    }
+
+    private String statementSchema(Sym sym, String table) {
+        if (sym == null || sym.meta == null || table == null || table.isBlank()) {
+            return "";
+        }
+        String encoded = sym.meta.get("tableSchemas");
+        if (encoded != null && !encoded.isBlank()) {
+            for (String part : encoded.split(",")) {
+                int eq = part.indexOf('=');
+                if (eq > 0 && part.substring(0, eq).equalsIgnoreCase(table)) {
+                    return part.substring(eq + 1);
+                }
+            }
+        }
+        String ddlTable = sym.meta.get("ddlTable");
+        String ddlSchema = sym.meta.get("ddlSchema");
+        if (ddlTable != null && ddlSchema != null && normalizeTable(ddlTable).equals(table)) {
+            return ddlSchema;
+        }
+        return "";
+    }
+
+    private static String safeNullable(String value) {
+        if (value == null || value.isBlank()) {
+            return "未知";
+        }
+        return "true".equalsIgnoreCase(value) ? "可空" : "非空";
+    }
+
+    private static void addExample(List<String> examples, String value) {
+        if (examples.size() < 5 && !examples.contains(value)) {
+            examples.add(value);
+        }
+    }
+
+    private static String normalizeTable(Object value) {
+        return com.geek.association.parse.SqlAnalyzer.normalizeTable(value == null ? "" : String.valueOf(value));
+    }
+
+    private static String normalizeColumn(Object value) {
+        String column = str(value).trim().toLowerCase(java.util.Locale.ROOT);
+        int dot = column.lastIndexOf('.');
+        return dot >= 0 ? column.substring(dot + 1) : column;
     }
 
     private static String str(Object value) {

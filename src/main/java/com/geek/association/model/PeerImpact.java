@@ -48,6 +48,22 @@ public class PeerImpact {
     public List<String> unparsedColumnFiles = new ArrayList<>();
 
     /**
+     * Database candidates excluded because the two programs declare different databases.
+     *
+     * A table name is not a contract when it lives in another database. These are counted instead
+     * of silently disappearing, so "no impact" never hides a suppressed candidate.
+     */
+    public int dbMismatchSuppressed;
+    /** A few examples behind {@link #dbMismatchSuppressed}, capped for display. */
+    public List<String> dbMismatchExamples = new ArrayList<>();
+    /** Schema changes excluded because the type change is compatible (widening, nullable relaxed). */
+    public int dbCompatibilitySuppressed;
+    /** A few examples behind {@link #dbCompatibilitySuppressed}, capped for display. */
+    public List<String> dbCompatibilityExamples = new ArrayList<>();
+    /** Matches kept although one side's database identity is unknown; confidence is lowered. */
+    public int dbIdentityUnknownMatches;
+
+    /**
      * One shared contract: the changed thing on this side, and the code on the peer side that
      * consumes it.
      */

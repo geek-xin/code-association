@@ -214,22 +214,54 @@ class PeerImpactTest {
 
     /** One program whose only changed file is a MyBatis mapper with a single statement. */
     private static Change mapperChange(Path tmp, String before, String after) throws IOException {
+        return mapperChange(tmp, before, after, null);
+    }
+
+    /** Same, with a declared JDBC URL so database identity can be compared. */
+    private static Change mapperChange(Path tmp, String before, String after, String ownUrl) throws IOException {
         Path base = tmp.resolve("base");
         write(base, "pom.xml", WRITER_POM);
         write(base, "src/main/resources/mapper/OrderMapper.xml", "<mapper namespace=\"com.example.w.OrderMapper\">"
                 + before + "</mapper>");
+        if (ownUrl != null) {
+            write(base, "src/main/resources/application.yml", datasource(ownUrl));
+        }
         Path head = tmp.resolve("head");
         write(head, "pom.xml", WRITER_POM);
         write(head, "src/main/resources/mapper/OrderMapper.xml", "<mapper namespace=\"com.example.w.OrderMapper\">"
                 + after + "</mapper>");
+        if (ownUrl != null) {
+            write(head, "src/main/resources/application.yml", datasource(ownUrl));
+        }
         return detectChanges(base, head);
     }
 
+    private static String datasource(String url) {
+        return "spring:\n  datasource:\n    url: " + url + "\n";
+    }
+
     private static CodeIndex readerOfOrders(Path root, String statement) throws IOException {
+        return readerOfOrders(root, statement, null);
+    }
+
+    private static CodeIndex readerOfOrders(Path root, String statement, String url) throws IOException {
         write(root, "pom.xml", "<project><modelVersion>4.0.0</modelVersion>"
                 + "<groupId>com.example</groupId><artifactId>reader</artifactId><version>1.0</version></project>");
         write(root, "src/main/resources/mapper/OrderReader.xml", "<mapper namespace=\"com.example.r.OrderReader\">"
                 + "<select id=\"loadOrder\">" + statement + "</select></mapper>");
+        if (url != null) {
+            write(root, "src/main/resources/application.yml", datasource(url));
+        }
+        return index(root);
+    }
+
+    private static CodeIndex writerOfOrders(Path root) throws IOException {
+        write(root, "pom.xml", "<project><modelVersion>4.0.0</modelVersion>"
+                + "<groupId>com.example</groupId><artifactId>other-writer</artifactId><version>1.0</version></project>");
+        write(root, "src/main/resources/mapper/OtherWriter.xml",
+                "<mapper namespace=\"com.example.o.OtherWriter\">"
+                        + "<update id=\"touchRemark\">UPDATE orders SET remark = #{remark} WHERE id = #{id}</update>"
+                        + "</mapper>");
         return index(root);
     }
 
@@ -300,6 +332,418 @@ class PeerImpactTest {
                 "two programs writing the same column do not conflict through this change: " + describe(result));
     }
 
+    // ---------------------------------------------------- database identity
+    //
+    // A table name is not an identity: orders exists in almost every schema. A match is only
+    // allowed when the two programs can actually see the same database object; unknown identity
+    // stays a match with lower confidence, because "I could not read the URL" is not evidence of
+    // a different database.
+
+    @Test
+    void sameTableInDifferentDatabasesIsNotASharedContract(@TempDir Path tmp) throws IOException {
+        Change change = mapperChange(tmp,
+                "<insert id=\"insertOrder\">INSERT INTO orders (id) VALUES (#{id})</insert>",
+                "<insert id=\"insertOrder\">INSERT INTO orders (id, remark) VALUES (#{id}, #{remark})</insert>",
+                "jdbc:mysql://db-a:3306/order_db");
+        CodeIndex peer = readerOfOrders(tmp.resolve("r"),
+                "SELECT remark FROM orders WHERE id = #{id}", "jdbc:mysql://db-b:3306/billing_db");
+
+        PeerImpact result = analyzeAgainst(change, peer);
+
+        assertTrue(result.matches.isEmpty(),
+                "same table name in another database is not a contract: " + describe(result));
+        assertEquals(1, result.dbMismatchSuppressed,
+                "the suppressed candidate must be counted, not silently dropped");
+    }
+
+    @Test
+    void sameDatabaseNameOnDifferentHostsIsStillTheSameContract(@TempDir Path tmp) throws IOException {
+        Change change = mapperChange(tmp,
+                "<insert id=\"insertOrder\">INSERT INTO orders (id) VALUES (#{id})</insert>",
+                "<insert id=\"insertOrder\">INSERT INTO orders (id, remark) VALUES (#{id}, #{remark})</insert>",
+                "jdbc:mysql://db-a:3306/order_db");
+        CodeIndex peer = readerOfOrders(tmp.resolve("r"),
+                "SELECT remark FROM orders WHERE id = #{id}", "jdbc:mysql://db-b:3306/order_db");
+
+        PeerImpact result = analyzeAgainst(change, peer);
+
+        assertFalse(result.matches.isEmpty(),
+                "the database name, not the host, is the identity: " + describe(result));
+        assertEquals(0, result.dbMismatchSuppressed);
+    }
+
+    @Test
+    void unknownDatabaseIdentityKeepsTheMatchAtLowerConfidence(@TempDir Path tmp) throws IOException {
+        Change change = mapperChange(tmp,
+                "<insert id=\"insertOrder\">INSERT INTO orders (id) VALUES (#{id})</insert>",
+                "<insert id=\"insertOrder\">INSERT INTO orders (id, remark) VALUES (#{id}, #{remark})</insert>");
+        CodeIndex peer = readerOfOrders(tmp.resolve("r"), "SELECT remark FROM orders WHERE id = #{id}");
+
+        PeerImpact result = analyzeAgainst(change, peer);
+
+        assertFalse(result.matches.isEmpty(), "unknown identity is not a reason to drop a match");
+        assertTrue(result.matches.get(0).confidence < 0.85,
+                "an unverified identity must lower confidence: " + result.matches.get(0).confidence);
+        assertEquals(1, result.dbIdentityUnknownMatches,
+                "the report must say that the database identity was not verified");
+    }
+
+    @Test
+    void explicitSchemasInDifferentDatabasesAreNotTheSameContract(@TempDir Path tmp) throws IOException {
+        Change change = mapperChange(tmp,
+                "<insert id=\"insertOrder\">INSERT INTO order_db.orders (id) VALUES (#{id})</insert>",
+                "<insert id=\"insertOrder\">INSERT INTO order_db.orders (id, remark) "
+                        + "VALUES (#{id}, #{remark})</insert>");
+        CodeIndex peer = readerOfOrders(tmp.resolve("r"),
+                "SELECT remark FROM billing_db.orders WHERE id = #{id}");
+
+        PeerImpact result = analyzeAgainst(change, peer);
+
+        assertTrue(result.matches.isEmpty(),
+                "order_db.orders and billing_db.orders are different objects: " + describe(result));
+        assertEquals(1, result.dbMismatchSuppressed);
+    }
+
+    /** A new table cannot already be a dependency of another program. */
+    @Test
+    void createTableDoesNotReachCodeThatAlreadyUsesTheTable(@TempDir Path tmp) throws IOException {
+        Path base = tmp.resolve("base");
+        write(base, "pom.xml", WRITER_POM);
+        write(base, "src/main/resources/db/migration/V1__orders.sql", "CREATE TABLE orders (id BIGINT);");
+        Path head = tmp.resolve("head");
+        write(head, "pom.xml", WRITER_POM);
+        write(head, "src/main/resources/db/migration/V1__orders.sql",
+                "CREATE TABLE orders (id BIGINT);\nCREATE TABLE order_archive (id BIGINT);");
+        Change change = detectChanges(base, head);
+
+        CodeIndex peer = readerOfOrders(tmp.resolve("r"), "SELECT id FROM order_archive WHERE id = #{id}");
+        PeerImpact result = analyzeAgainst(change, peer);
+
+        assertTrue(result.matches.isEmpty(),
+                "a new table cannot already be a dependency: " + describe(result));
+    }
+
+    /** Deleting a migration script does not roll back a migration that already ran. */
+    @Test
+    void deletingAMigrationScriptIsNotASchemaRollback(@TempDir Path tmp) throws IOException {
+        Path base = tmp.resolve("base");
+        write(base, "pom.xml", WRITER_POM);
+        write(base, "src/main/resources/db/migration/V1__orders.sql",
+                "CREATE TABLE orders (id BIGINT, remark VARCHAR(64));");
+        Path head = tmp.resolve("head");
+        write(head, "pom.xml", WRITER_POM);
+        Change change = detectChanges(base, head);
+
+        assertTrue(change.records.stream().anyMatch(c -> ChangeDetector.DDL_CHANGED.equals(c.changeType)
+                        && "true".equals(String.valueOf(c.extra.get("ddlRemoved")))),
+                "removing a migration script is still a file change: " + change.records);
+
+        CodeIndex peer = readerOfOrders(tmp.resolve("r"), "SELECT remark FROM orders WHERE id = #{id}");
+        PeerImpact result = analyzeAgainst(change, peer);
+
+        assertTrue(result.matches.isEmpty(),
+                "deleting the script does not undo the migration: " + describe(result));
+    }
+
+    @Test
+    void wideningAColumnDoesNotReachItsReaders(@TempDir Path tmp) throws IOException {
+        Change change = createTableTypeChange(tmp, "VARCHAR(32)", "VARCHAR(64)");
+        assertTrue(change.records.stream().anyMatch(c -> ChangeDetector.DDL_CHANGED.equals(c.changeType)
+                        && "MODIFY_COLUMN".equals(c.extra.get("ddl"))
+                        && "orders.remark".equals(c.extra.get("table") + "." + c.extra.get("column"))),
+                "the type change must be detected: " + change.records);
+
+        CodeIndex peer = readerOfOrders(tmp.resolve("r"), "SELECT remark FROM orders WHERE id = #{id}");
+        PeerImpact result = analyzeAgainst(change, peer);
+
+        assertTrue(result.matches.isEmpty(),
+                "a widened column keeps every existing value valid: " + describe(result));
+        assertEquals(1, result.dbCompatibilitySuppressed,
+                "the compatible change must be counted, not silently dropped");
+    }
+
+    @Test
+    void narrowingAColumnReachesItsReaders(@TempDir Path tmp) throws IOException {
+        Change change = createTableTypeChange(tmp, "VARCHAR(64)", "VARCHAR(32)");
+        CodeIndex peer = readerOfOrders(tmp.resolve("r"), "SELECT remark FROM orders WHERE id = #{id}");
+
+        PeerImpact result = analyzeAgainst(change, peer);
+
+        assertTrue(result.matches.stream().anyMatch(m -> "DB_COLUMN".equals(m.kind)
+                        && "orders.remark".equals(m.contract)),
+                "a narrowed column can truncate values: " + describe(result));
+    }
+
+    @Test
+    void makingAColumnNotNullReachesWritersOnly(@TempDir Path tmp) throws IOException {
+        Change change = createTableTypeChange(tmp, "VARCHAR(64) NULL", "VARCHAR(64) NOT NULL");
+
+        CodeIndex reader = readerOfOrders(tmp.resolve("r"), "SELECT remark FROM orders WHERE id = #{id}");
+        PeerImpact readSide = analyzeAgainst(change, reader);
+        assertTrue(readSide.matches.isEmpty(),
+                "readers still see the same values after a NOT NULL change: " + describe(readSide));
+
+        Path writerDir = tmp.resolve("w");
+        write(writerDir, "pom.xml", "<project><modelVersion>4.0.0</modelVersion>"
+                + "<groupId>com.example</groupId><artifactId>other-writer</artifactId><version>1.0</version></project>");
+        write(writerDir, "src/main/resources/mapper/OtherWriter.xml",
+                "<mapper namespace=\"com.example.o.OtherWriter\">"
+                        + "<update id=\"touchRemark\">UPDATE orders SET remark = #{remark} WHERE id = #{id}</update>"
+                        + "</mapper>");
+        PeerImpact writeSide = analyzeAgainst(change, index(writerDir));
+        assertTrue(writeSide.matches.stream().anyMatch(m -> "writer".equals(m.usage)),
+                "an existing writer can fail when the column becomes NOT NULL: " + describe(writeSide));
+    }
+
+    @Test
+    void alterNotNullReachesWritersNotReaders(@TempDir Path tmp) throws IOException {
+        Path base = tmp.resolve("base");
+        write(base, "pom.xml", WRITER_POM);
+        write(base, "src/main/resources/db/migration/V1__orders.sql",
+                "CREATE TABLE orders (id BIGINT, remark VARCHAR(64) NULL);");
+        Path head = tmp.resolve("head");
+        write(head, "pom.xml", WRITER_POM);
+        write(head, "src/main/resources/db/migration/V1__orders.sql",
+                "CREATE TABLE orders (id BIGINT, remark VARCHAR(64) NULL);\n"
+                        + "ALTER TABLE orders MODIFY COLUMN remark VARCHAR(64) NOT NULL;");
+        Change change = detectChanges(base, head);
+
+        assertTrue(change.records.stream().anyMatch(c -> ChangeDetector.DDL_CHANGED.equals(c.changeType)
+                        && "MODIFY_COLUMN".equals(c.extra.get("ddl"))
+                        && "NULLABILITY".equals(c.extra.get("schemaChange"))),
+                "an ALTER that only changes nullability must say so: " + change.records);
+
+        CodeIndex reader = readerOfOrders(tmp.resolve("r"), "SELECT remark FROM orders WHERE id = #{id}");
+        assertTrue(analyzeAgainst(change, reader).matches.isEmpty(),
+                "readers still see the same values");
+
+        Path writerDir = tmp.resolve("w");
+        write(writerDir, "pom.xml", "<project><modelVersion>4.0.0</modelVersion>"
+                + "<groupId>com.example</groupId><artifactId>other-writer</artifactId><version>1.0</version></project>");
+        write(writerDir, "src/main/resources/mapper/OtherWriter.xml",
+                "<mapper namespace=\"com.example.o.OtherWriter\">"
+                        + "<update id=\"touchRemark\">UPDATE orders SET remark = #{remark} WHERE id = #{id}</update>"
+                        + "</mapper>");
+        PeerImpact writeSide = analyzeAgainst(change, index(writerDir));
+        assertTrue(writeSide.matches.stream().anyMatch(m -> "writer".equals(m.usage)),
+                "an existing writer can fail when the column becomes NOT NULL: " + describe(writeSide));
+    }
+
+    @Test
+    void postgresSetNotNullReachesWriters(@TempDir Path tmp) throws IOException {
+        Change change = alterChange(tmp,
+                "CREATE TABLE orders (id BIGINT, remark VARCHAR(64));",
+                "ALTER TABLE orders ALTER COLUMN remark SET NOT NULL;");
+
+        assertTrue(change.records.stream().anyMatch(c -> ChangeDetector.DDL_CHANGED.equals(c.changeType)
+                        && "NULLABILITY".equals(c.extra.get("schemaChange"))),
+                "ALTER COLUMN ... SET NOT NULL must be a nullability change: " + change.records);
+
+        CodeIndex reader = readerOfOrders(tmp.resolve("r"), "SELECT remark FROM orders WHERE id = #{id}");
+        assertTrue(analyzeAgainst(change, reader).matches.isEmpty(), "readers still see the same values");
+
+        PeerImpact writeSide = analyzeAgainst(change, writerOfOrders(tmp.resolve("w")));
+        assertTrue(writeSide.matches.stream().anyMatch(m -> "writer".equals(m.usage)),
+                "an existing writer can fail when the column becomes NOT NULL: " + describe(writeSide));
+    }
+
+    @Test
+    void ifExistsColumnDdlKeepsTheRealColumnName(@TempDir Path tmp) throws IOException {
+        Change added = alterChange(tmp,
+                "CREATE TABLE orders (id BIGINT);",
+                "ALTER TABLE orders ADD COLUMN IF NOT EXISTS remark VARCHAR(64);");
+        assertTrue(added.head.columnTypes.containsKey("orders.remark"),
+                "ADD COLUMN IF NOT EXISTS must add remark, not a column called IF");
+        assertFalse(added.head.columnTypes.containsKey("orders.if"));
+
+        Change dropped = alterChange(tmp,
+                "CREATE TABLE orders (id BIGINT, remark VARCHAR(64));",
+                "ALTER TABLE orders DROP COLUMN IF EXISTS remark;");
+        assertFalse(dropped.head.columnTypes.containsKey("orders.remark"),
+                "DROP COLUMN IF EXISTS must drop remark, not a column called IF");
+    }
+
+    @Test
+    void wideningTypeAndNotNullAreBothReported(@TempDir Path tmp) throws IOException {
+        Change change = alterChange(tmp,
+                "CREATE TABLE orders (id BIGINT, remark VARCHAR(64) NULL);",
+                "ALTER TABLE orders MODIFY COLUMN remark VARCHAR(128) NOT NULL;");
+
+        assertTrue(change.records.stream().anyMatch(c -> ChangeDetector.DDL_CHANGED.equals(c.changeType)
+                        && "TYPE".equals(c.extra.get("schemaChange"))),
+                "the widening must be recorded: " + change.records);
+        assertTrue(change.records.stream().anyMatch(c -> ChangeDetector.DDL_CHANGED.equals(c.changeType)
+                        && "NULLABILITY".equals(c.extra.get("schemaChange"))),
+                "the NOT NULL tightening must not be swallowed by the widening: " + change.records);
+
+        PeerImpact writeSide = analyzeAgainst(change, writerOfOrders(tmp.resolve("w")));
+        assertTrue(writeSide.matches.stream().anyMatch(m -> "writer".equals(m.usage)),
+                "the write-side break must survive the safe widening: " + describe(writeSide));
+    }
+
+    @Test
+    void aLaterNotNullIsNotHiddenByAnEarlierModifyWithoutNullability(@TempDir Path tmp) throws IOException {
+        Path base = tmp.resolve("base");
+        write(base, "pom.xml", WRITER_POM);
+        write(base, "src/main/resources/db/migration/V1__orders.sql",
+                "CREATE TABLE c (v INT NOT NULL);\nALTER TABLE c MODIFY v INT;");
+        Path head = tmp.resolve("head");
+        write(head, "pom.xml", WRITER_POM);
+        write(head, "src/main/resources/db/migration/V1__orders.sql",
+                "CREATE TABLE c (v INT NOT NULL);\nALTER TABLE c MODIFY v INT;\n"
+                        + "ALTER TABLE c MODIFY v INT NOT NULL;");
+        Change change = detectChanges(base, head);
+
+        assertTrue(change.records.stream().anyMatch(c -> ChangeDetector.DDL_CHANGED.equals(c.changeType)
+                        && "NULLABILITY".equals(c.extra.get("schemaChange"))),
+                "an earlier MODIFY without NOT NULL must clear the stale false, not hide the later true: "
+                        + change.records);
+    }
+
+    @Test
+    void inPlaceModifyWithoutCreateTableStillProducesADbDelta(@TempDir Path tmp) throws IOException {
+        Path base = tmp.resolve("base");
+        write(base, "pom.xml", WRITER_POM);
+        write(base, "src/main/resources/db/migration/V1__orders.sql",
+                "ALTER TABLE orders MODIFY remark VARCHAR(64);");
+        Path head = tmp.resolve("head");
+        write(head, "pom.xml", WRITER_POM);
+        write(head, "src/main/resources/db/migration/V1__orders.sql",
+                "ALTER TABLE orders MODIFY remark VARCHAR(32);");
+        Change change = detectChanges(base, head);
+
+        assertTrue(change.records.stream().anyMatch(c -> ChangeDetector.DDL_CHANGED.equals(c.changeType)
+                        && "MODIFY_COLUMN".equals(c.extra.get("ddl"))),
+                "an in-place MODIFY is a DDL change even without a CREATE TABLE in the repository: "
+                        + change.records);
+
+        CodeIndex reader = readerOfOrders(tmp.resolve("r"), "SELECT remark FROM orders WHERE id = #{id}");
+        PeerImpact result = analyzeAgainst(change, reader);
+        assertTrue(result.matches.stream().anyMatch(m -> "DB_COLUMN".equals(m.kind)
+                        && "orders.remark".equals(m.contract)),
+                "the narrowed column must reach its reader: " + describe(result));
+    }
+
+    @Test
+    void renamingAColumnReachesReadersOfTheOldName(@TempDir Path tmp) throws IOException {
+        Change change = alterChange(tmp,
+                "CREATE TABLE orders (id BIGINT, remark VARCHAR(64));",
+                "ALTER TABLE orders RENAME COLUMN remark TO note;");
+
+        assertTrue(change.records.stream().anyMatch(c -> ChangeDetector.DDL_CHANGED.equals(c.changeType)
+                        && "DROP_COLUMN".equals(c.extra.get("ddl"))
+                        && "remark".equals(c.extra.get("column"))),
+                "a rename breaks code that still reads the old name: " + change.records);
+
+        CodeIndex reader = readerOfOrders(tmp.resolve("r"), "SELECT remark FROM orders WHERE id = #{id}");
+        PeerImpact result = analyzeAgainst(change, reader);
+
+        assertTrue(result.matches.stream().anyMatch(m -> "DB_COLUMN".equals(m.kind)
+                        && "orders.remark".equals(m.contract)),
+                "the old column name is the contract: " + describe(result));
+    }
+
+    @Test
+    void databaseNameAndExplicitSchemaMatchAcrossLevelsWithLowerConfidence(@TempDir Path tmp) throws IOException {
+        Change change = mapperChange(tmp,
+                "<insert id=\"insertOrder\">INSERT INTO orders (id) VALUES (#{id})</insert>",
+                "<insert id=\"insertOrder\">INSERT INTO orders (id, remark) VALUES (#{id}, #{remark})</insert>",
+                "jdbc:mysql://db:3306/order_db");
+        CodeIndex peer = readerOfOrders(tmp.resolve("r"),
+                "SELECT remark FROM order_db.orders WHERE id = #{id}");
+
+        PeerImpact result = analyzeAgainst(change, peer);
+
+        assertFalse(result.matches.isEmpty(),
+                "a database name and an explicit schema can denote the same object: " + describe(result));
+        assertEquals(1, result.dbIdentityUnknownMatches,
+                "cross-level comparison is uncertain and must be counted");
+        assertTrue(result.matches.get(0).confidence < 0.85,
+                "cross-level identity must lower confidence: " + result.matches.get(0).confidence);
+    }
+
+    private static Change alterChange(Path tmp, String createSql, String alterSql) throws IOException {
+        Path base = tmp.resolve("base");
+        write(base, "pom.xml", WRITER_POM);
+        write(base, "src/main/resources/db/migration/V1__orders.sql", createSql);
+        Path head = tmp.resolve("head");
+        write(head, "pom.xml", WRITER_POM);
+        write(head, "src/main/resources/db/migration/V1__orders.sql", createSql + "\n" + alterSql);
+        return detectChanges(base, head);
+    }
+
+    private static Change createTableTypeChange(Path tmp, String beforeType, String afterType) throws IOException {
+        Path base = tmp.resolve("base");
+        write(base, "pom.xml", WRITER_POM);
+        write(base, "src/main/resources/db/migration/V1__orders.sql",
+                "CREATE TABLE orders (id BIGINT, remark " + beforeType + ");");
+        Path head = tmp.resolve("head");
+        write(head, "pom.xml", WRITER_POM);
+        write(head, "src/main/resources/db/migration/V1__orders.sql",
+                "CREATE TABLE orders (id BIGINT, remark " + afterType + ");");
+        return detectChanges(base, head);
+    }
+
+    /** Dynamic SQL must not degrade to a table-level contract: its parsed column list is a lower bound. */
+    @Test
+    void dynamicWriteDoesNotFallBackToATableContract(@TempDir Path tmp) throws IOException {
+        Change change = mapperChange(tmp,
+                "<select id=\"noop\">SELECT 1</select>",
+                "<select id=\"noop\">SELECT 1</select>"
+                        + "<insert id=\"archive\">INSERT INTO order_archive <include refid=\"cols\"/> "
+                        + "VALUES (#{id})</insert>");
+        CodeIndex peer = readerOfOrders(tmp.resolve("r"), "SELECT id FROM order_archive WHERE id = #{id}");
+
+        PeerImpact result = analyzeAgainst(change, peer);
+
+        assertTrue(result.matches.isEmpty(),
+                "an unresolved include is a blind spot, not a table-level contract: " + describe(result));
+    }
+
+    @Test
+    void testMapperIsNotAProductionConsumer(@TempDir Path tmp) throws IOException {
+        Change change = mapperChange(tmp,
+                "<insert id=\"insertOrder\">INSERT INTO orders (id) VALUES (#{id})</insert>",
+                "<insert id=\"insertOrder\">INSERT INTO orders (id, remark) VALUES (#{id}, #{remark})</insert>");
+        Path peerDir = tmp.resolve("r");
+        write(peerDir, "pom.xml", "<project><modelVersion>4.0.0</modelVersion>"
+                + "<groupId>com.example</groupId><artifactId>reader</artifactId><version>1.0</version></project>");
+        write(peerDir, "src/test/resources/mapper/OrderReader.xml",
+                "<mapper namespace=\"com.example.r.OrderReader\">"
+                        + "<select id=\"loadOrder\">SELECT remark FROM orders WHERE id = #{id}</select></mapper>");
+        CodeIndex peer = index(peerDir);
+
+        PeerImpact result = analyzeAgainst(change, peer);
+
+        assertTrue(result.matches.isEmpty(),
+                "test SQL is not a production consumer: " + describe(result));
+    }
+
+    @Test
+    void movingAStatementToAnotherMapperIsNotAWriteSetChange(@TempDir Path tmp) throws IOException {
+        Path base = tmp.resolve("base");
+        write(base, "pom.xml", WRITER_POM);
+        write(base, "src/main/resources/mapper/A.xml", "<mapper namespace=\"com.example.w.A\">"
+                + "<insert id=\"insertOrder\">INSERT INTO orders (id, remark) "
+                + "VALUES (#{id}, #{remark})</insert></mapper>");
+        Path head = tmp.resolve("head");
+        write(head, "pom.xml", WRITER_POM);
+        write(head, "src/main/resources/mapper/B.xml", "<mapper namespace=\"com.example.w.B\">"
+                + "<insert id=\"insertOrder\">INSERT INTO orders (id, remark) "
+                + "VALUES (#{id}, #{remark})</insert></mapper>");
+        Change change = detectChanges(base, head);
+
+        assertTrue(change.records.stream().noneMatch(c -> ChangeDetector.SQL_REMOVED.equals(c.changeType)
+                        || ChangeDetector.SQL_ADDED.equals(c.changeType)),
+                "a moved statement is not a contract change: " + change.records);
+
+        CodeIndex peer = readerOfOrders(tmp.resolve("r"), "SELECT remark FROM orders WHERE id = #{id}");
+        PeerImpact result = analyzeAgainst(change, peer);
+
+        assertTrue(result.matches.isEmpty(),
+                "moving a mapper must not look like a write-set change: " + describe(result));
+    }
+
     /** A dropped column breaks both sides, so the read side and the write side both match. */
     @Test
     void droppingAColumnReachesReadersAndWriters(@TempDir Path tmp) throws IOException {
@@ -357,9 +801,13 @@ class PeerImpactTest {
         assertFalse(result.impacts.isEmpty());
     }
 
-    /** A JPA field mapped onto a column is a database contract even without a SQL statement. */
+    /**
+     * Removing an entity field is not dropping a column. The column can still exist and be read by
+     * SQL; the mapping is this program's private view. Treating it as a schema change used to pull
+     * every reader and writer of the column into the report on every entity refactor.
+     */
     @Test
-    void removedEntityColumnMappingReachesTheProgramUsingThatColumn(@TempDir Path tmp) throws IOException {
+    void removedEntityMappingDoesNotReachSqlReaders(@TempDir Path tmp) throws IOException {
         String entityBefore = """
                 package com.example.w;
 
@@ -405,9 +853,8 @@ class PeerImpactTest {
         CodeIndex peer = readerOfOrders(tmp.resolve("r"), "SELECT remark FROM orders WHERE id = #{id}");
         PeerImpact result = analyzeAgainst(change, peer);
 
-        assertTrue(result.matches.stream().anyMatch(m -> "DB_COLUMN".equals(m.kind)
-                        && "orders.remark".equals(m.contract)),
-                "the dropped column mapping is a database contract: " + describe(result));
+        assertTrue(result.matches.isEmpty(),
+                "removing an entity field is not dropping a column: " + describe(result));
     }
 
     /**
@@ -452,9 +899,13 @@ class PeerImpactTest {
                 "a write with no column list is matched at table level: " + describe(result));
     }
 
-    /** An added column is a schema change too: code that maps the entity or selects it must be checked. */
+    /**
+     * A new column is invisible to a statement that names its columns. Reporting it as an impact
+     * was the database equivalent of reporting an unused method addition: the schema moved, the
+     * contract a named-column consumer depends on did not.
+     */
     @Test
-    void addingAColumnReachesTheProgramUsingThatColumn(@TempDir Path tmp) throws IOException {
+    void addingAColumnDoesNotReachTheReaderOfNamedColumns(@TempDir Path tmp) throws IOException {
         Path base = tmp.resolve("base");
         write(base, "pom.xml", WRITER_POM);
         write(base, "src/main/resources/db/migration/V1__orders.sql", "CREATE TABLE orders (id BIGINT);");
@@ -467,9 +918,29 @@ class PeerImpactTest {
         CodeIndex peer = readerOfOrders(tmp.resolve("r"), "SELECT remark FROM orders WHERE id = #{id}");
         PeerImpact result = analyzeAgainst(change, peer);
 
-        assertTrue(result.matches.stream().anyMatch(m -> "DB_COLUMN".equals(m.kind)
-                        && "orders.remark".equals(m.contract)),
-                "the added column is the contract: " + describe(result));
+        assertTrue(result.matches.isEmpty(),
+                "a named-column reader cannot observe a new column: " + describe(result));
+        assertTrue(result.impacts.isEmpty());
+    }
+
+    /** The same column addition is still visible to a statement whose column list is unknown. */
+    @Test
+    void addingAColumnSurfacesAsABlindSpotForSelectStar(@TempDir Path tmp) throws IOException {
+        Path base = tmp.resolve("base");
+        write(base, "pom.xml", WRITER_POM);
+        write(base, "src/main/resources/db/migration/V1__orders.sql", "CREATE TABLE orders (id BIGINT);");
+        Path head = tmp.resolve("head");
+        write(head, "pom.xml", WRITER_POM);
+        write(head, "src/main/resources/db/migration/V1__orders.sql",
+                "CREATE TABLE orders (id BIGINT);\nALTER TABLE orders ADD COLUMN remark VARCHAR(64);");
+        Change change = detectChanges(base, head);
+
+        CodeIndex peer = readerOfOrders(tmp.resolve("r"), "SELECT * FROM orders WHERE id = #{id}");
+        PeerImpact result = analyzeAgainst(change, peer);
+
+        assertTrue(result.matches.isEmpty(), "SELECT * names no column, so it cannot match one");
+        assertEquals(1, result.unparsedColumnStatements,
+                "the added column is a blind spot for SELECT *, not a clean result");
     }
 
     /**

@@ -58,7 +58,10 @@ public class CodeIndexer {
         new JavaIndexer(source, maven, index, maxFiles, onFile).build();
         new SqlAnalyzer(source, maven, index).analyze();
         new ApiAnalyzer(source, index, maven).analyze();
-        new ConfigAnalyzer(source, index, maven).analyze();
+        ConfigAnalyzer config = new ConfigAnalyzer(source, index, maven);
+        config.analyze();
+        index.databaseName = DatabaseIdentity.databaseName(config.keyValues);
+        index.defaultSchema = DatabaseIdentity.defaultSchema(config.keyValues);
         new MessagingAnalyzer().analyze(source, index);
         new TestLinker(source, index, maven).analyze();
         index.buildMillis = System.currentTimeMillis() - start;

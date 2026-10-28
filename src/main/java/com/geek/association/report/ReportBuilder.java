@@ -285,6 +285,25 @@ public class ReportBuilder {
                             + "（SELECT * 或动态拼接），无法参与字段级匹配；"
                             + "它们既不算命中也不算排除，请按「字段盲区」人工确认。");
         }
+        int dbMismatch = peers.stream().mapToInt(p -> p.dbMismatchSuppressed).sum();
+        if (dbMismatch > 0) {
+            ImpactReport.addNote(report.notes, seen,
+                    "有 " + dbMismatch + " 条数据库候选（按对方使用点计）因两程序声明的数据库不同而被排除；"
+                            + "同名表不等于同一张表，若确认两者共享数据库，请核对数据源配置后人工复核。");
+        }
+        int dbCompatible = peers.stream().mapToInt(p -> p.dbCompatibilitySuppressed).sum();
+        if (dbCompatible > 0) {
+            ImpactReport.addNote(report.notes, seen,
+                    "有 " + dbCompatible + " 条表结构候选属于兼容变更（字段加宽、可空性放宽等），"
+                            + "未作为跨程序影响报告；原有取值与绑定仍然有效。");
+        }
+        int dbUnknown = peers.stream().mapToInt(p -> p.dbIdentityUnknownMatches).sum();
+        if (dbUnknown > 0) {
+            ImpactReport.addNote(report.notes, seen,
+                    "有 " + dbUnknown + " 条数据库匹配因一侧未声明或无法确定数据源（或数据库名与 schema 名"
+                            + "属于不同层级）而无法确认是否同库，已保留匹配但降低置信度；"
+                            + "核对 JDBC URL 或显式 schema 可确认。");
+        }
         int peerSkipped = peers.stream().mapToInt(p -> p.skippedFiles.size()).sum();
         if (peerSkipped > 0) {
             ImpactReport.addNote(report.notes, seen,

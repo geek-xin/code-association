@@ -2,6 +2,29 @@
 
 遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### 修复
+
+- **数据库跨程序影响不再把「同名表」当成同一张表。** 契约 key 仍以 `表.字段` 为单位，但匹配前先比较两侧的数据源身份：从 `spring.datasource.url` / `spring.datasource.*.url` / `spring.datasource.hikari.jdbc-url` 解析数据库名，从 SQL 与 DDL 的 `schema.table` 读取显式 schema。两侧都已知且同层级不同 → 排除并计数；一侧未知 → 保留匹配但降低置信度；H2 mem / HSQLDB / Derby / SQLite 视为未知，因为进程内数据库不共享数据。报告会说明有多少候选因数据库不同被排除，而不是悄悄消失。
+- **DDL 按「变更可被观察」分型，不再让加列与删列同权。**
+  - `DROP COLUMN`、收窄类型（`VARCHAR(64) → VARCHAR(32)`、`BIGINT → INT`）、类型族变化 → 命中读方、写方、映射方；
+  - `ADD COLUMN`、`CREATE TABLE`、删除迁移脚本、类型放宽（`VARCHAR(32) → VARCHAR(64)`、`INT → BIGINT`）→ 不扩散，只计数；
+  - 加列只对 `SELECT *` / 无列名 INSERT 形成字段盲区；删除迁移脚本不再被当成 schema 回滚；
+  - 新增 `ColumnTypeCompatibility`，按字符串长度、整数等级、decimal 精度/scale、可空性与安全提升判断兼容性；无法判断时保留命中但降低置信度，不猜测。
+- **实体映射与数据库 schema 解耦。** `FIELD_ADDED` 不再产生数据库 delta；`FIELD_REMOVED` / `FIELD_TYPE_CHANGED` 只对同样映射该列的对方代码产生低置信度 mapping 提示，不再命中 SQL 读写方。`@Transient`、`static`、集合类型不建列映射；显式 `@Column` / `@JoinColumn` 优先于隐式命名；隐式命名按 Hibernate 边界转换（`userID → user_id`、`URLPath → url_path`），并降低置信度。
+- **移动语句不再伪造写入集合变化。** 同一 SQL 从一个 mapper 或迁移文件移动到另一个时，按规范化文本配对 `SQL_REMOVED` 与 `SQL_ADDED` 并取消两条记录；否则「文件搬家」会被读成「本程序停止写这一列」。
+- **动态 SQL 不再降级为表级契约。** `<if>` / `<choose>` / `<foreach>` / `<include>` 或占位符拼接导致列名不完整时，不把「没解析出写入列」当成「写入列集合变了」，也不退回整表匹配；对方侧改为按「读写列都没解析出来或语句被标记为不完整」计入字段盲区。
+- **测试 SQL 与测试迁移脚本不再参与生产契约。** `src/test/` 下的 mapper、schema.sql、data.sql 与迁移脚本不产生 DDL 变更、不作为对方消费方、不进入字段盲区。
+- **解析加固。** 解析前剥离 SQL 行注释与块注释（注释掉的 `ALTER TABLE ... DROP COLUMN` 不再生效，纯注释改动不再产生 SQL_CHANGED）；`ADD INDEX` / `ADD CONSTRAINT` / `DROP INDEX` 不再被当成列；`INSERT ... SELECT` 读取目标列清单；`ON DUPLICATE KEY UPDATE` 不再凭空造出名为 `status` 的表；多注解间隔的 `@Column` 仍能识别；`CREATE TABLE` 支持脚本开头有注释。
+- **ALTER / 迁移脚本解析补强。** 识别 PostgreSQL 风格 `ALTER COLUMN ... SET/DROP NOT NULL / SET DEFAULT`、`ADD/DROP COLUMN IF [NOT] EXISTS`、`RENAME COLUMN`；多动作 ALTER 的类型不再吞掉后续动作；迁移脚本按数值版本排序（V10 在 V2 后）；按引号/注释外的分号切分语句；DDL 只在语句开头识别，字符串字面量里的 `CREATE TABLE` 不再污染快照；JDBC URL 中的未解析占位符视为未知库。
+- **报告透明。** 新增「因数据库不同被排除」「因类型兼容被排除」计数与说明；字段盲区口径修正为「读写列都没解析出来或语句不完整」，已作为 writer 命中的纯写语句不重复计入。
+
+### 文档
+
+- 新增 [数据库影响判断](docs/wiki/数据库影响判断.md)：四个准入条件、DDL 分型对照表、类型兼容规则、字段盲区口径与仍然存在的边界（值语义、事务并发、视图/触发器/存储过程、运行时 SQL）。
+- 更新 [契约匹配详解](docs/wiki/契约匹配详解.md) 的数据库章节、[变更识别规则](docs/wiki/变更识别规则.md) 的 DDL 风险表、README 的跨程序比较说明。
+
 ## [0.6.0] - 2026-10-28
 
 ### 新增

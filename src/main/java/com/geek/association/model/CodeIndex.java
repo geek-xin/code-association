@@ -26,6 +26,19 @@ public class CodeIndex {
     public List<String[]> moduleDependencies = new ArrayList<>();
     public int parsedFiles;
     public long buildMillis;
+    /**
+     * The database this program declares in its configuration, when exactly one can be read.
+     * Null means unknown or ambiguous - never a guess. See {@code DatabaseIdentity}.
+     */
+    public String databaseName;
+    /** Default schema/catalog declared by the program, or null when unknown. */
+    public String defaultSchema;
+    /** {@code table.column -> SQL type}, from CREATE TABLE and ALTER statements. */
+    public Map<String, String> columnTypes = new HashMap<>();
+    /** {@code table.column -> "true"/"false"} when the DDL states nullability. */
+    public Map<String, String> columnNullability = new HashMap<>();
+    /** {@code table.column -> default expression} when the DDL states one. */
+    public Map<String, String> columnDefaults = new HashMap<>();
 
     public static class UnresolvedCall {
         public String filePath;
