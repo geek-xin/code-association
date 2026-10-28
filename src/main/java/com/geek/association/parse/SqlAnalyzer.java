@@ -105,6 +105,10 @@ public class SqlAnalyzer {
             "\\bdelete\\s+from\\s+([a-zA-Z_][\\w.]*)", Pattern.CASE_INSENSITIVE);
     private static final Pattern FROM_JOIN = Pattern.compile(
             "\\b(?:from|join)\\s+([a-zA-Z_][\\w.]*)", Pattern.CASE_INSENSITIVE);
+    /** Compiled once: this used to be built for every DROP TABLE statement seen. */
+    private static final Pattern DROP_TABLE = Pattern.compile(
+            "DROP\\s+TABLE\\s+(?:IF\\s+EXISTS\\s+)?([\\w.\\x60\\[\\]]+)",
+            Pattern.CASE_INSENSITIVE);
     /** Words that follow a table reference but are not aliases. */
     private static final Set<String> SQL_KEYWORDS = Set.of(
             "where", "set", "values", "select", "from", "join", "left", "right", "inner", "outer", "full",
@@ -503,8 +507,7 @@ public class SqlAnalyzer {
             return;
         }
         if (upper.startsWith("DROP TABLE")) {
-            Matcher dropTable = Pattern.compile("DROP\\s+TABLE\\s+(?:IF\\s+EXISTS\\s+)?([\\w.\\x60\\[\\]]+)",
-                    Pattern.CASE_INSENSITIVE).matcher(sqlText);
+            Matcher dropTable = DROP_TABLE.matcher(sqlText);
             if (dropTable.find()) {
                 sym.meta.put("ddl", "DROP_TABLE");
                 sym.meta.put("ddlTable", dropTable.group(1));
@@ -513,7 +516,6 @@ public class SqlAnalyzer {
         }
     }
 
-    /** True for ADD INDEX / ADD CONSTRAINT / DROP KEY ...: a DDL action, but not a column. */
     /** PostgreSQL/Oracle spell a type change as ALTER COLUMN c TYPE <type>; keep the type only. */
     private String alterDefinition(String definition) {
         String def = definition == null ? "" : definition.strip();
@@ -523,6 +525,7 @@ public class SqlAnalyzer {
         return def;
     }
 
+    /** True for ADD INDEX / ADD CONSTRAINT / DROP KEY ...: a DDL action, but not a column. */
     private boolean isNonColumnDefinition(String definition) {
         if (definition == null || definition.isBlank()) {
             return false;
@@ -1178,6 +1181,17 @@ public class SqlAnalyzer {
                     i++;
                     continue;
                 }
+                if (c == '#' && startsHashComment(next)) {
+                    lineComment = true;
+                    continue;
+                }
+            }
+            if (singleQuote && c == '\\') {
+                // MySQL lets a backslash escape the next character: without this, a value ending
+                // in \' would look like a closed string and the rest of the statement would be
+                // parsed as SQL.
+                i++;
+                continue;
             }
             if (c == '\'' && !doubleQuote) {
                 singleQuote = !singleQuote;
@@ -1190,6 +1204,15 @@ public class SqlAnalyzer {
         }
         out.add(new SqlChunk(content.substring(start), start));
         return out;
+    }
+
+    /**
+     * MySQL starts a line comment with {@code #}. The same character is a JSON path operator in
+     * PostgreSQL ({@code #>}, {@code #>>}, {@code #-}) and the prefix of a MyBatis placeholder
+     * ({@code #{id}}), so only a bare {@code #} opens a comment.
+     */
+    private static boolean startsHashComment(char next) {
+        return next != '{' && next != '>' && next != '-';
     }
 
     private static final class SqlChunk {
@@ -1246,6 +1269,20 @@ public class SqlAnalyzer {
                     i++;
                     continue;
                 }
+                if (c == '#' && startsHashComment(next)) {
+                    lineComment = true;
+                    continue;
+                }
+            }
+            if (singleQuote && c == '\\') {
+                // Same escape rule as the statement splitter: keep the pair, do not let the
+                // escaped quote close the string.
+                out.append(c);
+                if (i + 1 < sql.length()) {
+                    out.append(sql.charAt(i + 1));
+                    i++;
+                }
+                continue;
             }
             if (c == '\'' && !doubleQuote) {
                 singleQuote = !singleQuote;

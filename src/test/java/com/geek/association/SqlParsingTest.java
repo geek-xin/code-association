@@ -10,6 +10,7 @@ import org.junit.jupiter.api.io.TempDir;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -221,5 +222,58 @@ class SqlParsingTest {
         assertTrue(index.symbol("db:column:order_archive.created_at") != null,
                 "INSERT ... SELECT writes the named target columns");
         assertTrue(index.symbol("db:table:orders") != null, "and reads the source table");
+    }
+
+    @Test
+    void hashCommentsAndEscapedQuotesDoNotSplitStatements(@TempDir Path tmp) throws IOException {
+        Path root = project(tmp);
+        write(root, "src/main/resources/db/migration/V1__orders.sql", """
+                # a MySQL comment; this semicolon must not split the script
+                CREATE TABLE orders (
+                    id BIGINT,
+                    remark VARCHAR(64)
+                );
+                INSERT INTO orders (id, remark) VALUES (1, 'it\\'s fine; really');
+                ALTER TABLE orders ADD COLUMN note VARCHAR(32); # trailing comment; with a semicolon
+                """);
+
+        CodeIndex index = index(root);
+
+        assertTrue(index.columnTypes.containsKey("orders.note"),
+                "the statement after a # comment must still be parsed: " + index.columnTypes);
+        assertTrue(statements(index).stream().anyMatch(sql -> sql.startsWith("INSERT INTO orders")
+                        && sql.contains("really")),
+                "a backslash-escaped quote must not end the string: " + statements(index));
+        assertTrue(statements(index).stream().noneMatch(sql -> sql.startsWith("it")),
+                "the text after the escaped quote still belongs to the INSERT statement");
+    }
+
+    @Test
+    void mybatisPlaceholdersAndJsonOperatorsAreNotComments(@TempDir Path tmp) throws IOException {
+        Path root = project(tmp);
+        write(root, "src/main/resources/mapper/OrderMapper.xml", """
+                <mapper namespace="com.example.OrderMapper">
+                  <select id="find" resultType="com.example.Order">
+                    SELECT id, remark FROM orders WHERE id = #{id}
+                  </select>
+                </mapper>
+                """);
+        write(root, "src/main/resources/db/migration/V1__json.sql", """
+                SELECT data #> '{a,b}' FROM orders;
+                """);
+
+        CodeIndex index = index(root);
+
+        assertTrue(statements(index).stream().anyMatch(sql -> sql.contains("#{id}")),
+                "a MyBatis placeholder is not a comment: " + statements(index));
+        assertTrue(statements(index).stream().anyMatch(sql -> sql.contains("#>")),
+                "a PostgreSQL JSON path operator is not a comment: " + statements(index));
+    }
+
+    private static List<String> statements(CodeIndex index) {
+        return index.symbols.values().stream()
+                .filter(s -> "SQL_STATEMENT".equals(s.type))
+                .map(s -> s.meta.getOrDefault("sql", ""))
+                .toList();
     }
 }
