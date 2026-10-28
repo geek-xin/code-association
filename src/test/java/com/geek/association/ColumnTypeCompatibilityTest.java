@@ -41,6 +41,58 @@ class ColumnTypeCompatibilityTest {
     }
 
     @Test
+    void decimalNarrowingCoversAShrinkingIntegerPart() {
+        // The precision is unchanged but the integer part goes from 8 digits to 6, so
+        // 12345678.99 no longer fits: that is a truncation, not a widening.
+        assertEquals(ColumnTypeCompatibility.Result.NARROWING,
+                ColumnTypeCompatibility.compare("DECIMAL(10,2)", "DECIMAL(10,4)"));
+        assertEquals(ColumnTypeCompatibility.Result.NARROWING,
+                ColumnTypeCompatibility.compare("DECIMAL(10,2)", "DECIMAL(12,5)"),
+                "DECIMAL(12,5) keeps 7 integer digits, DECIMAL(10,2) has 8");
+        assertEquals(ColumnTypeCompatibility.Result.NARROWING,
+                ColumnTypeCompatibility.compare("DECIMAL(10,2)", "DECIMAL(9,2)"));
+        assertFalse(ColumnTypeCompatibility.safe(
+                ColumnTypeCompatibility.compare("DECIMAL(10,2)", "DECIMAL(10,4)")));
+        assertFalse(ColumnTypeCompatibility.safe(
+                ColumnTypeCompatibility.compare("DECIMAL(10,2)", "DECIMAL(12,5)")));
+    }
+
+    @Test
+    void decimalWideningKeepsBothScaleAndIntegerPart() {
+        assertEquals(ColumnTypeCompatibility.Result.WIDENING,
+                ColumnTypeCompatibility.compare("DECIMAL(10,2)", "DECIMAL(12,4)"),
+                "8 integer digits survive and the scale grows, so every value still fits");
+        assertEquals(ColumnTypeCompatibility.Result.WIDENING,
+                ColumnTypeCompatibility.compare("DECIMAL(10,2)", "DECIMAL(12,2)"));
+        assertEquals(ColumnTypeCompatibility.Result.SAME,
+                ColumnTypeCompatibility.compare("DECIMAL(10,2)", "DECIMAL(10,2)"));
+        assertTrue(ColumnTypeCompatibility.safe(
+                ColumnTypeCompatibility.compare("DECIMAL(10,2)", "DECIMAL(12,4)")));
+    }
+
+    @Test
+    void decimalWithOneArgumentHasNoFractionDigits() {
+        // DECIMAL(10) means DECIMAL(10,0): ten integer digits and no fraction, so DECIMAL(10,2)
+        // trades two integer digits for a fraction that did not exist before.
+        assertEquals(ColumnTypeCompatibility.Result.NARROWING,
+                ColumnTypeCompatibility.compare("DECIMAL(10)", "DECIMAL(10,2)"));
+        assertEquals(ColumnTypeCompatibility.Result.NARROWING,
+                ColumnTypeCompatibility.compare("DECIMAL(10,2)", "DECIMAL(10)"));
+        assertEquals(ColumnTypeCompatibility.Result.SAME,
+                ColumnTypeCompatibility.compare("DECIMAL(10)", "DECIMAL(10,0)"));
+    }
+
+    @Test
+    void decimalWithoutParsableArgumentsStaysUnknown() {
+        assertEquals(ColumnTypeCompatibility.Result.UNKNOWN,
+                ColumnTypeCompatibility.compare("DECIMAL", "DECIMAL(10,2)"));
+        assertEquals(ColumnTypeCompatibility.Result.UNKNOWN,
+                ColumnTypeCompatibility.compare("DECIMAL(10,2)", "DECIMAL(x,y)"));
+        assertFalse(ColumnTypeCompatibility.safe(
+                ColumnTypeCompatibility.compare("DECIMAL", "DECIMAL(10,2)")));
+    }
+
+    @Test
     void unknownOldTypeIsNotSilentlyTreatedAsSafe() {
         assertEquals(ColumnTypeCompatibility.Result.UNKNOWN,
                 ColumnTypeCompatibility.compare("", "VARCHAR(64)"));

@@ -202,8 +202,17 @@ public final class ColumnTypeCompatibility {
         int oldScale = oldArgs.length > 1 ? oldArgs[1] : 0;
         int newPrecision = newArgs[0];
         int newScale = newArgs.length > 1 ? newArgs[1] : 0;
-        if (newPrecision >= oldPrecision && newScale >= oldScale) {
-            return newPrecision == oldPrecision && newScale == oldScale ? Result.SAME : Result.WIDENING;
+        if (oldPrecision == newPrecision && oldScale == newScale) {
+            return Result.SAME;
+        }
+        // DECIMAL(p,s) has p-s integer digits and s fraction digits, and the two are separate
+        // capacities. Keeping the precision while raising the scale still shrinks the integer part:
+        // DECIMAL(10,2) -> DECIMAL(10,4) drops it from 8 digits to 6 and truncates 12345678.99, so
+        // the change is only a widening when both capacities survive.
+        int oldIntegerDigits = oldPrecision - oldScale;
+        int newIntegerDigits = newPrecision - newScale;
+        if (newScale >= oldScale && newIntegerDigits >= oldIntegerDigits) {
+            return Result.WIDENING;
         }
         return Result.NARROWING;
     }
