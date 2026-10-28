@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  测试用的日志配置。
+
+  为什么要单独一份：logback-spring.xml 会把日志写到 ./logs，而 mvn test 会启动几十次
+  Spring 上下文，测试于是往工作区里丢一堆日志文件，还和真实运行的那份混在一起。
+  测试只需要"出错时能看到原因"，不需要落盘。
+
+  logback-test.xml 是 Logback 的标准测试配置，Spring Boot 在初始化日志时会优先用它
+  （AbstractLoggingSystem 先找 logback-test.xml，再找 logback-spring.xml），
+  因此生产配置不会被测试意外改写。
+-->
+<configuration>
+  <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+    <encoder>
+      <pattern>%d{HH:mm:ss.SSS} %-5level [%thread] %logger{36} - %msg%n</pattern>
+      <charset>UTF-8</charset>
+    </encoder>
+  </appender>
+
+  <!-- 第三方的 INFO 在测试里只是噪音；本项目自己的 INFO 留着，失败时能看清流程走到哪。 -->
+  <logger name="com.geek.association" level="INFO"/>
+  <logger name="org.eclipse.jgit" level="WARN"/>
+  <logger name="org.springframework" level="WARN"/>
+
+  <root level="WARN">
+    <appender-ref ref="CONSOLE"/>
+  </root>
+</configuration>

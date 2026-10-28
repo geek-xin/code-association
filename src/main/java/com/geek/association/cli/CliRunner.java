@@ -15,9 +15,13 @@ import com.geek.association.report.AiExplainer;
 import com.geek.association.report.ImpactReport;
 import com.geek.association.report.MarkdownReport;
 import com.geek.association.report.ReportBuilder;
+import com.geek.association.source.GitSupport;
 import com.geek.association.source.RepositoryPreparer;
 import com.geek.association.source.RevisionPair;
 import com.geek.association.util.Json;
+import com.geek.association.util.LogEvents;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.boot.ApplicationArguments;
 import org.springframework.boot.ApplicationRunner;
 import org.springframework.boot.ExitCodeGenerator;
@@ -43,6 +47,8 @@ import java.util.Map;
 @Component
 public class CliRunner implements ApplicationRunner, ExitCodeGenerator {
 
+    private static final Logger log = LoggerFactory.getLogger(CliRunner.class);
+
     private final AppProperties properties;
     private final RepositoryPreparer preparer;
     private final AiExplainer aiExplainer;
@@ -59,6 +65,7 @@ public class CliRunner implements ApplicationRunner, ExitCodeGenerator {
     @Override
     public void run(ApplicationArguments args) throws Exception {
         rawArgs = args.getSourceArgs() == null ? List.of() : List.of(args.getSourceArgs());
+        long started = System.currentTimeMillis();
         List<String> nonOption = args.getNonOptionArgs();
         if (nonOption.isEmpty() || !"analyze".equals(nonOption.get(0))) {
             return;
@@ -67,6 +74,7 @@ public class CliRunner implements ApplicationRunner, ExitCodeGenerator {
         if (location == null) {
             System.err.println("missing --location <path or git url>");
             exitCode = 2;
+            logFailure(started, "missing --location");
             return;
         }
         RepoSource source = new RepoSource();
@@ -97,6 +105,7 @@ public class CliRunner implements ApplicationRunner, ExitCodeGenerator {
             if (sep < 0) {
                 System.err.println("--range needs the form <base>..<target>, e.g. origin/main..HEAD");
                 exitCode = 2;
+                logFailure(started, "malformed --range, expected <base>..<target>");
                 return;
             }
             request.mode = "COMMIT_RANGE";
@@ -105,6 +114,7 @@ public class CliRunner implements ApplicationRunner, ExitCodeGenerator {
             if (request.baseRef.isEmpty() || request.targetRef.isEmpty()) {
                 System.err.println("--range needs both ends, e.g. origin/main..HEAD");
                 exitCode = 2;
+                logFailure(started, "--range is missing one end");
                 return;
             }
         }
@@ -118,6 +128,7 @@ public class CliRunner implements ApplicationRunner, ExitCodeGenerator {
             // messages are written for a person: "起始提交 x 不在 y 的历史里" says what to fix.
             System.err.println("cannot prepare the revision range: " + e.getMessage());
             exitCode = 2;
+            logFailure(started, "cannot prepare revisions: " + e.getMessage());
             return;
         }
         FileDiffCollector collector = new FileDiffCollector(revisions.base, revisions.head);
@@ -139,6 +150,7 @@ public class CliRunner implements ApplicationRunner, ExitCodeGenerator {
             System.err.println("missing --peer <path-or-url>: only impacts on other programs are scanned");
             System.err.println("  example: --peer /path/to/order-service --peer https://github.com/org/billing.git");
             exitCode = 2;
+            logFailure(started, "missing --peer");
             return;
         }
         List<PeerImpact> peers = peerImpacts(changes, headIndex, peerLocations);
@@ -179,9 +191,31 @@ public class CliRunner implements ApplicationRunner, ExitCodeGenerator {
                 System.out.println("FAILED: impact risk reached " + failOn.toUpperCase());
             }
         }
+        // 一行收尾：CI 日志里"这次 CLI 跑了什么、结果如何、花了多久"只在这一行里，
+        // 退出码与耗时都带上，流水线失败时不必再去翻整段 stdout。
+        log.info(LogEvents.of("cli.done",
+                "exitCode", exitCode,
+                "mode", report.mode,
+                "peers", report.peers.size(),
+                "high", report.summary.highRisk,
+                "medium", report.summary.mediumRisk,
+                "durationMs", LogEvents.msSince(started)));
         if (out == null) {
             System.out.println(payload);
         }
+    }
+
+    /**
+     * 失败分支的统一收尾：一行 WARN 说清退出码与缺什么参数。
+     *
+     * 这些分支各自 {@code return}，没有 report 可汇总，所以只带 reason；用 WARN 而不是 INFO，
+     * 是因为它们都意味着"这次调用没有产出报告"。
+     */
+    private void logFailure(long started, String reason) {
+        log.warn(LogEvents.of("cli.done",
+                "exitCode", exitCode,
+                "reason", reason,
+                "durationMs", LogEvents.msSince(started)));
     }
 
     private boolean shouldFail(ImpactReport report, String failOn) {
@@ -252,6 +286,12 @@ public class CliRunner implements ApplicationRunner, ExitCodeGenerator {
                 out.add(new PeerImpactEngine(properties).analyze(changes, ownHead, peerIndex, info, firstImpactId));
             } catch (Exception e) {
                 info.note = "无法读取该程序：" + e.getMessage();
+                // CI 里 --peer 写错路径，报告里只会留下一句"无法读取"的 note，流水线红了也无从排查：
+                // 日志必须留下原因链。退出码仍由报告内容决定，这里不改任何业务行为。
+                log.warn(LogEvents.of("cli.peer",
+                        "peer", info.peerSourceName,
+                        "failed", true,
+                        "error", GitSupport.describe(e)));
                 out.add(info);
             }
         }

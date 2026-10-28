@@ -9,6 +9,7 @@ import com.geek.association.model.TypeInfo;
 import com.geek.association.parse.JavaIndexer;
 import com.geek.association.parse.TypeResolver;
 import com.geek.association.util.ColumnTypeCompatibility;
+import com.geek.association.util.Json;
 import com.geek.association.util.Texts;
 
 import java.util.ArrayList;
@@ -67,6 +68,9 @@ public class ChangeDetector {
     public static final String MESSAGE_FIELD_TYPE_CHANGED = "MESSAGE_FIELD_TYPE_CHANGED";
     public static final String MESSAGE_REQUIRED_CHANGED = "MESSAGE_REQUIRED_CHANGED";
     public static final String MESSAGE_ENUM_CHANGED = "MESSAGE_ENUM_CHANGED";
+
+    /** Explains why a required column is a write-side break instead of an invisible addition. */
+    private static final String REQUIRED_COLUMN_NOTE = "（NOT NULL 且无默认值，写入方需补列）";
 
     private final CodeIndex baseIndex;
     private final CodeIndex headIndex;
@@ -656,13 +660,16 @@ public class ChangeDetector {
         Map<String, Sym> newByKey = byKey(newSyms);
         for (Sym s : newSyms) {
             Sym old = oldByKey.get(s.key);
-            if (old == null) {
-                out.add(addedRecord(s));
+            // One ALTER can carry several actions, and each of them is a different contract for
+            // the other program. The statement-level comparison used to stop at the first action;
+            // the per-action list is what makes "ADD a, DROP b" report both of them.
+            List<ChangeRecord> ddl = ddlChanges(s, old == null ? new Sym() : old, 1.0);
+            if (!ddl.isEmpty()) {
+                out.addAll(ddl);
                 continue;
             }
-            ChangeRecord ddl = ddlChange(s, old, 1.0);
-            if (ddl != null) {
-                out.add(ddl);
+            if (old == null) {
+                out.add(addedRecord(s));
                 continue;
             }
             if (!Objects.equals(old.bodyHash, s.bodyHash)) {
@@ -694,6 +701,7 @@ public class ChangeDetector {
             return;
         }
         Set<String> existing = new LinkedHashSet<>();
+        Set<String> renameTargets = new LinkedHashSet<>();
         for (ChangeRecord cr : out) {
             if (!DDL_CHANGED.equals(cr.changeType)) {
                 continue;
@@ -704,6 +712,13 @@ public class ChangeDetector {
             String reason = safe(cr.extra.get("schemaChange"));
             if (!table.isBlank() && !column.isBlank()) {
                 existing.add(table + "." + column + "|" + kind + "|" + reason);
+            }
+            // A column rename is already reported as the drop of the old name. The new name is not
+            // an addition: it is the same column under a different name, so counting it as an
+            // invisible added column would report a change no consumer can observe.
+            String renamedTo = safe(cr.extra.get("renamedTo")).toLowerCase(java.util.Locale.ROOT);
+            if (!table.isBlank() && "DROP_COLUMN".equals(kind) && !renamedTo.isBlank()) {
+                renameTargets.add(table + "." + renamedTo);
             }
         }
         for (Map.Entry<String, Map<String, String>> tableEntry : headTables.entrySet()) {
@@ -717,8 +732,16 @@ public class ChangeDetector {
                 String column = columnEntry.getKey();
                 String newType = columnEntry.getValue();
                 if (!oldColumns.containsKey(column)) {
+                    if (renameTargets.contains(table + "." + column.toLowerCase(java.util.Locale.ROOT))) {
+                        continue; // the rename record already describes this column under its new name
+                    }
+                    // The nullability and the default tell a harmless addition from one that
+                    // rejects every INSERT which does not name the new column, so the snapshot
+                    // record has to carry them like the per-statement record does.
                     addSchemaRecord(out, existing, "ADD_COLUMN", table, column,
-                            null, newType, null, null, "TYPE");
+                            null, newType, null,
+                            headIndex.columnNullability.get(table + "." + column),
+                            null, headIndex.columnDefaults.get(table + "." + column), "TYPE");
                     continue;
                 }
                 String oldType = oldColumns.get(column);
@@ -731,15 +754,15 @@ public class ChangeDetector {
                 // the safe widening and silently drop the write-side break.
                 if (!ColumnTypeCompatibility.compare(oldType, newType).equals(ColumnTypeCompatibility.Result.SAME)) {
                     addSchemaRecord(out, existing, "MODIFY_COLUMN", table, column,
-                            oldType, newType, oldNullable, newNullable, "TYPE");
+                            oldType, newType, oldNullable, newNullable, oldDefault, newDefault, "TYPE");
                 }
                 if (!Objects.equals(oldNullable, newNullable)) {
                     addSchemaRecord(out, existing, "MODIFY_COLUMN", table, column,
-                            oldType, newType, oldNullable, newNullable, "NULLABILITY");
+                            oldType, newType, oldNullable, newNullable, oldDefault, newDefault, "NULLABILITY");
                 }
                 if (!Objects.equals(oldDefault, newDefault)) {
                     addSchemaRecord(out, existing, "MODIFY_COLUMN", table, column,
-                            oldType, newType, oldNullable, newNullable, "DEFAULT");
+                            oldType, newType, oldNullable, newNullable, oldDefault, newDefault, "DEFAULT");
                 }
             }
             for (Map.Entry<String, String> columnEntry : oldColumns.entrySet()) {
@@ -748,14 +771,15 @@ public class ChangeDetector {
                     continue;
                 }
                 addSchemaRecord(out, existing, "DROP_COLUMN", table, column,
-                        columnEntry.getValue(), null, null, null, "TYPE");
+                        columnEntry.getValue(), null, null, null, null, null, "TYPE");
             }
         }
     }
 
     private void addSchemaRecord(List<ChangeRecord> out, Set<String> existing, String kind,
                                  String table, String column, String oldType, String newType,
-                                 String oldNullable, String newNullable, String reason) {
+                                 String oldNullable, String newNullable, String oldDefault,
+                                 String newDefault, String reason) {
         String key = table + "." + column + "|" + kind + "|" + reason;
         if (!existing.add(key)) {
             return;
@@ -770,8 +794,10 @@ public class ChangeDetector {
         cr.symbolKey = source == null ? "sql:schema-diff#" + table + "." + column : source.key;
         cr.oldValue = safe(oldType);
         cr.newValue = safe(newType);
-        cr.riskSeed = schemaRisk(kind, reason, oldType, newType, oldNullable, newNullable);
-        cr.semanticSummary = schemaSummary(kind, reason, table, column, oldType, newType, oldNullable, newNullable);
+        cr.riskSeed = schemaRisk(kind, reason, oldType, newType, oldNullable, newNullable,
+                oldDefault, newDefault);
+        cr.semanticSummary = schemaSummary(kind, reason, table, column, oldType, newType,
+                oldNullable, newNullable, oldDefault, newDefault);
         cr.tags.add("DATA");
         cr.tags.add("CONTRACT");
         cr.extra.put("ddl", kind);
@@ -781,6 +807,10 @@ public class ChangeDetector {
         cr.extra.put("newType", safe(newType));
         cr.extra.put("oldNullable", safe(oldNullable));
         cr.extra.put("newNullable", safe(newNullable));
+        // A required addition is only recognisable from these two values: the peer engine has to
+        // know the column rejects a columnless INSERT instead of treating it as invisible.
+        cr.extra.put("oldDefault", safe(oldDefault));
+        cr.extra.put("newDefault", safe(newDefault));
         cr.extra.put("schemaChange", reason);
         cr.extra.put("schemaDiff", "true");
         cr.extra.put("ddlSchema", source == null ? "" : safe(source.meta.get("ddlSchema")));
@@ -788,12 +818,15 @@ public class ChangeDetector {
     }
 
     private double schemaRisk(String kind, String reason, String oldType, String newType,
-                              String oldNullable, String newNullable) {
+                              String oldNullable, String newNullable,
+                              String oldDefault, String newDefault) {
         if ("DROP_COLUMN".equals(kind)) {
             return 0.95;
         }
         if ("ADD_COLUMN".equals(kind)) {
-            return 0.4;
+            // Adding a nullable column changes nothing for code that names its columns. A NOT NULL
+            // column without a default is different: an INSERT that omits it is rejected.
+            return requiredColumn(newNullable, newDefault) ? 0.7 : 0.4;
         }
         if ("DEFAULT".equals(reason)) {
             return 0.3;
@@ -811,14 +844,17 @@ public class ChangeDetector {
     }
 
     private String schemaSummary(String kind, String reason, String table, String column,
-                                 String oldType, String newType, String oldNullable, String newNullable) {
+                                 String oldType, String newType, String oldNullable, String newNullable,
+                                 String oldDefault, String newDefault) {
         if ("DROP_COLUMN".equals(kind)) {
             return "删除数据库字段：" + table + "." + column
                     + (safe(oldType).isBlank() ? "" : "（原类型 " + oldType + "）");
         }
         if ("ADD_COLUMN".equals(kind)) {
-            return "新增数据库字段：" + table + "." + column
+            String summary = "新增数据库字段：" + table + "." + column
                     + (safe(newType).isBlank() ? "" : "（" + newType + "）");
+            return requiredColumn(newNullable, newDefault)
+                    ? summary + REQUIRED_COLUMN_NOTE : summary;
         }
         if ("DEFAULT".equals(reason)) {
             return "修改数据库字段默认值：" + table + "." + column;
@@ -1097,6 +1133,377 @@ public class ChangeDetector {
     private static String firstNonBlank(String first, String second) {
         return first != null && !first.isBlank() ? first : (second == null ? "" : second);
     }
+
+    // ------------------------------------------------------------ ddl actions
+
+    /**
+     * The DDL records of one statement pair, one record per action that actually moved.
+     *
+     * A single {@code ALTER TABLE} can carry several column actions - {@code ADD a, DROP b},
+     * {@code MODIFY c, RENAME d TO e}. Comparing only the statement's primary action reported the
+     * first one and hid the rest, so a statement whose shape changed could look untouched. Actions
+     * are aligned by their own identity ({@code kind|table|column}) and every action that was
+     * added, changed or removed becomes its own record, because each one reaches a different
+     * consumer.
+     *
+     * The historical single-action metadata is still understood: a symbol without
+     * {@code ddlActions} is read as a one-element list, so an index built by an older version - and
+     * a symbol constructed by hand in a test - keeps producing exactly the record it produced
+     * before.
+     *
+     * @param now the head revision symbol (an empty symbol when the statement was deleted)
+     * @param before the base revision symbol (an empty symbol when the statement is new)
+     * @param risk fallback risk seed for kinds without a fixed seed
+     * @return the records, empty when no action moved
+     */
+    public List<ChangeRecord> ddlChanges(Sym now, Sym before, double risk) {
+        Sym head = now == null ? new Sym() : now;
+        Sym base = before == null ? new Sym() : before;
+        List<DdlAction> headActions = ddlActionsOf(head);
+        List<DdlAction> baseActions = ddlActionsOf(base);
+        if (headActions.isEmpty() && baseActions.isEmpty()) {
+            return List.of();
+        }
+        Map<String, DdlAction> newByKey = lastActionByKey(headActions);
+        Map<String, DdlAction> oldByKey = lastActionByKey(baseActions);
+        List<ChangeRecord> out = new ArrayList<>();
+        for (Map.Entry<String, DdlAction> entry : newByKey.entrySet()) {
+            DdlAction nowAction = entry.getValue();
+            DdlAction beforeAction = oldByKey.get(entry.getKey());
+            if (beforeAction != null && beforeAction.sameAs(nowAction)) {
+                continue; // the action is still there unchanged: nothing reaches the other program
+            }
+            out.add(actionRecord(head, base, nowAction, beforeAction, risk, false));
+        }
+        for (Map.Entry<String, DdlAction> entry : oldByKey.entrySet()) {
+            if (newByKey.containsKey(entry.getKey())) {
+                continue;
+            }
+            // The statement still exists but no longer declares this action. That is a script edit,
+            // not a schema rollback: the migration already ran in every deployed database.
+            out.add(actionRecord(head, base, null, entry.getValue(), risk, true));
+        }
+        return out;
+    }
+
+    /**
+     * One DDL record built from a single action.
+     *
+     * The record keeps the shape of the historical per-statement record - the same extras, the
+     * same summary wording and the same risk seeds - because that shape is what the peer engine
+     * and the report already know how to read.
+     */
+    private ChangeRecord actionRecord(Sym now, Sym before, DdlAction headAction, DdlAction baseAction,
+                                      double risk, boolean removed) {
+        DdlAction action = headAction != null ? headAction : baseAction;
+        String kind = recordKind(action.kind);
+        String table = normalizeTable(action.table);
+        String column = safe(action.column);
+        String oldColumn = baseAction == null ? "" : safe(baseAction.column);
+        boolean columnScoped = !column.isBlank();
+        String columnKey = table + "." + column.toLowerCase(java.util.Locale.ROOT);
+        String oldType = firstNonBlank(text(baseAction == null ? null : baseAction.type),
+                columnScoped ? baseIndex.columnTypes.get(columnKey) : null);
+        String newType = firstNonBlank(text(headAction == null ? null : headAction.type),
+                columnScoped ? headIndex.columnTypes.get(columnKey) : null);
+        String oldNullable = firstNonBlank(text(baseAction == null ? null : baseAction.nullable),
+                columnScoped ? baseIndex.columnNullability.get(columnKey) : null);
+        String newNullable = firstNonBlank(text(headAction == null ? null : headAction.nullable),
+                columnScoped ? headIndex.columnNullability.get(columnKey) : null);
+        String oldDefault = firstNonBlank(text(baseAction == null ? null : baseAction.defaultValue),
+                columnScoped ? baseIndex.columnDefaults.get(columnKey) : null);
+        String newDefault = firstNonBlank(text(headAction == null ? null : headAction.defaultValue),
+                columnScoped ? headIndex.columnDefaults.get(columnKey) : null);
+        if ("DROP_COLUMN".equals(kind) || "RENAME_TABLE".equals(kind)) {
+            newType = "";
+        }
+        String renamedTo = "RENAME_COLUMN".equals(action.kind) || "DROP_COLUMN".equals(action.kind)
+                ? safe(action.renamedTo) : "";
+        String tableRenamedTo = "RENAME_TABLE".equals(kind) ? safe(action.renamedTo) : "";
+        // A MODIFY can change three different things. Naming the one that moved is what lets the
+        // peer engine apply the right rule: a type narrowing hits readers and writers, NOT NULL
+        // hits writers, and a default change is invisible to named-column code.
+        String schemaChange = "TYPE";
+        if ("MODIFY_COLUMN".equals(kind)) {
+            if (!oldType.isBlank() && !newType.isBlank() && !oldType.equalsIgnoreCase(newType)) {
+                schemaChange = "TYPE";
+            } else if (oldType.isBlank() || newType.isBlank()) {
+                schemaChange = "TYPE";
+            } else if (!Objects.equals(oldNullable, newNullable)) {
+                schemaChange = "NULLABILITY";
+            } else if (!Objects.equals(oldDefault, newDefault)) {
+                schemaChange = "DEFAULT";
+            }
+        }
+        boolean required = "ADD_COLUMN".equals(kind) && !removed && requiredColumn(newNullable, newDefault);
+        double seed = ddlRisk(kind, risk);
+        if ("MODIFY_COLUMN".equals(kind)) {
+            if ("DEFAULT".equals(schemaChange)) {
+                seed = 0.3;
+            } else if ("NULLABILITY".equals(schemaChange)) {
+                seed = ColumnTypeCompatibility.safe(
+                        ColumnTypeCompatibility.compareNullability(oldNullable, newNullable)) ? 0.45 : 0.8;
+            } else if (!oldType.isBlank() && !newType.isBlank()) {
+                seed = switch (ColumnTypeCompatibility.compare(oldType, newType)) {
+                    case SAME -> 0.5;
+                    case WIDENING -> 0.45;
+                    case NARROWING, INCOMPATIBLE -> 0.9;
+                    case UNKNOWN -> 0.9;
+                };
+            }
+        }
+        if ("RENAME_TABLE".equals(kind)) {
+            // The old table name disappears; every use of it in the other program is affected.
+            seed = 0.9;
+        }
+        if (required) {
+            seed = 0.7;
+        }
+        String summary = removed
+                ? "移除 DDL 动作：" + actionDescription(action, table, column)
+                        + "（仅脚本不再声明该动作，数据库不会回滚）"
+                : actionSummary(kind, schemaChange, table, column, renamedTo, tableRenamedTo,
+                        oldType, newType, oldNullable, newNullable, required);
+        ChangeRecord cr = baseRecord(DDL_CHANGED, "SQL_STATEMENT", now.filePath, now.qualifiedName,
+                now.startLine, now.endLine);
+        cr.modulePath = now.modulePath;
+        cr.symbolKey = now.key;
+        cr.oldValue = baseAction == null ? "" : actionValue(baseAction, oldType);
+        cr.newValue = headAction == null ? "" : actionValue(headAction, newType);
+        cr.semanticSummary = summary;
+        cr.riskSeed = seed;
+        cr.tags.add("DATA");
+        cr.tags.add("CONTRACT");
+        cr.extra.put("ddl", kind);
+        cr.extra.put("oldDdl", baseAction == null ? "" : safe(baseAction.kind));
+        cr.extra.put("table", table);
+        cr.extra.put("column", column);
+        cr.extra.put("oldColumn", oldColumn);
+        cr.extra.put("ddlSql", firstNonBlank(now.meta.get("ddlSql"), before.meta.get("ddlSql")));
+        cr.extra.put("oldType", oldType);
+        cr.extra.put("newType", newType);
+        cr.extra.put("oldNullable", oldNullable);
+        cr.extra.put("newNullable", newNullable);
+        // The peer engine needs both defaults: "no default" is what makes a required column reject
+        // an INSERT, and a default is what makes the same addition harmless.
+        cr.extra.put("oldDefault", oldDefault);
+        cr.extra.put("newDefault", newDefault);
+        cr.extra.put("schemaChange", schemaChange);
+        cr.extra.put("renamedTo", renamedTo);
+        if ("RENAME_TABLE".equals(kind)) {
+            cr.extra.put("renamedToTable", tableRenamedTo);
+        }
+        cr.extra.put("ddlSchema", firstNonBlank(now.meta.get("ddlSchema"), before.meta.get("ddlSchema")));
+        if (removed) {
+            cr.extra.put("ddlRemoved", "true");
+        }
+        return cr;
+    }
+
+    private String actionSummary(String kind, String schemaChange, String table, String column,
+                                 String renamedTo, String tableRenamedTo, String oldType, String newType,
+                                 String oldNullable, String newNullable, boolean required) {
+        switch (kind) {
+            case "RENAME_TABLE":
+                return "重命名数据库表：" + table + " → " + tableRenamedTo;
+            case "DROP_TABLE":
+                return "删除数据库表：" + table;
+            case "CREATE_TABLE":
+                return "新建数据库表：" + table;
+            case "DROP_COLUMN":
+                if (!renamedTo.isBlank()) {
+                    return "重命名数据库字段：" + table + "." + column + " → " + table + "." + renamedTo;
+                }
+                return "删除数据库字段：" + table + "." + column
+                        + (oldType.isBlank() ? "" : "（原类型 " + oldType + "）");
+            case "ADD_COLUMN":
+                String added = "新增数据库字段：" + table + "." + column
+                        + (newType.isBlank() ? "" : "（" + newType + "）");
+                return required ? added + REQUIRED_COLUMN_NOTE : added;
+            case "MODIFY_COLUMN":
+                if ("NULLABILITY".equals(schemaChange)) {
+                    return "修改数据库字段可空性：" + table + "." + column
+                            + "（" + safe(oldNullable) + " → " + safe(newNullable) + "）";
+                }
+                if ("DEFAULT".equals(schemaChange)) {
+                    return "修改数据库字段默认值：" + table + "." + column;
+                }
+                if (!oldType.isBlank() && !newType.isBlank() && !oldType.equalsIgnoreCase(newType)) {
+                    return "修改数据库字段类型：" + table + "." + column
+                            + "（" + oldType + " → " + newType + "）";
+                }
+                return "修改数据库字段：" + table + "." + column;
+            default:
+                return "表结构发生变化：" + table;
+        }
+    }
+
+    private String actionDescription(DdlAction action, String table, String column) {
+        return switch (safe(action.kind)) {
+            case "ADD_COLUMN" -> "新增数据库字段 " + table + "." + column;
+            case "DROP_COLUMN" -> "删除数据库字段 " + table + "." + column;
+            case "MODIFY_COLUMN" -> "修改数据库字段 " + table + "." + column;
+            case "RENAME_COLUMN" -> "重命名数据库字段 " + table + "." + column
+                    + " → " + table + "." + safe(action.renamedTo);
+            case "RENAME_TABLE" -> "重命名数据库表 " + table + " → " + safe(action.renamedTo);
+            case "CREATE_TABLE" -> "新建数据库表 " + table;
+            case "DROP_TABLE" -> "删除数据库表 " + table;
+            default -> safe(action.kind) + " " + table + "." + column;
+        };
+    }
+
+    /** The value line of a record: the action as the script spelled it, plus the type that applies. */
+    private String actionValue(DdlAction action, String type) {
+        String kind = safe(action.kind);
+        String table = normalizeTable(action.table);
+        if ("RENAME_TABLE".equals(kind)) {
+            return kind + " " + table + " → " + safe(action.renamedTo);
+        }
+        return kind + " " + table + "." + safe(action.column)
+                + (type == null || type.isBlank() ? "" : " " + type);
+    }
+
+    /**
+     * A column rename is reported as the drop of the old name.
+     *
+     * That is the contract another program can feel: the old column name is what its SQL names.
+     * The new name cannot already be a dependency, and the historical records already used
+     * {@code DROP_COLUMN} plus {@code renamedTo} for renames, so the peer rules keep working.
+     */
+    private static String recordKind(String actionKind) {
+        return "RENAME_COLUMN".equals(actionKind) ? "DROP_COLUMN" : safe(actionKind);
+    }
+
+    /**
+     * A NOT NULL column without a default rejects an INSERT that does not name it.
+     *
+     * That is a write-side break rather than an invisible addition, so it gets a higher seed and a
+     * summary that says what the writer has to do.
+     */
+    private static boolean requiredColumn(String nullable, String defaultValue) {
+        boolean notNull = "false".equalsIgnoreCase(nullable == null ? "" : nullable.trim());
+        return notNull && (defaultValue == null || defaultValue.isBlank());
+    }
+
+    private List<DdlAction> ddlActionsOf(Sym sym) {
+        List<DdlAction> actions = readDdlActions(sym.meta.get("ddlActions"));
+        if (!actions.isEmpty()) {
+            return actions;
+        }
+        DdlAction legacy = legacyDdlAction(sym);
+        return legacy == null ? List.of() : List.of(legacy);
+    }
+
+    /**
+     * Reads the action list written by the analyzer, or an empty list when the symbol predates it.
+     *
+     * The JSON element fields are written for every action, so a field that is missing here means
+     * "unknown" and stays null rather than becoming an empty string that could compare unequal to
+     * the other revision for no reason.
+     */
+    private List<DdlAction> readDdlActions(String json) {
+        if (json == null || json.isBlank()) {
+            return List.of();
+        }
+        List<DdlAction> out = new ArrayList<>();
+        for (Map<String, Object> raw : Json.readList(json)) {
+            if (raw == null) {
+                continue;
+            }
+            String kind = text(raw.get("kind"));
+            if (kind.isBlank()) {
+                continue;
+            }
+            DdlAction action = new DdlAction();
+            action.kind = kind;
+            action.table = normalizeTable(raw.get("table"));
+            action.column = text(raw.get("column"));
+            action.type = text(raw.get("type"));
+            action.nullable = nullableText(raw.get("nullable"));
+            action.defaultValue = text(raw.get("default"));
+            action.schema = text(raw.get("schema"));
+            action.renamedTo = text(raw.get("renamedTo"));
+            out.add(action);
+        }
+        return out;
+    }
+
+    /**
+     * A single action read from the historical statement-level DDL keys.
+     *
+     * Indexes written before actions existed carry only the first action. Reading them as a
+     * one-element list keeps this comparison working against those indexes - and keeps a
+     * hand-built symbol in a test behaving exactly like a parsed one.
+     */
+    private DdlAction legacyDdlAction(Sym sym) {
+        String kind = text(sym.meta.get("ddl"));
+        if (kind.isBlank()) {
+            return null;
+        }
+        DdlAction action = new DdlAction();
+        action.kind = kind;
+        action.table = normalizeTable(sym.meta.get("ddlTable"));
+        action.column = text(sym.meta.get("ddlColumn"));
+        action.type = text(sym.meta.get("ddlType"));
+        action.nullable = nullableText(sym.meta.get("ddlNullable"));
+        action.defaultValue = text(sym.meta.get("ddlDefault"));
+        action.schema = text(sym.meta.get("ddlSchema"));
+        action.renamedTo = "RENAME_TABLE".equals(kind)
+                ? text(sym.meta.get("ddlRenamedToTable"))
+                : text(sym.meta.get("ddlRenamedTo"));
+        return action;
+    }
+
+    private Map<String, DdlAction> lastActionByKey(List<DdlAction> actions) {
+        Map<String, DdlAction> out = new LinkedHashMap<>();
+        for (DdlAction action : actions) {
+            // The last declaration of the same action wins: it is the one the analyzer's snapshot
+            // ends up with, so the record must describe the same state as the snapshot.
+            out.put(action.alignKey(), action);
+        }
+        return out;
+    }
+
+    private static String text(Object value) {
+        return value == null ? "" : String.valueOf(value).trim();
+    }
+
+    private static String nullableText(Object value) {
+        String raw = text(value);
+        return raw.isBlank() ? null : raw.toLowerCase(java.util.Locale.ROOT);
+    }
+
+    /** One action of a DDL statement, in the order the script declared it. */
+    private static final class DdlAction {
+
+        String kind;
+        String table;
+        String column;
+        String type;
+        String nullable;
+        String defaultValue;
+        String schema;
+        String renamedTo;
+
+        /** The identity two revisions are aligned on. */
+        String alignKey() {
+            return safe(kind) + "|" + normalizeTable(table) + "|"
+                    + safe(column).toLowerCase(java.util.Locale.ROOT);
+        }
+
+        boolean sameAs(DdlAction other) {
+            return other != null
+                    && Objects.equals(kind, other.kind)
+                    && Objects.equals(table, other.table)
+                    && Objects.equals(column, other.column)
+                    && Objects.equals(type, other.type)
+                    && Objects.equals(nullable, other.nullable)
+                    && Objects.equals(defaultValue, other.defaultValue)
+                    && Objects.equals(schema, other.schema)
+                    && Objects.equals(renamedTo, other.renamedTo);
+        }
+    }
+
 
     /**
      * Risk of a schema change. Dropping is worse than adding: the other side keeps running and

@@ -8,6 +8,7 @@ import com.geek.association.report.AiExplainer;
 import com.geek.association.report.ImpactReport;
 import com.geek.association.schedule.ScheduledScanService;
 import com.geek.association.service.AnalysisService;
+import com.geek.association.source.GitSupport;
 import com.geek.association.source.PathBrowser;
 import com.geek.association.source.RepositoryPreparer;
 import com.geek.association.source.SourceNames;
@@ -16,7 +17,10 @@ import com.geek.association.transfer.SourceTags;
 import com.geek.association.transfer.SourceTransfer;
 import com.geek.association.update.UpdateService;
 import com.geek.association.util.Json;
+import com.geek.association.util.LogEvents;
 import com.geek.association.util.Texts;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.DeleteMapping;
@@ -37,6 +41,8 @@ import java.util.Map;
 @RestController
 @RequestMapping("/api")
 public class ApiController {
+
+    private static final Logger log = LoggerFactory.getLogger(ApiController.class);
 
     private final Store store;
     private final AnalysisService analysisService;
@@ -335,6 +341,9 @@ public class ApiController {
                 .withZone(java.time.ZoneOffset.UTC)
                 .format(java.time.Instant.now());
         String filename = "code-association-sources-" + stamp + ".json";
+        // The registry file itself is the payload, so only its size is logged: it is the answer to
+        // "what was in the file I sent" without writing a list of locations into the log.
+        log.info(LogEvents.of("source.export", "exported", exportedCount(payload), "file", filename));
         return ResponseEntity.ok()
                 .header(org.springframework.http.HttpHeaders.CONTENT_DISPOSITION,
                         "attachment; filename=\"" + filename + "\"")
@@ -363,7 +372,27 @@ public class ApiController {
                 return store.saveSource(source);
             }
         };
-        return SourceTransfer.importPayload(body, sink);
+        Map<String, Object> result = SourceTransfer.importPayload(body, sink);
+        // One line per import: the counts are what tells a merge that quietly updated everything
+        // apart from an import that created new rows, and "skipped" is where the per-row errors are.
+        log.info(LogEvents.of("source.import",
+                "imported", number(result.get("created")) + number(result.get("updated")),
+                "created", number(result.get("created")),
+                "updated", number(result.get("updated")),
+                "skipped", number(result.get("skipped")),
+                "total", number(result.get("total"))));
+        return result;
+    }
+
+    /** Size of the exported registry, without assuming the payload is still shaped like a list. */
+    private static int exportedCount(Map<String, Object> payload) {
+        Object sources = payload.get("sources");
+        return sources instanceof List<?> list ? list.size() : 0;
+    }
+
+    /** Lenient integer read for the counters in an import result map. */
+    private static int number(Object value) {
+        return value instanceof Number n ? n.intValue() : 0;
     }
 
     @PostMapping("/sources")
@@ -379,7 +408,14 @@ public class ApiController {
         requireLocalDirectory(source);
         // The name is only a label: derive it from the location instead of asking for it.
         SourceNames.withDerivedName(source);
-        return store.saveSource(source);
+        RepoSource saved = store.saveSource(source);
+        // Credentials in a location URL are masked, and credentialEnv is only ever the name of an
+        // environment variable - the value lives in the operator's environment, never here.
+        log.info(LogEvents.of("source.create",
+                "sourceId", saved.id, "source", saved.name, "type", saved.type,
+                "location", GitSupport.maskCredentials(saved.location),
+                "credentialEnv", saved.credentialEnv));
+        return saved;
     }
 
     @PutMapping("/sources/{id}")
@@ -409,7 +445,12 @@ public class ApiController {
         // the user has just pointed at the right place. Judging again instead of assuming OK also
         // covers the directory disappearing between the two checks.
         SourceTransfer.markAvailability(existing, "编辑时");
-        return store.saveSource(existing);
+        RepoSource saved = store.saveSource(existing);
+        log.info(LogEvents.of("source.update",
+                "sourceId", saved.id, "source", saved.name, "type", saved.type,
+                "location", GitSupport.maskCredentials(saved.location),
+                "credentialEnv", saved.credentialEnv));
+        return saved;
     }
 
     /**
@@ -466,6 +507,11 @@ public class ApiController {
         out.put("deleted", true);
         out.put("analyses", analyses);
         out.put("cacheDeleted", cacheDeleted);
+        // Deleting a program removes its analyses too, so the count belongs in the log: it is how
+        // "the reports for X disappeared" gets explained months later.
+        log.info(LogEvents.of("source.delete",
+                "sourceId", id, "source", source.name, "type", source.type,
+                "analyses", analyses, "cacheDeleted", cacheDeleted));
         return out;
     }
 

@@ -5,7 +5,7 @@
 #   ./start.sh                 # 默认 9996 端口，数据目录 ./.code-association
 #   ./start.sh 8080            # 指定端口
 #   PORT=8080 ./start.sh       # 同上
-#   DATA_DIR=/var/lib/ca LOG_FILE=/var/log/ca.log ./start.sh
+#   DATA_DIR=/var/lib/ca LOG_FILE=/var/log/ca/console.log ./start.sh
 #
 # 各平台分别走哪条路径（每处都先探测，缺工具就降级，不硬依赖）：
 #
@@ -25,7 +25,11 @@ cd "$(dirname "$0")"
 
 PORT="${1:-${PORT:-9996}}"
 DATA_DIR="${DATA_DIR:-./.code-association}"
-LOG_FILE="${LOG_FILE:-./code-association.log}"
+# LOG_FILE 是「进程原始输出」的捕获文件（stdout+stderr，每次启动截断），不是应用日志。
+# 两者的分工：logback 初始化之前就失败的报错、JVM 崩溃输出只在这里；结构化应用日志由
+# logback 写到 ${LOG_DIR:-./logs}/code-association.log（按天滚动、保留 7 天）。
+# 默认落在同一个 logs/ 下，运维只需要看一个目录；要分开就用 LOG_FILE 覆盖。
+LOG_FILE="${LOG_FILE:-./logs/console.log}"
 PID_FILE="./.code-association.pid"
 JAR="target/code-association.jar"
 JAR_NAME="code-association.jar"
@@ -357,9 +361,9 @@ while [ "$i" -lt 120 ]; do
     READY=1
     break
   fi
-  # 启动 3 秒后进程已经不在了，就没必要继续等，直接把日志尾部打出来
+  # 启动 3 秒后进程已经不在了，就没必要继续等，直接把进程输出尾部打出来
   if [ "$i" -ge 6 ] && ! service_alive; then
-    echo "启动失败，进程已退出。日志尾部："
+    echo "启动失败，进程已退出。进程输出尾部（$LOG_ABS）："
     tail -20 "$LOG_ABS" 2>/dev/null || true
     rm -f "$PID_FILE"
     exit 1
@@ -374,12 +378,13 @@ if [ "$READY" = 1 ]; then
     echo "$REAL_PID" > "$PID_FILE"
   fi
   echo "已启动：http://127.0.0.1:$PORT  (PID ${REAL_PID:-未知})"
-  echo "日志：$LOG_ABS"
+  echo "应用日志：${LOG_DIR:-./logs}/code-association.log（ERROR 另见 code-association-error.log）"
+  echo "进程输出：$LOG_ABS"
   exit 0
 fi
 
 echo "启动超时（60 秒内健康检查未通过），进程可能仍在启动中。"
-echo "日志尾部："
+echo "进程输出尾部（$LOG_ABS）："
 tail -20 "$LOG_ABS" 2>/dev/null || true
 echo "如需停止：./stop.sh $PORT"
 exit 1

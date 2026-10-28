@@ -40,7 +40,7 @@ Set-Location -LiteralPath $scriptRoot
 
 if ([string]::IsNullOrWhiteSpace($Port)) { $Port = '9996' }
 if ([string]::IsNullOrWhiteSpace($DataDir)) { $DataDir = './.code-association' }
-if ([string]::IsNullOrWhiteSpace($LogFile)) { $LogFile = './code-association.log' }
+if ([string]::IsNullOrWhiteSpace($LogFile)) { $LogFile = './logs/console.log' }
 
 $portNumber = 0
 if (-not [int]::TryParse($Port.Trim(), [ref]$portNumber) -or $portNumber -lt 1 -or $portNumber -gt 65535) {
@@ -80,7 +80,9 @@ $dataDirPath = Resolve-ScriptPath -Path $DataDir
 $logPath = Resolve-ScriptPath -Path $LogFile
 
 # stdout 与 stderr 必须落在两个不同的文件里（原因见下面 Start-Process 处的注释），
-# 约定把 stderr 放在日志同目录、同名加 .err 后缀，与 README / INSTALL.md 的说法一致。
+# 约定把 stderr 放在同一目录、同名加 .err 后缀，默认即 logs/console.err.log。
+# 这两份都是「进程原始输出」（每次启动截断），不是应用日志：logback 初始化之前的报错、
+# JVM 崩溃输出只在这里；应用日志由 logback 写到 logs/code-association.log（保留 7 天）。
 $logDirectory = Split-Path -Parent $logPath
 if (-not [string]::IsNullOrWhiteSpace($logDirectory) -and -not (Test-Path -LiteralPath $logDirectory -PathType Container)) {
     New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null
@@ -240,7 +242,7 @@ $javaCommandLine = (Quote-ArgValue -Value $javaExe) + ' -jar ' + (Quote-ArgValue
     ' --code-association.data-dir=' + (Quote-ArgValue -Value $dataDirPath)
 
 # > 覆盖 stdout，2> 覆盖 stderr。cmd 不允许同一个文件被两个重定向同时打开（会互相覆盖），
-# 所以 stderr 单独写到 code-association.err.log，与 README / INSTALL.md 的说法一致。
+# 所以 stderr 单独写到 logs/console.err.log，与 README / 故障排查文档的说法一致。
 $redirectedCommand = $javaCommandLine + ' > ' + (Quote-ArgValue -Value $logPath) +
     ' 2> ' + (Quote-ArgValue -Value $errLogPath)
 
@@ -353,7 +355,8 @@ if ($servicePid -gt 0) {
     # 反查不到 PID 不影响服务运行，stop.ps1 会改用端口 / 命令行定位。
     Write-Host "已启动：http://127.0.0.1:$portNumber  (PID 未知，停止时按端口查找)"
 }
-Write-Host "日志：$logPath"
-Write-Host "错误日志：$errLogPath"
+Write-Host "进程输出：$logPath"
+Write-Host "进程错误输出：$errLogPath"
+Write-Host "应用日志：logs/code-association.log（ERROR 另见 logs/code-association-error.log）"
 Write-Host "停止：.\stop.ps1 $portNumber"
 exit 0

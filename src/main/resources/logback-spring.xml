@@ -1,0 +1,113 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  日志落盘策略。
+
+  为什么不用 Spring Boot 默认的 logging.file.name：默认只有"一个文件一直追加"，没有滚动、
+  没有保留期，运维一个月后只会得到一个删不掉又不敢删的巨文件。这里要的是三件事：
+  按天滚动、只留 7 天、放独立目录。
+
+  目录由 code-association.log-dir（application.yml）决定，默认 ./logs，环境变量 LOG_DIR 可覆盖。
+  它刻意与数据目录 .code-association 分开：数据目录是"丢了就要重新分析"的状态，
+  日志目录是"随时可以清空"的诊断产物，两者的备份与清理节奏不同。
+
+  文件名固定为 code-association.log：README、CONTRIBUTING、故障排查文档都按这个名字写的，
+  改名等于让所有排障指引失效。
+
+  archive/ 下是滚动出来的历史文件（gz 压缩），只保留 7 天：
+  maxHistory=7 按天计数，cleanHistoryOnStart=true 让"停了一周再启动"也能立刻清掉过期文件，
+  而不是等到下一次滚动才清。
+-->
+<configuration>
+
+  <!-- 从 Spring 环境取值，这样目录与文件名只有一处定义（application.yml）。 -->
+  <springProperty scope="context" name="APP_NAME" source="spring.application.name" defaultValue="code-association"/>
+  <springProperty scope="context" name="LOG_DIR" source="code-association.log-dir" defaultValue="./logs"/>
+
+  <!--
+    一行日志要能回答"什么时候、哪个线程、谁打的、说了什么"。线程名是分析的关键线索：
+    一次分析跑在 impact-analysis-N 线程上，同一线程的行天然按时间聚在一起。
+  -->
+  <property name="LOG_PATTERN"
+            value="%d{yyyy-MM-dd HH:mm:ss.SSS} %-5level [%thread] %logger{40} - %msg%n"/>
+
+  <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+    <encoder>
+      <pattern>${LOG_PATTERN}</pattern>
+      <charset>UTF-8</charset>
+    </encoder>
+  </appender>
+
+  <!-- 主日志：所有 INFO 及以上。 -->
+  <appender name="FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+    <file>${LOG_DIR}/${APP_NAME}.log</file>
+    <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
+      <fileNamePattern>${LOG_DIR}/archive/${APP_NAME}.%d{yyyy-MM-dd}.%i.log.gz</fileNamePattern>
+      <!-- 单文件上限：一次大仓库分析可能刷出几十 MB，按天切之外再按大小切，方便直接打开。 -->
+      <maxFileSize>50MB</maxFileSize>
+      <maxHistory>7</maxHistory>
+      <totalSizeCap>500MB</totalSizeCap>
+      <cleanHistoryOnStart>true</cleanHistoryOnStart>
+    </rollingPolicy>
+    <encoder>
+      <pattern>${LOG_PATTERN}</pattern>
+      <charset>UTF-8</charset>
+    </encoder>
+  </appender>
+
+  <!--
+    ERROR 单独一份：排障时先看这份，不用在几万行 INFO 里翻。
+    它同时保留在主日志里——一份日志讲完整时间线，另一份只讲故障，两种读法都要支持。
+  -->
+  <appender name="ERROR_FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+    <file>${LOG_DIR}/${APP_NAME}-error.log</file>
+    <filter class="ch.qos.logback.classic.filter.ThresholdFilter">
+      <level>ERROR</level>
+    </filter>
+    <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
+      <fileNamePattern>${LOG_DIR}/archive/${APP_NAME}-error.%d{yyyy-MM-dd}.%i.log.gz</fileNamePattern>
+      <maxFileSize>20MB</maxFileSize>
+      <maxHistory>7</maxHistory>
+      <totalSizeCap>200MB</totalSizeCap>
+      <cleanHistoryOnStart>true</cleanHistoryOnStart>
+    </rollingPolicy>
+    <encoder>
+      <pattern>${LOG_PATTERN}</pattern>
+      <charset>UTF-8</charset>
+    </encoder>
+  </appender>
+
+  <!--
+    异步写盘：分析线程不该因为日志 IO 停顿。neverBlock=false + discardingThreshold=0 表示
+    队列满时阻塞而不是丢日志——诊断日志丢一条，事后分析就可能少一个关键节点。
+
+    两个 appender 各包一层异步器，不能把两份文件挂在同一个 AsyncAppender 上：
+    AsyncAppender 只接受一个 appender-ref，第二个会被静默忽略（logback 只留一条 WARN），
+    错误日志于是永远是空文件——这类"配置看起来对、实际不工作"的坑只能靠一条配置对应一条断言来防。
+  -->
+  <appender name="ASYNC_FILE" class="ch.qos.logback.classic.AsyncAppender">
+    <queueSize>2048</queueSize>
+    <discardingThreshold>0</discardingThreshold>
+    <neverBlock>false</neverBlock>
+    <appender-ref ref="FILE"/>
+  </appender>
+
+  <appender name="ASYNC_ERROR" class="ch.qos.logback.classic.AsyncAppender">
+    <queueSize>512</queueSize>
+    <discardingThreshold>0</discardingThreshold>
+    <neverBlock>false</neverBlock>
+    <appender-ref ref="ERROR_FILE"/>
+  </appender>
+
+  <!--
+    第三方的日志级别由 application.yml 的 logging.level 决定，这里只定基线。
+    org.eclipse.jgit 特别吵（每次 fetch 都刷 DEBUG），保持 WARN。
+  -->
+  <logger name="org.eclipse.jgit" level="WARN"/>
+
+  <root level="INFO">
+    <appender-ref ref="CONSOLE"/>
+    <appender-ref ref="ASYNC_FILE"/>
+    <appender-ref ref="ASYNC_ERROR"/>
+  </root>
+
+</configuration>

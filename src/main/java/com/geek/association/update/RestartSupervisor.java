@@ -1,6 +1,7 @@
 package com.geek.association.update;
 
 import com.geek.association.config.AppProperties;
+import com.geek.association.util.LogEvents;
 import com.geek.association.util.Texts;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -215,11 +216,15 @@ public class RestartSupervisor {
     public boolean scheduleRestart(String appliedVersion) {
         String reason = unsupportedReason();
         if (reason != null) {
-            log.warn("hot restart refused: {}", reason);
+            // role=parent: this line is written by the process that is about to exit. The new build
+            // reports itself with app.start, and the daemon's own progress lives in restart.log.
+            log.warn(LogEvents.of("update.restart", "phase", "refused", "role", "parent",
+                    "version", appliedVersion, "reason", reason));
             return false;
         }
         if (!running.compareAndSet(false, true)) {
-            log.warn("hot restart refused: another restart is already running");
+            log.warn(LogEvents.of("update.restart", "phase", "refused", "role", "parent",
+                    "version", appliedVersion, "reason", "已有重启正在进行中"));
             return false;
         }
         long now = System.currentTimeMillis();
@@ -258,7 +263,10 @@ public class RestartSupervisor {
             // overwrites it with "waiting". That difference is the handover signal the in-process
             // watcher uses below to decide whether the script is really in charge.
             updateStatusInMemory(RestartStatus.PHASE_WAITING, "已交给守护脚本，等待旧进程退出", false);
-            log.info("restart to {} accepted; daemon {} will start {}", appliedVersion, script, jar);
+            log.info(LogEvents.of("update.restart", "phase", "start", "role", "parent",
+                    "version", appliedVersion, "daemon", script, "jar", jar,
+                    "timeoutSeconds", Math.max(1, properties.getUpdate().getRestartTimeoutSeconds()),
+                    "pid", ProcessHandle.current().pid()));
 
             startFallbackWorker(appliedVersion, jar, backup, statusFile);
             scheduleExit();
@@ -266,7 +274,8 @@ public class RestartSupervisor {
         } catch (IOException | RuntimeException e) {
             // The jar has already been replaced, so the update itself succeeded; only the automatic
             // restart did not. Report that honestly instead of pretending a restart is running.
-            log.warn("could not start the restart daemon: {}", e.toString());
+            log.warn(LogEvents.of("update.restart", "phase", "failed", "role", "parent",
+                    "version", appliedVersion, "error", e.toString()), e);
             failEarly("无法启动重启守护脚本：" + describe(e), now, appliedVersion);
             return false;
         }
@@ -356,6 +365,11 @@ public class RestartSupervisor {
 
     private static boolean isInFlight(String phase) {
         return RestartStatus.PHASE_SPAWNING.equals(phase) || RestartStatus.PHASE_WAITING.equals(phase);
+    }
+
+    /** Milliseconds since the attempt was accepted; 0 when it never recorded a start time. */
+    private static long elapsedSince(Long startedAt) {
+        return startedAt == null ? 0L : LogEvents.msSince(startedAt);
     }
 
     private RestartStatus snapshotStatus() {
@@ -458,9 +472,16 @@ public class RestartSupervisor {
                 Thread.currentThread().interrupt();
                 return;
             }
+            // Milliseconds since the attempt was accepted, so the outcome line carries a duration
+            // that starts where update.restart start left off rather than where this watcher woke.
+            Long attemptStartedAt = snapshotStatus().getStartedAt();
             try {
                 if (daemonTookOver(statusFile)) {
-                    log.debug("the restart daemon took over {}; nothing left to watch here", appliedVersion);
+                    // role=daemon: the script spoke, so this JVM is no longer the authority on the
+                    // attempt. The rest of the outcome is written by the script into restart.log.
+                    log.debug(LogEvents.of("update.restart", "phase", "handoff", "role", "daemon",
+                            "version", appliedVersion,
+                            "durationMs", elapsedSince(attemptStartedAt)));
                     return;
                 }
                 long timeoutMillis = Math.max(1, properties.getUpdate().getRestartTimeoutSeconds()) * 1000L;
@@ -470,9 +491,15 @@ public class RestartSupervisor {
                     running.set(false);
                     updateStatus(statusFile, RestartStatus.PHASE_SUCCEEDED,
                             "新版本已启动并通过健康检查", false);
+                    log.info(LogEvents.of("update.restart", "phase", "healthy", "role", "parent",
+                            "version", appliedVersion, "healthUrl", healthUrl(),
+                            "durationMs", elapsedSince(attemptStartedAt)));
                     return;
                 }
-                log.warn("the new build did not answer {}; rolling back to {}", healthUrl(), backup);
+                log.warn(LogEvents.of("update.restart", "phase", "failed", "role", "parent",
+                        "version", appliedVersion, "reason", "新版本未通过健康检查",
+                        "healthUrl", healthUrl(), "backup", backup,
+                        "durationMs", elapsedSince(attemptStartedAt)));
                 if (backup == null || !Files.isRegularFile(backup)) {
                     running.set(false);
                     updateStatus(statusFile, RestartStatus.PHASE_FAILED,
@@ -481,19 +508,30 @@ public class RestartSupervisor {
                 }
                 updateStatus(statusFile, RestartStatus.PHASE_WAITING, "新版本未通过健康检查，正在回滚", true);
                 Files.copy(backup, jar, StandardCopyOption.REPLACE_EXISTING);
-                history.markRolledBack(backupVersion(jar, backup), Instant.now());
+                String restored = backupVersion(jar, backup);
+                history.markRolledBack(restored, Instant.now());
+                log.info(LogEvents.of("update.rollback", "version", restored, "role", "parent",
+                        "reason", "新版本未通过健康检查"));
                 launcher.start(javaCommand(jar), logFile());
                 boolean recovered = awaitHealthy(System.currentTimeMillis() + timeoutMillis);
                 running.set(false);
                 if (recovered) {
                     updateStatus(statusFile, RestartStatus.PHASE_ROLLED_BACK,
                             "新版本未通过健康检查，已回滚并重新启动旧版本", true);
+                    log.info(LogEvents.of("update.restart", "phase", "healthy", "role", "parent",
+                            "version", restored, "after", "rollback",
+                            "durationMs", elapsedSince(attemptStartedAt)));
                 } else {
                     updateStatus(statusFile, RestartStatus.PHASE_FAILED,
                             "回滚后旧版本仍未通过健康检查，请查看日志", true);
+                    log.warn(LogEvents.of("update.restart", "phase", "failed", "role", "parent",
+                            "version", restored, "reason", "回滚后仍未通过健康检查",
+                            "durationMs", elapsedSince(attemptStartedAt)));
                 }
             } catch (IOException | RuntimeException e) {
-                log.warn("in-process restart supervision failed: {}", e.toString());
+                log.warn(LogEvents.of("update.restart", "phase", "failed", "role", "parent",
+                        "version", appliedVersion, "error", e.toString(),
+                        "durationMs", elapsedSince(attemptStartedAt)), e);
                 running.set(false);
                 updateStatus(statusFile, RestartStatus.PHASE_FAILED, "重启失败：" + describe(e), true);
             }

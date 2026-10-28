@@ -28,7 +28,7 @@ assignees: ''
 <!-- 日志片段、报告中的 blindSpots、截图 -->
 
 ```text
-code-association.log 相关片段
+logs/code-association.log 相关片段（重要节点是 event=... 结构化行，见 docs/wiki/日志规范.md）
 ```
 
 ## 是否可复现

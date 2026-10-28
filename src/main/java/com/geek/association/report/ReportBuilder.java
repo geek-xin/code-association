@@ -306,9 +306,16 @@ public class ReportBuilder {
         int dbNonObservable = peers.stream().mapToInt(p -> p.dbNonObservableChanges).max().orElse(0);
         if (dbNonObservable > 0) {
             ImpactReport.addNote(report.notes, seen,
-                    "有 " + dbNonObservable + " 条表结构变更（加列、建表、删除迁移脚本）对对比程序不可观察，"
-                            + "未作为跨程序影响报告；这些变更不会让对方已有代码失效，"
-                            + "但仍需随发布顺序执行，字段盲区处请人工确认。");
+                    "有 " + dbNonObservable + " 条表结构变更（可空或带默认值的加列、建表、"
+                            + "删除迁移脚本或移除 DDL 动作）对对比程序不可观察，未作为跨程序影响报告；"
+                            + "这些变更不会让对方已有代码失效，但仍需随发布顺序执行，字段盲区处请人工确认。");
+        }
+        int dbRequired = peers.stream().mapToInt(p -> p.dbRequiredColumnChanges).max().orElse(0);
+        if (dbRequired > 0) {
+            ImpactReport.addNote(report.notes, seen,
+                    "有 " + dbRequired + " 条表结构变更把字段改为必填（NOT NULL 且无默认值）："
+                            + "对比程序中省略该字段的 INSERT 会被数据库拒绝，已按「写入方必填字段」命中；"
+                            + "请确认对方所有插入语句都补齐该字段，动态 SQL 与 SELECT * 处仍属字段盲区，需人工确认。");
         }
         int dbUnknown = peers.stream().mapToInt(p -> p.dbIdentityUnknownMatches).sum();
         if (dbUnknown > 0) {

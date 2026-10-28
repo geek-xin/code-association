@@ -207,6 +207,13 @@ public class PeerImpactEngine {
                     // A test mapper or test entity is not a production consumer of the contract.
                     continue;
                 }
+                if ("REQUIRED_COLUMN".equals(delta.operation)
+                        && !insertOmitsRequiredColumn(relation, consumer, delta)) {
+                    // Only an INSERT that leaves the new required column out is rejected. UPDATE
+                    // and DELETE never need it, and a dynamic statement's column list is a lower
+                    // bound, so those stay blind spots instead of becoming a guess.
+                    continue;
+                }
                 DbIdentity peerIdentity = peerIdentity(peer, e.from, delta.table);
                 if (!DbIdentity.compatible(delta.ownIdentity, peerIdentity)) {
                     peerInfo.dbMismatchSuppressed++;
@@ -238,7 +245,10 @@ public class PeerImpactEngine {
         String symbolKey;
         String contract;
         String kind;
-        /** WRITE_SET | ADD_COLUMN | DROP_COLUMN | MODIFY_COLUMN | DROP_TABLE | CREATE_TABLE | MAPPING | SCHEMA. */
+        /**
+         * WRITE_SET | ADD_COLUMN | DROP_COLUMN | MODIFY_COLUMN | RENAME_TABLE | DROP_TABLE |
+         * CREATE_TABLE | REQUIRED_COLUMN | MAPPING | SCHEMA.
+         */
         String operation;
         String table;
         DbIdentity ownIdentity;
@@ -384,6 +394,9 @@ public class PeerImpactEngine {
         String newType = str(change.extra.get("newType"));
         String oldNullable = str(change.extra.get("oldNullable"));
         String newNullable = str(change.extra.get("newNullable"));
+        // The default decides whether a NOT NULL column can still be left out of an INSERT: with a
+        // default the database fills it in, so only a defaultless NOT NULL column is required.
+        String newDefault = str(change.extra.get("newDefault"));
         String reason = str(change.extra.get("schemaChange"));
         if (reason.isBlank()) {
             reason = "TYPE";
@@ -395,12 +408,20 @@ public class PeerImpactEngine {
                 }
             }
             case "ADD_COLUMN" -> {
+                if (isRequiredColumn(newNullable, newDefault) && !table.isBlank() && !column.isBlank()) {
+                    // NOT NULL with no default: a peer INSERT that omits the column is rejected by
+                    // the database, so this is a real break rather than an invisible addition. The
+                    // delta hangs off the table symbol (the rejecting statement names no column)
+                    // but its contract is the column; columnless INSERTs are matched against it.
+                    addRequiredColumnDelta(deltas, seen, table, column);
+                    countRequiredColumn(counter, schemaSubject(table, column),
+                            "新增必填列（NOT NULL 且无默认值），写入方 INSERT 需补该列");
+                    break;
+                }
                 // A named-column reader or writer is unaffected by a new column. Only SELECT * and
-                // columnless INSERT can observe it, and those are counted as blind spots. A NOT
-                // NULL column without a default can reject a columnless INSERT; that is exactly
-                // the blind spot the count exists to surface, not a reason to flag every writer.
-                // The delta is still emitted so the table reaches the blind-spot pass, but it hits
-                // nothing; the change is counted here instead of vanishing from the report.
+                // columnless INSERT can observe it, and those are counted as blind spots. The delta
+                // is still emitted so the table reaches the blind-spot pass, but it hits nothing;
+                // the change is counted here instead of vanishing from the report.
                 if (!table.isBlank()) {
                     addTableDelta(deltas, seen, table, kind, false, false, false, 0.5);
                 }
@@ -431,6 +452,14 @@ public class PeerImpactEngine {
                     }
                     // Readers still see the same values; only writers can fail on NOT NULL.
                     addColumnDelta(deltas, seen, table + "." + column, kind, false, true, false, 0.8);
+                    if (isRequiredColumn(newNullable, newDefault)) {
+                        // The column also became required, so an INSERT that omits it is rejected.
+                        // That is table-scoped (the statement names no column) and coexists with the
+                        // column delta above, which covers the writers that do name the column.
+                        addRequiredColumnDelta(deltas, seen, table, column);
+                        countRequiredColumn(counter, schemaSubject(table, column),
+                                "字段改为必填（NOT NULL 且无默认值），写入方 INSERT 需补该列");
+                    }
                     break;
                 }
                 ColumnTypeCompatibility.Result result = ColumnTypeCompatibility.compare(oldType, newType);
@@ -451,6 +480,15 @@ public class PeerImpactEngine {
                     addTableDelta(deltas, seen, table, kind, true, true, true, 0.95);
                 }
             }
+            case "RENAME_TABLE" -> {
+                // The old name disappears, so every reader, writer and mapping of it breaks at
+                // once; that is why the table itself is the contract. The new name cannot already
+                // be a dependency - this rename created it - so it is deliberately not a delta and
+                // does not inflate the non-observable count.
+                if (!table.isBlank()) {
+                    addTableDelta(deltas, seen, table, kind, true, true, true, 0.9);
+                }
+            }
             case "CREATE_TABLE" -> {
                 // A new table cannot already be a dependency of another program. If the peer does
                 // reference it, that code is new too; this is not a regression caused by the change.
@@ -467,14 +505,17 @@ public class PeerImpactEngine {
     }
 
     /**
-     * A deleted migration script does not undo the migration in a real database, so it cannot break
-     * a consumer. Counted instead of dropped: the file change is real, and a change that leaves no
+     * A removed DDL action does not undo the migration in a real database, so it cannot break a
+     * consumer. The change detector marks two cases this way: a deleted migration script, and a
+     * statement that is still there but no longer declares an action. Both leave the deployed schema
+     * untouched, so the example names both - otherwise the report would describe a deletion that did
+     * not happen. Counted instead of dropped: the file change is real, and a change that leaves no
      * trace in the report reads as one the analyser never saw.
      */
     private static void countRemovedMigrationScript(ChangeRecord change, PeerImpact counter) {
         countNonObservable(counter,
                 schemaSubject(change.extra.get("table"), change.extra.get("column")),
-                "删除迁移脚本，已执行的迁移不会回滚");
+                "移除 DDL 动作或迁移脚本，已执行的迁移不会回滚");
     }
 
     /**
@@ -493,6 +534,63 @@ public class PeerImpactEngine {
         if (!subject.isBlank()) {
             addExample(counter.dbNonObservableExamples, subject + "（" + reason + "）");
         }
+    }
+
+    /**
+     * Counts a change that made a column required, with one capped example.
+     *
+     * Unlike {@link #countNonObservable}, this change does reach the other program: its INSERT that
+     * omits the column is rejected by the database. Only the statements this pass could match are
+     * reported, so the count tells the reader how many such changes were judged and why the report
+     * asks for the dynamic statements to be checked by hand. Counted per change, like the other
+     * change-level counters, which is why the report aggregates it with {@code max()}.
+     */
+    private static void countRequiredColumn(PeerImpact counter, String subject, String reason) {
+        if (counter == null) {
+            // The blind-spot pass re-reads the same deltas; it owns no counters of its own.
+            return;
+        }
+        counter.dbRequiredColumnChanges++;
+        if (!subject.isBlank()) {
+            addExample(counter.dbRequiredColumnExamples, subject + "（" + reason + "）");
+        }
+    }
+
+    /**
+     * A column every future INSERT has to provide: {@code NOT NULL} with no default.
+     *
+     * Blank nullability means the change did not state it, and a default lets the database fill the
+     * value in, so neither is "required". Guessing here would flag every writer of every added
+     * column, which is the noise this engine exists to remove.
+     */
+    private static boolean isRequiredColumn(String newNullable, String newDefault) {
+        return "false".equalsIgnoreCase(str(newNullable).trim()) && str(newDefault).isBlank();
+    }
+
+    /**
+     * True when this statement is a complete INSERT that does not provide the required column.
+     *
+     * The column list has to be inspected, not just the relation: an INSERT that names the column
+     * already satisfies the new constraint. A statement with unresolved dynamic SQL names no
+     * reliable column list, so it is left to the column blind spot rather than being matched or
+     * excluded on a guess.
+     */
+    private static boolean insertOmitsRequiredColumn(String relation, Sym consumer, DbDelta delta) {
+        if (!"WRITES_TABLE".equals(relation) || consumer == null || delta.contract == null) {
+            return false;
+        }
+        if (!"insert".equalsIgnoreCase(str(consumer.meta.get("sqlKind")))) {
+            return false;
+        }
+        if ("true".equalsIgnoreCase(str(consumer.meta.get("sqlIncomplete")))) {
+            return false;
+        }
+        for (String column : splitColumns(consumer.meta.get("writesColumns"))) {
+            if (column.equalsIgnoreCase(delta.contract)) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /** {@code table.column} when both are known, otherwise the table alone. */
@@ -635,6 +733,39 @@ public class PeerImpactEngine {
         d.hitsWriters = writers;
         d.hitsMappings = mappings;
         d.confidence = confidence;
+        out.add(d);
+        return d;
+    }
+
+    /**
+     * A table-level delta whose contract is still one column.
+     *
+     * A NOT NULL column with no default is broken by a statement that names no column at all, so the
+     * match has to hang off the table symbol - that is the only node the peer INSERT can reach. The
+     * contract stays {@code table.column}, because that is what the other program has to provide;
+     * calling it a table contract would read as "the whole table changed". Entering the delta with a
+     * table also keeps the table in the blind-spot pass, so {@code SELECT *} is still surfaced.
+     */
+    private DbDelta addRequiredColumnDelta(List<DbDelta> out, Set<String> seen, String table, String column) {
+        String normalizedTable = normalizeTable(table);
+        String normalizedColumn = normalizeColumn(column);
+        if (normalizedTable.isBlank() || normalizedColumn.isBlank()) {
+            return null;
+        }
+        String key = "db:table:" + normalizedTable;
+        if (!seen.add(key)) {
+            return null;
+        }
+        DbDelta d = new DbDelta();
+        d.symbolKey = key;
+        d.contract = normalizedTable + "." + normalizedColumn;
+        d.kind = "DB_COLUMN";
+        d.operation = "REQUIRED_COLUMN";
+        d.table = normalizedTable;
+        d.hitsReaders = false;
+        d.hitsWriters = true;
+        d.hitsMappings = false;
+        d.confidence = 0.85;
         out.add(d);
         return d;
     }

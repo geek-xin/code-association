@@ -20,6 +20,10 @@ spring:
 
 code-association:
   data-dir: ./.code-association
+  # 日志目录，默认 ./logs，与数据目录刻意分开：数据目录丢了要重新分析，日志目录随时可以清空，
+  # 两者的备份与清理节奏不同。目录、文件名与 7 天保留期由 logback-spring.xml 落实；
+  # 这里只决定"放哪儿"。环境变量 LOG_DIR 可覆盖，容器里挂载日志卷时用它。
+  log-dir: ${LOG_DIR:./logs}
   max-files: 20000
   # Largest single file the indexer will read, in megabytes. Source files are kilobytes; anything
   # near this is a committed SDK, a database dump or a packaged jar under another extension.
@@ -124,6 +128,9 @@ code-association:
     # no, and this has no effect while enabled is false.
     default-for-runs: true
 
+# 级别是基线，落盘位置与滚动策略在 logback-spring.xml 里。
+# com.geek.association 保持 INFO：分析、扫描、更新这些"重要节点"都打在 INFO，
+# 打开 DEBUG 会额外得到每次扫描对每个程序的判定理由（scan.program），排查"为什么没扫这个程序"时才开。
 logging:
   level:
     root: INFO

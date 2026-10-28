@@ -6,6 +6,7 @@ import com.geek.association.model.RepoSource;
 import com.geek.association.service.AnalysisService;
 import com.geek.association.source.RepositoryPreparer;
 import com.geek.association.store.Store;
+import com.geek.association.util.LogEvents;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -72,7 +73,10 @@ public class ScheduledScanService {
             // exists for callers that cannot know that; here it would only delay recovery.
             int recovered = store.recoverStaleAnalyses(0);
             if (recovered > 0) {
-                log.warn("recovered {} analysis run(s) left RUNNING by a previous process", recovered);
+                // A run left RUNNING by the previous process would make every later scan skip that
+                // program as "busy", so the recovery is worth a line of its own: it explains why a
+                // program that was never re-analysed after the restart now gets scanned.
+                log.warn(LogEvents.of("scan.recover", "recovered", recovered, "graceMs", 0));
             }
         } catch (RuntimeException e) {
             log.warn("could not recover stale analyses", e);
@@ -109,6 +113,8 @@ public class ScheduledScanService {
      */
     public ScanResult runAsync(String trigger) {
         if (!running.compareAndSet(false, true)) {
+            log.warn(LogEvents.of("scan.done", "trigger", trigger, "status", "SKIPPED",
+                    "reason", "上一次扫描仍在进行中", "durationMs", 0));
             return ScanResult.skipped(trigger, "上一次扫描仍在进行中");
         }
         // The flag is already taken; hand it to the worker, which owns it from here on.
@@ -133,7 +139,10 @@ public class ScheduledScanService {
         if (!running.compareAndSet(false, true)) {
             ScanResult skipped = ScanResult.skipped(trigger, "上一次扫描仍在进行中");
             lastResult = skipped;
-            log.info("scheduled scan skipped: a previous run is still in progress");
+            // WARN, not INFO: a tick that did nothing is the answer to "why was nothing scanned",
+            // and it must be findable without reading the schedule endpoint.
+            log.warn(LogEvents.of("scan.done", "trigger", trigger, "status", "SKIPPED",
+                    "reason", "上一次扫描仍在进行中", "durationMs", 0));
             return skipped;
         }
         return execute(trigger);
@@ -152,6 +161,11 @@ public class ScheduledScanService {
             List<RepoSource> sources = store.sources();
             result.registered = sources.size();
             int budget = Math.max(1, properties.getSchedule().getMaxProgramsPerRun());
+            // budget is on the start line on purpose: "20 registered but only 20 examined" is the
+            // normal case, while "registered=40 deferred=20" is the answer to "why was my program
+            // not scanned today" - the two numbers only make sense together.
+            log.info(LogEvents.of("scan.start", "trigger", trigger,
+                    "registered", result.registered, "budget", budget));
             for (RepoSource source : sources) {
                 if (result.scanned >= budget) {
                     result.deferred = sources.size() - result.scanned - result.skipped;
@@ -170,9 +184,18 @@ public class ScheduledScanService {
             lastResult = result;
             running.set(false);
         }
-        log.info("scheduled scan {} by {}: registered={} scanned={} skipped={} failed={} deferred={}",
-                result.status, trigger, result.registered, result.scanned, result.skipped,
-                result.failed, result.deferred);
+        // One line per run, whatever the outcome: the counters are what the schedule is judged by,
+        // and analysisIds is what joins this line to the analysis.* trail of the runs it started.
+        log.info(LogEvents.of("scan.done",
+                "trigger", trigger,
+                "status", result.status,
+                "registered", result.registered,
+                "scanned", result.scanned,
+                "skipped", result.skipped,
+                "failed", result.failed,
+                "deferred", result.deferred,
+                "durationMs", result.durationMs,
+                "analysisIds", result.analysisIds));
         return result;
     }
 
@@ -189,14 +212,14 @@ public class ScheduledScanService {
         try {
             if (hasRunningAnalysis(source.id)) {
                 result.skipped++;
-                result.details.add(entry(source, "SKIPPED", "已有分析在进行中"));
+                result.details.add(entry(result, source, "SKIPPED", "已有分析在进行中"));
                 return;
             }
             // A source whose location disappeared must not be retried on every tick: the run would
             // fail identically each time and drown the real signal. Report it once and move on.
             if (!preparer.locationExists(source)) {
                 result.skipped++;
-                result.details.add(entry(source, "SKIPPED", "位置不可访问：" + source.location));
+                result.details.add(entry(result, source, "SKIPPED", "位置不可访问：" + source.location));
                 return;
             }
             String head = preparer.currentCommit(source);
@@ -208,18 +231,18 @@ public class ScheduledScanService {
                     submit(source, result, "目录型程序，按时间间隔重新扫描");
                 } else {
                     result.skipped++;
-                    result.details.add(entry(source, "SKIPPED", "目录型程序，尚未到重新扫描时间"));
+                    result.details.add(entry(result, source, "SKIPPED", "目录型程序，尚未到重新扫描时间"));
                 }
                 return;
             }
             if (head == null) {
                 result.skipped++;
-                result.details.add(entry(source, "SKIPPED", "无法解析当前提交"));
+                result.details.add(entry(result, source, "SKIPPED", "无法解析当前提交"));
                 return;
             }
             if (last != null && head.equals(last.headCommit)) {
                 result.skipped++;
-                result.details.add(entry(source, "SKIPPED", "没有新提交"));
+                result.details.add(entry(result, source, "SKIPPED", "没有新提交"));
                 return;
             }
             String reason = last == null
@@ -228,7 +251,7 @@ public class ScheduledScanService {
             submit(source, result, reason);
         } catch (Exception e) {
             result.failed++;
-            result.details.add(entry(source, "FAILED", messageOf(e)));
+            result.details.add(entry(result, source, "FAILED", messageOf(e)));
             log.warn("scheduled scan could not inspect {}", source.name, e);
         }
     }
@@ -243,7 +266,7 @@ public class ScheduledScanService {
         }
         if (peers.isEmpty()) {
             result.skipped++;
-            result.details.add(entry(source, "SKIPPED", "没有其他程序可比较"));
+            result.details.add(entry(result, source, "SKIPPED", "没有其他程序可比较"));
             return;
         }
         AnalysisService.RunRequest request = new AnalysisService.RunRequest();
@@ -254,10 +277,10 @@ public class ScheduledScanService {
             Analysis analysis = analysisService.submit(request);
             result.scanned++;
             result.analysisIds.add(analysis.id);
-            result.details.add(entry(source, "SCANNED", reason + "，分析 #" + analysis.id));
+            result.details.add(entry(result, source, "SCANNED", reason + "，分析 #" + analysis.id));
         } catch (Exception e) {
             result.failed++;
-            result.details.add(entry(source, "FAILED", messageOf(e)));
+            result.details.add(entry(result, source, "FAILED", messageOf(e)));
         }
     }
 
@@ -291,7 +314,17 @@ public class ScheduledScanService {
         }
     }
 
-    private ScanResult.Detail entry(RepoSource source, String outcome, String reason) {
+    /**
+     * Records one program's verdict and logs it.
+     *
+     * Every "why was this program not scanned" answer is one of the branches below, and the reason
+     * is already computed for the status endpoint - logging it here rather than at each branch is
+     * what keeps the two from disagreeing. DEBUG because a scan over 20 programs writes 20 lines
+     * that only matter when the outcome of a specific one is being questioned.
+     */
+    private ScanResult.Detail entry(ScanResult result, RepoSource source, String outcome, String reason) {
+        log.debug(LogEvents.of("scan.program", "trigger", result.trigger,
+                "sourceId", source.id, "source", source.name, "outcome", outcome, "reason", reason));
         ScanResult.Detail detail = new ScanResult.Detail();
         detail.sourceId = source.id;
         detail.sourceName = source.name;

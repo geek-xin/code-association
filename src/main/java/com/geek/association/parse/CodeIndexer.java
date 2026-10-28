@@ -6,6 +6,9 @@ import com.geek.association.model.Sym;
 import com.geek.association.model.TypeInfo;
 import com.geek.association.parse.messaging.MessagingAnalyzer;
 import com.geek.association.source.FileSource;
+import com.geek.association.util.LogEvents;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -18,6 +21,8 @@ import java.util.function.Consumer;
 
 /** Runs the whole parsing pipeline for one revision and returns the finished code index. */
 public class CodeIndexer {
+
+    private static final Logger log = LoggerFactory.getLogger(CodeIndexer.class);
 
     private final int maxFiles;
 
@@ -65,6 +70,14 @@ public class CodeIndexer {
         new MessagingAnalyzer().analyze(source, index);
         new TestLinker(source, index, maven).analyze();
         index.buildMillis = System.currentTimeMillis() - start;
+        // 一次 index 会跑在 head、base 以及每个对比程序上，所以这行是 DEBUG：排查"某个程序到底
+        // 解析进来多少"时它是唯一的计数来源，但 INFO 会淹没分析本身的里程碑。
+        log.debug(LogEvents.of("index.done",
+                "files", index.parsedFiles,
+                "symbols", index.symbols.size(),
+                "modules", index.modules.size(),
+                "unresolved", index.unresolved.size(),
+                "durationMs", index.buildMillis));
         return index;
     }
 }

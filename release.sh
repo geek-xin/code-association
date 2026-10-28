@@ -197,8 +197,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\stop.ps1 -Port 8080
 `start.bat` / `stop.bat` 只是薄封装，会自动带 `-ExecutionPolicy Bypass`，
 所以即使系统策略禁止运行脚本也能用，不需要改注册表。
 Windows 上 `start.ps1` 以隐藏窗口在后台启动 java，stdout / stderr 分别重定向到
-`code-association.log` / `code-association.err.log`（句柄由 java 直接持有，脚本退出后照常写入），
-并把反查到的真实 java 进程 PID 写入 `.code-association.pid`。
+`logs/console.log` / `logs/console.err.log`（句柄由 java 直接持有，脚本退出后照常写入），
+并把反查到的真实 java 进程 PID 写入 `.code-association.pid`。这两份是**进程原始输出**，
+每次启动截断；应用日志由 logback 写到 `logs/code-association.log`（按天滚动、保留 7 天）。
 
 ### 前台运行（三平台通用，调试用）
 
@@ -211,11 +212,12 @@ java -jar target/@@APP@@.jar --server.port=9996
 | 文件 | 用途 | 覆盖方式 |
 | --- | --- | --- |
 | `.code-association/` | 默认数据目录（SQLite、克隆的仓库） | `DATA_DIR=/path`（Windows：`set DATA_DIR=D:\path`） |
-| `code-association.log` | 运行日志 | `LOG_FILE=/path/log`（Windows 同理） |
+| `logs/` | 应用日志与进程输出：`code-association.log`、`code-association-error.log`、`archive/*.log.gz`（保留 7 天）、`console.log` | `LOG_DIR=/path`（Windows 同理）；进程输出另有 `LOG_FILE=/path/console.log` |
 | `.code-association.pid` | 进程号文件，启动脚本写入、停止脚本清理 | 不建议手工修改 |
 
-> Windows 上的 `start.ps1` 会把 stderr 单独写到 `code-association.err.log`，
-> 便于区分启动期错误与正常日志；两个文件都在启动时被截断重写。
+> Windows 上的 `start.ps1` 会把 stderr 单独写到 `logs/console.err.log`，
+> 便于区分启动期错误与正常输出；两个 console 文件都在启动时被截断重写。
+> 应用日志（`logs/code-association.log`）不截断，按天滚动并自动保留 7 天。
 
 ## 每日自动扫描（schedule）
 

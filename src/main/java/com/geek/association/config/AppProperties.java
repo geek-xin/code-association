@@ -12,6 +12,17 @@ public class AppProperties {
     /** Directory that stores the SQLite database, cloned repositories and snapshots. */
     private String dataDir = "./.code-association";
 
+    /**
+     * Directory that receives the log files.
+     *
+     * Kept separate from {@link #dataDir} on purpose: the data directory holds state that has to be
+     * backed up (reports, sources), while the log directory holds diagnostics that can be deleted
+     * at any time. The actual rolling/retention lives in {@code logback-spring.xml}, which reads the
+     * same property through the Spring environment; this field exists so the startup banner can
+     * print the absolute path without knowing how Logback is configured.
+     */
+    private String logDir = "./logs";
+
     /** Maximum files parsed per repository (safety valve). */
     private int maxFiles = 20000;
 
@@ -44,6 +55,14 @@ public class AppProperties {
 
     public void setDataDir(String dataDir) {
         this.dataDir = dataDir;
+    }
+
+    public String getLogDir() {
+        return logDir;
+    }
+
+    public void setLogDir(String logDir) {
+        this.logDir = logDir;
     }
 
     public int getMaxFiles() {
@@ -105,6 +124,11 @@ public class AppProperties {
 
     public Path dataPath() {
         return Path.of(dataDir).toAbsolutePath().normalize();
+    }
+
+    /** Absolute log directory, which is what a "日志在哪儿" answer needs. */
+    public Path logPath() {
+        return Path.of(logDir).toAbsolutePath().normalize();
     }
 
     /**

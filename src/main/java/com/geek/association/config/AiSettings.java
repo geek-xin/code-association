@@ -2,6 +2,7 @@ package com.geek.association.config;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.geek.association.util.Json;
+import com.geek.association.util.LogEvents;
 import com.geek.association.util.Texts;
 import jakarta.annotation.PostConstruct;
 import org.slf4j.Logger;
@@ -67,12 +68,21 @@ public class AiSettings {
     public void load() {
         Path file = file();
         if (!Files.isRegularFile(file)) {
+            // The normal first-run case: no snapshot yet, so application.yml is the whole answer.
+            // Logged because "which configuration is actually in effect" is the first question when
+            // the AI section behaves differently from what the settings page shows.
+            log.info(LogEvents.of("ai.settings", "loaded", false, "source", "default",
+                    "file", file, "enabled", properties.getAi().isEnabled(),
+                    "baseUrl", properties.getAi().getBaseUrl(),
+                    "model", properties.getAi().getModel(),
+                    "maxImpacts", properties.getAi().getMaxImpacts()));
             return;
         }
         try {
             JsonNode root = Json.mapper().readTree(Files.readString(file, StandardCharsets.UTF_8));
             if (root == null || !root.isObject()) {
-                log.warn("AI 设置文件不是 JSON 对象，已忽略并沿用 application.yml：{}", file);
+                log.warn(LogEvents.of("ai.settings", "loaded", false, "source", "default",
+                        "file", file, "reason", "设置文件不是 JSON 对象，已沿用 application.yml"));
                 return;
             }
             AppProperties.Ai ai = properties.getAi();
@@ -102,11 +112,14 @@ public class AiSettings {
                 ai.setDefaultForRuns(root.path("defaultForRuns").asBoolean(ai.isDefaultForRuns()));
             }
             loadedFromFile = true;
-            log.info("已从 {} 加载 AI 设置：enabled={} model={}", file, ai.isEnabled(), ai.getModel());
+            log.info(LogEvents.of("ai.settings", "loaded", true, "source", "file", "file", file,
+                    "enabled", ai.isEnabled(), "baseUrl", ai.getBaseUrl(),
+                    "model", ai.getModel(), "maxImpacts", ai.getMaxImpacts()));
         } catch (IOException | RuntimeException e) {
             // The file is user-writable and may be truncated by a crash or edited by hand. Losing
             // the customisations is recoverable; refusing to boot over a settings file is not.
-            log.warn("无法读取 AI 设置文件 {}，已沿用 application.yml：{}", file, e.toString());
+            log.warn(LogEvents.of("ai.settings", "loaded", false, "source", "default",
+                    "file", file, "error", e.toString()));
         }
     }
 
@@ -215,8 +228,13 @@ public class AiSettings {
         }
         AppProperties.Ai applied = properties.getAi();
         // No key, ever: this line is the one place that could leak it into a log file.
-        log.info("AI 设置已更新：enabled={} baseUrl={} model={} maxImpacts={}",
-                applied.isEnabled(), applied.getBaseUrl(), applied.getModel(), applied.getMaxImpacts());
+        // loaded/source mirror the load line, so "was it persisted" is answered the same way on both
+        // sides: source=default means the file could not be written and application.yml will win
+        // after the next restart.
+        log.info(LogEvents.of("ai.settings", "loaded", loadedFromFile,
+                "source", loadedFromFile ? "file" : "default",
+                "enabled", applied.isEnabled(), "baseUrl", applied.getBaseUrl(),
+                "model", applied.getModel(), "maxImpacts", applied.getMaxImpacts()));
         return view();
     }
 

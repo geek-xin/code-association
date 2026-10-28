@@ -5,6 +5,8 @@ build/
 # Runtime data / logs / pid
 .code-association/
 .code-association.pid
+# 日志落在独立目录（code-association.log-dir，默认 ./logs），含 archive/ 下的滚动历史
+logs/
 *.log
 
 # OS / IDE

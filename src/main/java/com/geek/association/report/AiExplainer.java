@@ -6,6 +6,7 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.geek.association.config.AppProperties;
 import com.geek.association.model.ImpactResult;
 import com.geek.association.util.Json;
+import com.geek.association.util.LogEvents;
 import com.geek.association.util.Texts;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -147,6 +148,13 @@ public class AiExplainer {
         if (Texts.isBlank(url) || Texts.isBlank(usedModel)) {
             out.put("ok", false);
             out.put("message", Texts.isBlank(url) ? "未填写接口地址，无法测试连接" : "未填写模型，无法测试连接");
+            // 没有发出请求也是一次测试结果：记一行，事后才分得清"没测"与"测了但失败"。
+            log.info(LogEvents.of("ai.test",
+                    "ok", false,
+                    "endpoint", redact((String) out.get("endpoint"), key),
+                    "model", out.get("model"),
+                    "latencyMs", 0,
+                    "error", out.get("message")));
             return out;
         }
 
@@ -158,12 +166,25 @@ public class AiExplainer {
             out.put("sample", Texts.truncate(Texts.oneLine(answer), 80));
             out.put("ok", true);
             out.put("message", "连接正常，模型已返回响应");
+            log.info(LogEvents.of("ai.test",
+                    "ok", true,
+                    "endpoint", redact((String) out.get("endpoint"), key),
+                    "model", usedModel,
+                    "latencyMs", out.get("latencyMs"),
+                    "error", null));
             return out;
         } catch (Exception e) {
             out.put("latencyMs", (int) (System.currentTimeMillis() - started));
             out.put("ok", false);
             out.put("message", describeFailure(e, timeoutSeconds, ai, key, url));
-            log.warn("AI connection test failed for {}: {}", out.get("endpoint"), out.get("message"));
+            // 结构化一行：ok=false 与 error 都是"反复查询"的字段（哪个地址/模型配错了），
+            // 地址与原因都先脱敏再写，绝不把 key 带进日志。
+            log.warn(LogEvents.of("ai.test",
+                    "ok", false,
+                    "endpoint", redact((String) out.get("endpoint"), key),
+                    "model", usedModel,
+                    "latencyMs", out.get("latencyMs"),
+                    "error", out.get("message")));
             return out;
         }
     }

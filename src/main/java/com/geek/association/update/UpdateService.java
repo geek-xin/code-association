@@ -1,6 +1,7 @@
 package com.geek.association.update;
 
 import com.geek.association.config.AppProperties;
+import com.geek.association.util.LogEvents;
 import com.geek.association.util.Texts;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -209,7 +210,7 @@ public class UpdateService {
         }
         Snapshot current = snapshot;
         if (current == null || shouldRefresh(current)) {
-            Snapshot fresh = refresh();
+            Snapshot fresh = refresh("status");
             return view(fresh.error == null ? "github" : "error",
                     fresh.releases, fresh.checkedAt, fresh.error);
         }
@@ -221,7 +222,7 @@ public class UpdateService {
         if (!properties.getUpdate().isEnabled()) {
             return view("disabled", List.of(), null, null);
         }
-        Snapshot fresh = refresh();
+        Snapshot fresh = refresh("manual");
         return view(fresh.error == null ? "github" : "error", fresh.releases, fresh.checkedAt, fresh.error);
     }
 
@@ -456,7 +457,12 @@ public class UpdateService {
      * A network hiccup must not empty the version history the user is looking at, so the previous
      * releases survive and only the error and the attempt time move.
      */
-    private Snapshot refresh() {
+    private Snapshot refresh(String trigger) {
+        long startedAt = System.currentTimeMillis();
+        // Both ends of the round trip: a check that never comes back is the failure this line makes
+        // visible, and trigger says who asked (a user, the cron, the startup catch-up or a poll).
+        log.info(LogEvents.of("update.check", "phase", "start", "trigger", trigger,
+                "version", runningVersion));
         Snapshot fresh;
         synchronized (snapshotLock) {
             Snapshot previous = snapshot;
@@ -465,11 +471,24 @@ public class UpdateService {
                 List<ReleaseInfo> releases = versionSource.fetch();
                 fresh = new Snapshot(List.copyOf(releases), attemptedAt, attemptedAt, null);
                 snapshot = fresh;
+                Version latest = newestOf(fresh.releases);
+                // updateAvailable, not just latest: "a newer tag exists" is the question the log is
+                // read for, and deriving it here keeps the answer identical to the status payload.
+                log.info(LogEvents.of("update.check", "phase", "done", "trigger", trigger,
+                        "version", runningVersion,
+                        "latest", latest,
+                        "updateAvailable", latest != null && latest.isNewerThan(runningVersion),
+                        "releases", fresh.releases.size(),
+                        "durationMs", LogEvents.msSince(startedAt)));
             } catch (UpdateException e) {
-                log.warn("update check failed: {}", e.getMessage());
+                log.warn(LogEvents.of("update.check", "phase", "failed", "trigger", trigger,
+                        "version", runningVersion, "error", e.getMessage(),
+                        "durationMs", LogEvents.msSince(startedAt)));
                 return fail(previous, attemptedAt, e.getMessage());
             } catch (RuntimeException e) {
-                log.warn("update check failed", e);
+                log.warn(LogEvents.of("update.check", "phase", "failed", "trigger", trigger,
+                        "version", runningVersion, "error", e.toString(),
+                        "durationMs", LogEvents.msSince(startedAt)), e);
                 String message = Texts.isBlank(e.getMessage())
                         ? "检查更新失败：" + e.getClass().getSimpleName()
                         : "检查更新失败：" + e.getMessage();
@@ -488,6 +507,24 @@ public class UpdateService {
             log.warn("could not record the update history: {}", e.toString());
         }
         return fresh;
+    }
+
+    /**
+     * The newest version in a release list, or null when nothing in it parses.
+     *
+     * Compared rather than taken from the first entry: GitHub returns releases newest first, but the
+     * tag list merged in afterwards is not guaranteed to be, and the log line must not name an older
+     * tag as "latest".
+     */
+    private static Version newestOf(List<ReleaseInfo> releases) {
+        Version newest = null;
+        for (ReleaseInfo release : releases) {
+            Version version = Version.tryParse(release.version);
+            if (version != null && (newest == null || version.isNewerThan(newest))) {
+                newest = version;
+            }
+        }
+        return newest;
     }
 
     private Snapshot fail(Snapshot previous, Instant attemptedAt, String error) {
@@ -533,8 +570,13 @@ public class UpdateService {
         if (!working.compareAndSet(false, true)) {
             throw new IllegalArgumentException("已有下载或应用正在进行中，请稍后重试");
         }
+        long startedAt = System.currentTimeMillis();
         progress.start(UpdateProgress.PHASE_DOWNLOADING, target.toString(), automatic, 0,
                 automatic ? "后台正在下载新版本" : "正在下载");
+        // trigger distinguishes the button press from the unattended path: a 40 MB transfer nobody
+        // asked for is only explainable if the log says who asked.
+        log.info(LogEvents.of("update.download", "phase", "start", "version", target,
+                "trigger", automatic ? "auto" : "manual"));
         try {
             ReleaseInfo release = releaseOf(target);
             ReleaseInfo.Asset asset = jarAsset(release);
@@ -555,8 +597,9 @@ public class UpdateService {
             // The ledger outlives the process, so after a restart the UI still knows which
             // versions are already fetched; `pending` alone forgets them when the service stops.
             history.markDownloaded(downloaded.version, downloadedAt);
-            log.info("downloaded {} to {} ({} bytes, sha256={})",
-                    target, file, result.bytes, result.sha256);
+            log.info(LogEvents.of("update.download", "phase", "done", "version", downloaded.version,
+                    "bytes", result.bytes, "durationMs", LogEvents.msSince(startedAt),
+                    "jar", file, "sha256", result.sha256));
             progress.downloaded(result.bytes, result.bytes);
             progress.succeeded("已下载 " + downloaded.version);
 
@@ -568,6 +611,8 @@ public class UpdateService {
             out.put("verified", true);
             return out;
         } catch (IOException e) {
+            log.warn(LogEvents.of("update.download", "phase", "failed", "version", target,
+                    "durationMs", LogEvents.msSince(startedAt), "error", describeDownload(e)));
             progress.failed("下载失败", describeDownload(e));
             throw new IllegalArgumentException("下载失败：" + describeDownload(e), e);
         } catch (RuntimeException e) {
@@ -575,6 +620,9 @@ public class UpdateService {
             // messages are already sentences, so they are shown as the reason - with the leading
             // "下载失败：" stripped, because the card already prints that as the title and
             // "下载失败 / 下载失败：连接被拒绝" reads like two different problems.
+            log.warn(LogEvents.of("update.download", "phase", "failed", "version", target,
+                    "durationMs", LogEvents.msSince(startedAt),
+                    "error", stripPrefix(e.getMessage(), "下载失败：")));
             progress.failed("下载失败", stripPrefix(e.getMessage(), "下载失败："));
             throw e;
         } finally {
@@ -769,7 +817,7 @@ public class UpdateService {
         if (release == null) {
             // The cached list may predate the release the user asked for (or be empty), so one
             // forced refresh is worth it before declaring the version unknown.
-            Snapshot fresh = refresh();
+            Snapshot fresh = refresh("download-retry");
             release = findIn(fresh.releases, target);
         }
         if (release == null) {
@@ -1067,8 +1115,11 @@ public class UpdateService {
         if (!working.compareAndSet(false, true)) {
             throw new IllegalArgumentException("已有下载或应用正在进行中，请稍后重试");
         }
+        long startedAt = System.currentTimeMillis();
         progress.start(UpdateProgress.PHASE_APPLYING, target.version, automatic, 0,
                 automatic ? "后台正在替换 jar" : "正在替换 jar");
+        log.info(LogEvents.of("update.apply", "phase", "start", "version", target.version,
+                "trigger", automatic ? "auto" : "manual"));
         try {
             Path downloaded = Path.of(target.jarPath);
             if (!Files.isRegularFile(downloaded)) {
@@ -1090,17 +1141,14 @@ public class UpdateService {
             }
             pending = null;
             history.markApplied(target.version, Instant.now());
-            log.info("applied {} over {} (backup {})", target.version, jar, backup);
 
             // The jar is on disk and the swap succeeded; the restart is the remaining half of the
             // update. Handing it to the supervisor after the copy means a failed copy can never
             // leave a restart running against a jar that was never replaced.
             boolean restarting = false;
             if (properties.getUpdate().isAutoRestart() && restarts != null && restarts.isSupported()) {
+                // The supervisor writes its own update.restart line; this only records the outcome.
                 restarting = restarts.scheduleRestart(target.version);
-                if (restarting) {
-                    log.info("scheduled a supervised restart into {}", target.version);
-                }
             }
             if (restarting) {
                 progress.moveTo(UpdateProgress.PHASE_RESTARTING, "已替换 jar，等待服务重启");
@@ -1110,6 +1158,11 @@ public class UpdateService {
                 // restart would be the same lie the old restart banner was fixed for.
                 progress.succeeded("jar 已替换，需要手动重启服务");
             }
+            // Logged after the restart decision on purpose: "the file was swapped" without "and
+            // nobody is going to bring the process back" is the misleading half of the story.
+            log.info(LogEvents.of("update.apply", "phase", "done", "version", target.version,
+                    "durationMs", LogEvents.msSince(startedAt), "jar", jar, "backup", backup,
+                    "restarting", restarting));
 
             Map<String, Object> out = new LinkedHashMap<>();
             out.put("applied", true);
@@ -1127,6 +1180,8 @@ public class UpdateService {
             out.put("swappedAt", System.currentTimeMillis());
             return out;
         } catch (RuntimeException e) {
+            log.warn(LogEvents.of("update.apply", "phase", "failed", "version", target.version,
+                    "durationMs", LogEvents.msSince(startedAt), "error", e.getMessage()));
             progress.failed("应用更新失败", e.getMessage());
             throw e;
         } finally {
@@ -1169,7 +1224,10 @@ public class UpdateService {
             // should show: the mark belongs to the build the installation went back to.
             String restored = backupVersion(jar, backup);
             history.markRolledBack(restored, Instant.now());
-            log.info("rolled {} back from {}", jar, backup);
+            // reason=manual: this is the endpoint the operator pressed. A rollback that the
+            // supervisor triggered after a failed health check logs its own reason.
+            log.info(LogEvents.of("update.rollback", "version", restored, "reason", "manual",
+                    "jar", jar, "backup", backup));
             // A rollback has the same problem an apply has: the file on disk is old news to the
             // running JVM. The supervisor is reused rather than reimplemented, because "start the
             // jar again and check that it comes up" is the same job in both directions.
@@ -1272,12 +1330,9 @@ public class UpdateService {
 
     private void checkQuietly(String trigger) {
         try {
-            Snapshot result = refresh();
-            if (result.error != null) {
-                log.warn("update check ({}): {}", trigger, result.error);
-            } else {
-                log.info("update check ({}): {} release(s)", trigger, result.releases.size());
-            }
+            // refresh() already writes update.check start/done/failed with this trigger; a second
+            // summary line here would only repeat it in prose.
+            refresh(trigger);
         } catch (RuntimeException e) {
             // Belt and braces: refresh() already absorbs failures, but a scheduler thread must
             // never die on an exception it did not anticipate.
@@ -1446,8 +1501,8 @@ public class UpdateService {
                 throw new IllegalArgumentException("自动应用需要同时开启自动重启，否则更新完不会有人把服务拉起来");
             }
         }
-        log.info("update settings: autoDownload={} autoApply={} autoRestart={}",
-                update.isAutoDownload(), update.isAutoApply(), update.isAutoRestart());
+        log.info(LogEvents.of("update.settings", "autoDownload", update.isAutoDownload(),
+                "autoApply", update.isAutoApply(), "autoRestart", update.isAutoRestart()));
         return status();
     }
 

@@ -4,6 +4,9 @@ import com.geek.association.config.AppProperties;
 import com.geek.association.model.Analysis;
 import com.geek.association.model.RepoSource;
 import com.geek.association.util.Json;
+import com.geek.association.util.LogEvents;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
 import java.io.IOException;
@@ -31,6 +34,8 @@ import java.util.Map;
 @Component
 public class Store {
 
+    private static final Logger log = LoggerFactory.getLogger(Store.class);
+
     private final AppProperties properties;
     private volatile boolean initialized;
 
@@ -56,6 +61,7 @@ public class Store {
         if (initialized) {
             return;
         }
+        long started = System.currentTimeMillis();
         try (Connection c = connection(); Statement st = c.createStatement()) {
             st.executeUpdate("""
                     CREATE TABLE IF NOT EXISTS repo_source (
@@ -101,6 +107,12 @@ public class Store {
                     """);
             migrate(st);
             initialized = true;
+            // init() 被每个 public 方法调用，但只有真正建表/迁移的这一次才值得一行 INFO：
+            // 它同时回答"数据库在哪"（绝对路径，日志目录之外唯一需要人肉找的文件）和
+            // "启动时 schema 工作花了多久"。
+            log.info(LogEvents.of("store.init",
+                    "db", dataDir().resolve("code-association.db").toAbsolutePath(),
+                    "durationMs", LogEvents.msSince(started)));
         } catch (SQLException e) {
             throw new IllegalStateException("sqlite init failed", e);
         }
@@ -131,7 +143,25 @@ public class Store {
         // the whole analysis table - reading every row, including its summary_json - to answer a
         // question about one program. Indexing (source_id, id) also satisfies the ORDER BY id DESC
         // from the index itself, so the sort disappears too. Idempotent, like the columns above.
-        st.executeUpdate("CREATE INDEX IF NOT EXISTS idx_analysis_source_id ON analysis(source_id, id)");
+        if (!indexExists(st, "idx_analysis_source_id")) {
+            st.executeUpdate("CREATE INDEX IF NOT EXISTS idx_analysis_source_id ON analysis(source_id, id)");
+            log.info(LogEvents.of("store.init",
+                    "migration", "create index idx_analysis_source_id"));
+        }
+    }
+
+    /**
+     * Whether a named index already exists.
+     *
+     * Needed only so the migration line above is logged on the one startup that actually creates
+     * it: {@code CREATE INDEX IF NOT EXISTS} succeeds silently either way, so its update count
+     * cannot tell the two cases apart.
+     */
+    private boolean indexExists(Statement st, String name) throws SQLException {
+        try (ResultSet rs = st.executeQuery(
+                "SELECT 1 FROM sqlite_master WHERE type='index' AND name='" + name + "'")) {
+            return rs.next();
+        }
     }
 
     private List<String> columnsOf(Statement st, String table) throws SQLException {
@@ -148,6 +178,9 @@ public class Store {
                                     String type) throws SQLException {
         if (!columns.contains(name)) {
             st.executeUpdate("ALTER TABLE " + table + " ADD COLUMN " + name + " " + type);
+            // 一次性事件：升级后的第一次启动才会走这里，记下来才能解释"为什么这次启动比平时慢"。
+            log.info(LogEvents.of("store.init",
+                    "migration", "add column " + table + "." + name));
         }
     }
 

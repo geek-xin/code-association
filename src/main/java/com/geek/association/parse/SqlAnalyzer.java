@@ -6,6 +6,7 @@ import com.geek.association.model.Sym;
 import com.geek.association.model.TypeInfo;
 import com.geek.association.source.FileSource;
 import com.geek.association.util.Hashes;
+import com.geek.association.util.Json;
 import com.geek.association.util.Texts;
 
 import java.util.ArrayList;
@@ -32,54 +33,61 @@ public class SqlAnalyzer {
             "\\b(?:from|join|into|update|table)\\s+([a-zA-Z_][\\w.]*)", Pattern.CASE_INSENSITIVE);
     private static final Pattern SELECT_COLUMNS = Pattern.compile(
             "\\bselect\\s+(.*?)\\s+from\\b", Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
-    private static final Pattern ALTER_ADD = Pattern.compile(
-            "\\balter\\s+table\\s+([\\w.]+)\\s+add\\s+(?:column\\s+)?(?:if\\s+not\\s+exists\\s+)?([\\w]+)",
-            Pattern.CASE_INSENSITIVE);
-    private static final Pattern ALTER_DROP = Pattern.compile(
-            "\\balter\\s+table\\s+([\\w.]+)\\s+drop\\s+(?:column\\s+)?(?:if\\s+exists\\s+)?([\\w]+)",
-            Pattern.CASE_INSENSITIVE);
-    private static final Pattern ALTER_MODIFY = Pattern.compile(
-            "\\balter\\s+table\\s+([\\w.]+)\\s+(?:modify|alter)\\s+(?:column\\s+)?(?:if\\s+exists\\s+)?([\\w]+)",
-            Pattern.CASE_INSENSITIVE);
-    /** ALTER TABLE ... ADD [COLUMN] c <definition>; the definition carries type/nullability/default. */
-    private static final Pattern ALTER_ADD_DEF = Pattern.compile(
-            "\\balter\\s+table\\s+([\\w.\\x60\\[\\]]+)\\s+add\\s+(?:column\\s+)?(?:if\\s+not\\s+exists\\s+)?"
-                    + "([\\w\\x60\\[\\]]+)\\s+([^;]+?)"
-                    + "(?=,\\s*(?:add|drop|modify|alter|rename|change)\\b|$)",
+    /** A DDL identifier as written: bare, backticked, bracket-quoted or double-quoted. */
+    private static final String DDL_IDENT = "[\\w\\x60\\[\\]\"]+";
+    /** A DDL table reference, possibly schema-qualified. */
+    private static final String DDL_TABLE_REF = "[\\w.\\x60\\[\\]\"]+";
+    /**
+     * {@code ALTER TABLE t <action>[, <action>]...}: one statement can carry several actions
+     * (MySQL especially), so the head is cut off here and the rest is split on top-level commas.
+     */
+    private static final Pattern ALTER_TABLE_HEAD = Pattern.compile(
+            "^alter\\s+table\\s+(?:if\\s+exists\\s+)?(?:only\\s+)?(" + DDL_TABLE_REF + ")\\s+(.+)$",
             Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
-    /** ALTER TABLE ... MODIFY/ALTER [COLUMN] c <definition>. */
-    private static final Pattern ALTER_MODIFY_DEF = Pattern.compile(
-            "\\balter\\s+table\\s+([\\w.\\x60\\[\\]]+)\\s+(?:modify|alter)\\s+(?:column\\s+)?(?:if\\s+exists\\s+)?"
-                    + "([\\w\\x60\\[\\]]+)\\s+([^;]+?)"
-                    + "(?=,\\s*(?:add|drop|modify|alter|rename|change)\\b|$)",
+    /** MySQL {@code RENAME TABLE old TO new [, old2 TO new2]}. */
+    private static final Pattern RENAME_TABLE_HEAD = Pattern.compile(
+            "^rename\\s+table\\s+(.+)$", Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
+    private static final Pattern RENAME_TABLE_PAIR = Pattern.compile(
+            "^(" + DDL_TABLE_REF + ")\\s+to\\s+(" + DDL_TABLE_REF + ")$", Pattern.CASE_INSENSITIVE);
+    /** One {@code ADD [COLUMN] [IF NOT EXISTS] c <definition>} action. */
+    private static final Pattern ACTION_ADD = Pattern.compile(
+            "^add\\s+(?:column\\s+)?(?:if\\s+not\\s+exists\\s+)?(" + DDL_IDENT + ")\\s*(.*)$",
             Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
+    /** One {@code DROP [COLUMN] [IF EXISTS] c} action. */
+    private static final Pattern ACTION_DROP = Pattern.compile(
+            "^drop\\s+(?:column\\s+)?(?:if\\s+exists\\s+)?(" + DDL_IDENT + ")\\s*$",
+            Pattern.CASE_INSENSITIVE);
+    /** One MySQL {@code MODIFY [COLUMN] c <definition>} action. */
+    private static final Pattern ACTION_MODIFY = Pattern.compile(
+            "^modify\\s+(?:column\\s+)?(?:if\\s+exists\\s+)?(" + DDL_IDENT + ")\\s*(.*)$",
+            Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
+    /** One standard {@code ALTER [COLUMN] c TYPE / SET NOT NULL / SET DEFAULT ...} action. */
+    private static final Pattern ACTION_ALTER = Pattern.compile(
+            "^alter\\s+(?:column\\s+)?(?:if\\s+exists\\s+)?(" + DDL_IDENT + ")\\s*(.*)$",
+            Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
+    /** One MySQL {@code CHANGE [COLUMN] old new <definition>} action: a rename plus a redefinition. */
+    private static final Pattern ACTION_CHANGE = Pattern.compile(
+            "^change\\s+(?:column\\s+)?(" + DDL_IDENT + ")\\s+(" + DDL_IDENT + ")\\s*(.*)$",
+            Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
+    /** {@code ALTER TABLE t RENAME [TO|AS] newTable}. */
+    private static final Pattern ACTION_RENAME_TABLE = Pattern.compile(
+            "^rename\\s+(?:to|as)\\s+(" + DDL_TABLE_REF + ")\\s*$", Pattern.CASE_INSENSITIVE);
+    /** {@code ALTER TABLE t RENAME [COLUMN] old TO new}. */
+    private static final Pattern ACTION_RENAME_COLUMN = Pattern.compile(
+            "^rename\\s+(?:column\\s+)?(" + DDL_IDENT + ")\\s+(?:to|as)\\s+(" + DDL_IDENT + ")\\s*$",
+            Pattern.CASE_INSENSITIVE);
+    /** Definitions where the database fills the column itself, so an INSERT may omit it. */
+    private static final Pattern AUTO_POPULATED = Pattern.compile(
+            "\\b(?:AUTO_INCREMENT|GENERATED|IDENTITY)\\b", Pattern.CASE_INSENSITIVE);
+    /** Clauses whose tail cannot describe how a column's value is produced. */
+    private static final Pattern DEFINITION_TAIL = Pattern.compile(
+            "\\b(?:COMMENT|REFERENCES|CHECK|COLLATE)\\b", Pattern.CASE_INSENSITIVE);
     private static final Pattern CREATE_TABLE_HEAD = Pattern.compile(
             "\\bcreate\\s+table\\s+(?:if\\s+not\\s+exists\\s+)?([\\w.\\x60\\[\\]]+)\\s*\\(",
             Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
     private static final Pattern CREATE_TABLE_ANY = Pattern.compile(
             "\\bcreate\\s+table\\s+(?:if\\s+not\\s+exists\\s+)?([\\w.\\x60\\[\\]]+)",
             Pattern.CASE_INSENSITIVE);
-    /** PostgreSQL / standard SQL: ALTER TABLE t ALTER COLUMN c SET NOT NULL. */
-    private static final Pattern ALTER_RENAME_COLUMN = Pattern.compile(
-            "\\balter\\s+table\\s+([\\w.\\x60\\[\\]]+)\\s+rename\\s+(?:column\\s+)?"
-                    + "([\\w\\x60\\[\\]]+)\\s+to\\s+([\\w\\x60\\[\\]]+)",
-            Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
-    private static final Pattern ALTER_SET_NOT_NULL = Pattern.compile(
-            "\\balter\\s+table\\s+([\\w.\\x60\\[\\]]+)\\s+alter\\s+(?:column\\s+)?"
-                    + "([\\w\\x60\\[\\]]+)\\s+set\\s+not\\s+null",
-            Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
-    private static final Pattern ALTER_DROP_NOT_NULL = Pattern.compile(
-            "\\balter\\s+table\\s+([\\w.\\x60\\[\\]]+)\\s+alter\\s+(?:column\\s+)?"
-                    + "([\\w\\x60\\[\\]]+)\\s+drop\\s+not\\s+null",
-            Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
-    private static final Pattern ALTER_SET_DEFAULT = Pattern.compile(
-            "\\balter\\s+table\\s+([\\w.\\x60\\[\\]]+)\\s+alter\\s+(?:column\\s+)?"
-                    + "([\\w\\x60\\[\\]]+)\\s+set\\s+default\\s+([^;]+)",
-            Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
-    private static final Pattern ALTER_DROP_DEFAULT = Pattern.compile(
-            "\\balter\\s+table\\s+([\\w.\\x60\\[\\]]+)\\s+alter\\s+(?:column\\s+)?"
-                    + "([\\w\\x60\\[\\]]+)\\s+drop\\s+default",
-            Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
     private static final Pattern SELECT_STAR = Pattern.compile(
             "\\bselect\\s+(?:[a-zA-Z_][\\w]*\\s*\\.\\s*)?\\*", Pattern.CASE_INSENSITIVE);
     private static final Pattern DYNAMIC_SQL = Pattern.compile(
@@ -114,10 +122,20 @@ public class SqlAnalyzer {
             "where", "set", "values", "select", "from", "join", "left", "right", "inner", "outer", "full",
             "cross", "on", "group", "order", "by", "having", "limit", "offset", "union", "and", "or",
             "as", "insert", "update", "delete", "into", "duplicate", "ignore", "returning", "for");
-    /** ALTER TABLE actions that are not a column and must never become a column contract. */
+    /**
+     * ALTER TABLE action words that name an object or a table option, not a column.
+     *
+     * {@code ADD INDEX}, {@code DROP CONSTRAINT}, {@code ADD PARTITION} and friends are real DDL but
+     * must never become a column contract: a contract on a column that does not exist would match
+     * nobody, and a contract on a table option would match everything.
+     */
     private static final Set<String> NON_COLUMN_DDL = Set.of(
-            "INDEX", "KEY", "CONSTRAINT", "PRIMARY", "FOREIGN", "UNIQUE", "CHECK", "FULLTEXT", "SPATIAL",
-            "SET", "DROP");
+            "COLUMN", "COLUMNS", "INDEX", "KEY", "CONSTRAINT", "PRIMARY", "FOREIGN", "UNIQUE", "CHECK",
+            "FULLTEXT", "SPATIAL", "PARTITION", "ENGINE", "CONVERT", "DEFAULT", "CHARACTER", "CHARSET",
+            "COLLATE", "AUTO_INCREMENT", "ALGORITHM", "LOCK", "FORCE", "ORDER", "TABLESPACE", "WITHOUT",
+            "IMPORT", "DISCARD", "ENABLE", "DISABLE", "TRUNCATE", "EXCHANGE", "REORGANIZE", "REBUILD",
+            "COALESCE", "ATTACH", "DETACH", "ANALYZE", "OPTIMIZE", "REPAIR", "VALIDATE", "UPGRADE",
+            "IDENTITY", "EXPRESSION", "SET", "DROP");
 
     private final FileSource source;
     private final MavenParser maven;
@@ -369,7 +387,16 @@ public class SqlAnalyzer {
                 if (sqlText.isEmpty()) {
                     continue;
                 }
-                int line = lineOf(content, chunk.start);
+                // A chunk starts right after the previous semicolon, so it usually begins with
+                // the newline that separates the statements. Counting that newline as "before"
+                // the chunk gave every statement of a multi-statement script the line of the
+                // previous one; the key is file#line, so the later statements then overwrote the
+                // earlier ones in the index and the change detector saw phantom removed actions.
+                int from = chunk.start;
+                while (from < content.length() && Character.isWhitespace(content.charAt(from))) {
+                    from++;
+                }
+                int line = lineOf(content, from);
                 String kind = guessKind(sqlText);
                 Sym sym = new Sym();
                 sym.key = "sql:" + file + "#" + line;
@@ -388,132 +415,303 @@ public class SqlAnalyzer {
                 markStatementShape(sym, sqlText, sqlText);
                 index.addSymbol(sym);
                 linkTables(sym, sqlText, kind);
-                detectDdl(sym, sqlText);
+                // One parse feeds both the statement metadata and the snapshot: two parsers would
+                // drift, and the snapshot must mirror exactly the actions the report describes.
+                List<DdlAction> actions = ddlActions(sqlText);
+                detectDdl(sym, sqlText, actions);
                 // Test schema must not become the production schema snapshot: a testcontainers
                 // DDL change says nothing about what other programs will see at runtime.
                 if (!sym.test) {
-                    applySchema(sqlText);
+                    applySchema(sqlText, actions);
                 }
             }
         }
     }
 
-    private void detectDdl(Sym sym, String sqlText) {
-        sqlText = sqlText.strip();
-        String upper = sqlText.toUpperCase(Locale.ROOT);
-        if (upper.startsWith("ALTER TABLE")) {
-            Matcher add = ALTER_ADD_DEF.matcher(sqlText);
-            boolean addColumn = false;
-            if (add.find() && !isNonColumnDefinition(add.group(2)) && !isNonColumnDefinition(add.group(3))) {
-                sym.meta.put("ddl", "ADD_COLUMN");
-                sym.meta.put("ddlTable", add.group(1));
-                sym.meta.put("ddlColumn", stripIdent(add.group(2)));
-                putDefinitionMeta(sym, alterDefinition(add.group(3)));
-                putSchemaMeta(sym, add.group(1));
-                addColumn = true;
-            }
-            if (!addColumn) {
-                Matcher fallback = ALTER_ADD.matcher(sqlText);
-                if (fallback.find() && !isNonColumnDefinition(fallback.group(2))) {
-                    sym.meta.put("ddl", "ADD_COLUMN");
-                    sym.meta.put("ddlTable", fallback.group(1));
-                    sym.meta.put("ddlColumn", stripIdent(fallback.group(2)));
-                    putSchemaMeta(sym, fallback.group(1));
-                }
-            }
-            Matcher drop = ALTER_DROP.matcher(sqlText);
-            if (drop.find() && !isNonColumnDefinition(drop.group(2))) {
-                sym.meta.put("ddl", "DROP_COLUMN");
-                sym.meta.put("ddlTable", drop.group(1));
-                sym.meta.put("ddlColumn", stripIdent(drop.group(2)));
-                putSchemaMeta(sym, drop.group(1));
-            }
-            Matcher modify = ALTER_MODIFY_DEF.matcher(sqlText);
-            boolean modifyColumn = false;
-            if (modify.find() && !isNonColumnDefinition(modify.group(2)) && !isNonColumnDefinition(modify.group(3))) {
-                sym.meta.put("ddl", "MODIFY_COLUMN");
-                sym.meta.put("ddlTable", modify.group(1));
-                sym.meta.put("ddlColumn", stripIdent(modify.group(2)));
-                putDefinitionMeta(sym, alterDefinition(modify.group(3)));
-                putSchemaMeta(sym, modify.group(1));
-                modifyColumn = true;
-            }
-            if (!modifyColumn) {
-                Matcher fallback = ALTER_MODIFY.matcher(sqlText);
-                if (fallback.find() && !isNonColumnDefinition(fallback.group(2))) {
-                    sym.meta.put("ddl", "MODIFY_COLUMN");
-                    sym.meta.put("ddlTable", fallback.group(1));
-                    sym.meta.put("ddlColumn", stripIdent(fallback.group(2)));
-                    putSchemaMeta(sym, fallback.group(1));
-                }
-            }
-            // A rename is a drop of the old name plus an add of the new one. Reporting the old
-            // name as DROP_COLUMN is what protects existing readers/writers; the new name cannot
-            // already be a dependency of another program.
-            Matcher rename = ALTER_RENAME_COLUMN.matcher(sqlText);
-            if (rename.find()) {
-                sym.meta.put("ddl", "DROP_COLUMN");
-                sym.meta.put("ddlTable", rename.group(1));
-                sym.meta.put("ddlColumn", stripIdent(rename.group(2)));
-                sym.meta.put("ddlRenamedTo", stripIdent(rename.group(3)));
-                putSchemaMeta(sym, rename.group(1));
-            }
-            // PostgreSQL / standard SQL: ALTER COLUMN c SET/DROP NOT NULL / DEFAULT.
-            // The generic MODIFY pattern deliberately rejects SET/DROP as an action, so these
-            // forms need their own branch; without it a NOT NULL tightening silently disappears.
-            Matcher setNotNull = ALTER_SET_NOT_NULL.matcher(sqlText);
-            Matcher dropNotNull = ALTER_DROP_NOT_NULL.matcher(sqlText);
-            Matcher setDefault = ALTER_SET_DEFAULT.matcher(sqlText);
-            Matcher dropDefault = ALTER_DROP_DEFAULT.matcher(sqlText);
-            if (setNotNull.find()) {
-                sym.meta.put("ddl", "MODIFY_COLUMN");
-                sym.meta.put("ddlTable", setNotNull.group(1));
-                sym.meta.put("ddlColumn", stripIdent(setNotNull.group(2)));
-                sym.meta.put("ddlNullable", "false");
-                putSchemaMeta(sym, setNotNull.group(1));
-            } else if (dropNotNull.find()) {
-                sym.meta.put("ddl", "MODIFY_COLUMN");
-                sym.meta.put("ddlTable", dropNotNull.group(1));
-                sym.meta.put("ddlColumn", stripIdent(dropNotNull.group(2)));
-                sym.meta.put("ddlNullable", "true");
-                putSchemaMeta(sym, dropNotNull.group(1));
-            } else if (setDefault.find()) {
-                sym.meta.put("ddl", "MODIFY_COLUMN");
-                sym.meta.put("ddlTable", setDefault.group(1));
-                sym.meta.put("ddlColumn", stripIdent(setDefault.group(2)));
-                sym.meta.put("ddlDefault", setDefault.group(3).strip());
-                putSchemaMeta(sym, setDefault.group(1));
-            } else if (dropDefault.find()) {
-                sym.meta.put("ddl", "MODIFY_COLUMN");
-                sym.meta.put("ddlTable", dropDefault.group(1));
-                sym.meta.put("ddlColumn", stripIdent(dropDefault.group(2)));
-                sym.meta.put("ddlDefault", "");
-                putSchemaMeta(sym, dropDefault.group(1));
-            }
-            sym.meta.put("ddlSql", Texts.truncate(JavaIndexer.normalize(sqlText), 500));
+    /**
+     * Records the DDL a statement carries, including every action of a multi-action ALTER TABLE.
+     *
+     * The legacy {@code ddl*} keys keep the first action, so a reader written before this change
+     * sees exactly what it saw before. The complete ordered list goes to {@code ddlActions} as
+     * JSON: a single ALTER can add one column and drop another, and hiding the second action was
+     * what made the report miss it. A statement with no column DDL writes neither, so
+     * {@code ALTER TABLE ... ADD INDEX} stays a non-schema change.
+     */
+    private void detectDdl(Sym sym, String sqlText, List<DdlAction> actions) {
+        String sql = sqlText.strip();
+        String upper = sql.toUpperCase(Locale.ROOT);
+        if (upper.startsWith("ALTER TABLE") || upper.startsWith("RENAME TABLE")) {
+            sym.meta.put("ddlSql", Texts.truncate(JavaIndexer.normalize(sql), 500));
         }
-        Matcher create = CREATE_TABLE_HEAD.matcher(sqlText);
+        if (actions.isEmpty()) {
+            return;
+        }
+        DdlAction first = actions.get(0);
+        sym.meta.put("ddl", legacyKind(first.kind));
+        sym.meta.put("ddlTable", first.rawTable);
+        if ("RENAME_TABLE".equals(first.kind)) {
+            sym.meta.put("ddlRenamedToTable", first.renamedTo);
+        } else if (!first.column.isEmpty()) {
+            sym.meta.put("ddlColumn", first.column);
+        }
+        if ("RENAME_COLUMN".equals(first.kind)) {
+            // A column rename is a drop of the old name for every existing reader or writer; the
+            // new name cannot already be a dependency of another program.
+            sym.meta.put("ddlRenamedTo", first.renamedTo);
+        }
+        if (first.type != null && !first.type.isBlank()) {
+            sym.meta.put("ddlType", first.type);
+        }
+        if (first.nullable != null) {
+            sym.meta.put("ddlNullable", first.nullable);
+        }
+        if (first.defaultValue != null) {
+            sym.meta.put("ddlDefault", first.defaultValue);
+        }
+        putSchemaMeta(sym, first.rawTable);
+        sym.meta.put("ddlActions", Json.write(actionJson(actions)));
+    }
+
+    /** The pre-existing spelling of an action kind: a column rename has always been a column drop. */
+    private static String legacyKind(String kind) {
+        return "RENAME_COLUMN".equals(kind) ? "DROP_COLUMN" : kind;
+    }
+
+    /**
+     * Parses every top-level action of one DDL statement, in statement order.
+     *
+     * {@code ADD a INT, ADD b INT} used to be read as {@code ADD a} only, and {@code ADD a, DROP b}
+     * even carried the ADD type on the DROP record. Commas inside parentheses or string literals do
+     * not split an action. Unsupported actions (indexes, constraints, table options) are skipped
+     * instead of being guessed as columns.
+     */
+    private List<DdlAction> ddlActions(String sqlText) {
+        String sql = sqlText == null ? "" : sqlText.strip();
+        List<DdlAction> out = new ArrayList<>();
+        Matcher create = CREATE_TABLE_HEAD.matcher(sql);
         if (create.lookingAt()) {
-            sym.meta.put("ddl", "CREATE_TABLE");
-            sym.meta.put("ddlTable", create.group(1));
-            putSchemaMeta(sym, create.group(1));
-            return;
+            out.add(newAction("CREATE_TABLE", create.group(1)));
+            return out;
         }
-        Matcher any = CREATE_TABLE_ANY.matcher(sqlText);
-        if (any.lookingAt()) {
-            sym.meta.put("ddl", "CREATE_TABLE");
-            sym.meta.put("ddlTable", any.group(1));
-            putSchemaMeta(sym, any.group(1));
-            return;
+        Matcher createAny = CREATE_TABLE_ANY.matcher(sql);
+        if (createAny.lookingAt()) {
+            out.add(newAction("CREATE_TABLE", createAny.group(1)));
+            return out;
         }
-        if (upper.startsWith("DROP TABLE")) {
-            Matcher dropTable = DROP_TABLE.matcher(sqlText);
-            if (dropTable.find()) {
-                sym.meta.put("ddl", "DROP_TABLE");
-                sym.meta.put("ddlTable", dropTable.group(1));
-                putSchemaMeta(sym, dropTable.group(1));
+        Matcher dropTable = DROP_TABLE.matcher(sql);
+        if (dropTable.lookingAt()) {
+            out.add(newAction("DROP_TABLE", dropTable.group(1)));
+            return out;
+        }
+        Matcher renameTable = RENAME_TABLE_HEAD.matcher(sql);
+        if (renameTable.matches()) {
+            for (String part : splitTopLevel(renameTable.group(1))) {
+                Matcher pair = RENAME_TABLE_PAIR.matcher(part.strip());
+                if (!pair.matches()) {
+                    continue;
+                }
+                DdlAction action = newAction("RENAME_TABLE", pair.group(1));
+                action.renamedTo = normalizeTable(pair.group(2));
+                out.add(action);
+            }
+            return out;
+        }
+        Matcher alter = ALTER_TABLE_HEAD.matcher(sql);
+        if (!alter.matches()) {
+            return out;
+        }
+        for (String part : splitTopLevel(alter.group(2))) {
+            DdlAction action = parseAlterAction(alter.group(1), part.strip());
+            if (action != null) {
+                out.add(action);
             }
         }
+        return out;
+    }
+
+    /** One {@code ADD / DROP / MODIFY / ALTER / CHANGE / RENAME} action, or null when it is not a column. */
+    private DdlAction parseAlterAction(String tableRef, String part) {
+        Matcher add = ACTION_ADD.matcher(part);
+        if (add.matches()) {
+            if (isNonColumnAction(add.group(1))) {
+                return null;
+            }
+            DdlAction action = newAction("ADD_COLUMN", tableRef);
+            action.column = stripIdent(add.group(1));
+            putDefinition(action, alterDefinition(add.group(2)));
+            return action;
+        }
+        Matcher drop = ACTION_DROP.matcher(part);
+        if (drop.matches()) {
+            if (isNonColumnAction(drop.group(1))) {
+                return null;
+            }
+            DdlAction action = newAction("DROP_COLUMN", tableRef);
+            action.column = stripIdent(drop.group(1));
+            return action;
+        }
+        Matcher modify = ACTION_MODIFY.matcher(part);
+        if (modify.matches()) {
+            if (isNonColumnAction(modify.group(1))) {
+                return null;
+            }
+            DdlAction action = newAction("MODIFY_COLUMN", tableRef);
+            action.column = stripIdent(modify.group(1));
+            putDefinition(action, alterDefinition(modify.group(2)));
+            return action;
+        }
+        Matcher alter = ACTION_ALTER.matcher(part);
+        if (alter.matches()) {
+            if (isNonColumnAction(alter.group(1))) {
+                return null;
+            }
+            return alterColumnAction(tableRef, alter.group(1), alter.group(2).strip());
+        }
+        Matcher change = ACTION_CHANGE.matcher(part);
+        if (change.matches()) {
+            DdlAction action = newAction("RENAME_COLUMN", tableRef);
+            action.column = stripIdent(change.group(1));
+            action.renamedTo = stripIdent(change.group(2));
+            putDefinition(action, alterDefinition(change.group(3)));
+            return action;
+        }
+        Matcher renameTable = ACTION_RENAME_TABLE.matcher(part);
+        if (renameTable.matches()) {
+            DdlAction action = newAction("RENAME_TABLE", tableRef);
+            action.renamedTo = normalizeTable(renameTable.group(1));
+            return action;
+        }
+        Matcher renameColumn = ACTION_RENAME_COLUMN.matcher(part);
+        if (renameColumn.matches()) {
+            DdlAction action = newAction("RENAME_COLUMN", tableRef);
+            action.column = stripIdent(renameColumn.group(1));
+            action.renamedTo = stripIdent(renameColumn.group(2));
+            return action;
+        }
+        return null;
+    }
+
+    /**
+     * {@code ALTER [COLUMN] c TYPE t / SET DATA TYPE t / SET NOT NULL / DROP NOT NULL / SET DEFAULT d
+     * / DROP DEFAULT}. The property not named by the action stays unknown instead of being reset.
+     */
+    private DdlAction alterColumnAction(String tableRef, String rawColumn, String rest) {
+        DdlAction action = newAction("MODIFY_COLUMN", tableRef);
+        action.column = stripIdent(rawColumn);
+        String upper = rest.toUpperCase(Locale.ROOT);
+        if (upper.startsWith("SET DATA TYPE ")) {
+            putDefinition(action, rest.substring("SET DATA TYPE ".length()).strip());
+        } else if (upper.startsWith("TYPE ")) {
+            putDefinition(action, rest.substring("TYPE ".length()).strip());
+        } else if (upper.matches("(?s)SET\\s+NOT\\s+NULL")) {
+            action.nullable = "false";
+        } else if (upper.matches("(?s)DROP\\s+NOT\\s+NULL")) {
+            action.nullable = "true";
+        } else if (upper.startsWith("SET DEFAULT ")) {
+            action.defaultValue = rest.substring("SET DEFAULT ".length()).strip();
+        } else if (upper.matches("(?s)DROP\\s+DEFAULT")) {
+            // The empty string is "no default", which is a real change; null means "not stated".
+            action.defaultValue = "";
+        } else {
+            putDefinition(action, alterDefinition(rest));
+        }
+        return action;
+    }
+
+    /** One action, as written to {@code ddlActions}: the 8 fields are always present. */
+    private static List<Map<String, Object>> actionJson(List<DdlAction> actions) {
+        List<Map<String, Object>> out = new ArrayList<>(actions.size());
+        for (DdlAction action : actions) {
+            Map<String, Object> item = new LinkedHashMap<>();
+            item.put("kind", action.kind);
+            item.put("table", action.table);
+            item.put("column", action.column);
+            item.put("type", action.type);
+            item.put("nullable", action.nullable);
+            item.put("default", action.defaultValue);
+            item.put("schema", action.schema);
+            item.put("renamedTo", action.renamedTo);
+            out.add(item);
+        }
+        return out;
+    }
+
+    private DdlAction newAction(String kind, String rawTable) {
+        DdlAction action = new DdlAction();
+        action.kind = kind;
+        action.rawTable = rawTable == null ? "" : rawTable.strip();
+        action.table = normalizeTable(action.rawTable);
+        String schema = schemaOf(action.rawTable);
+        action.schema = schema == null ? "" : schema;
+        return action;
+    }
+
+    /** Copies type / nullability / default out of a column definition clause. */
+    private void putDefinition(DdlAction action, String definition) {
+        String def = definition == null ? "" : definition.strip();
+        if (def.isEmpty()) {
+            return;
+        }
+        String type = typeOf(def);
+        if (!type.isBlank()) {
+            action.type = type;
+        }
+        Boolean nullable = nullableOf(def);
+        // A column the database fills itself - MySQL AUTO_INCREMENT, SQL Server IDENTITY, standard
+        // GENERATED ALWAYS AS - may be omitted by an INSERT even when it is NOT NULL. Reporting it
+        // as NOT NULL would make the required-column rule claim a write-side break no caller hits.
+        if (nullable != null && !(Boolean.FALSE.equals(nullable) && databaseFilled(def))) {
+            action.nullable = nullable.toString();
+        }
+        String defaultValue = defaultValueOf(def);
+        if (defaultValue != null) {
+            action.defaultValue = defaultValue;
+        }
+    }
+
+    /**
+     * True when the database produces the column's value.
+     *
+     * Quoted text and the trailing COMMENT / REFERENCES / CHECK / COLLATE clauses are ignored, so
+     * a default or a comment that merely mentions the word is not mistaken for a generated column.
+     */
+    private boolean databaseFilled(String definition) {
+        StringBuilder stripped = new StringBuilder(definition.length());
+        char quote = 0;
+        for (int i = 0; i < definition.length(); i++) {
+            char c = definition.charAt(i);
+            if (quote != 0) {
+                if (c == '\\') {
+                    i++; // the escaped character cannot close the literal
+                } else if (c == quote) {
+                    quote = 0;
+                }
+                continue;
+            }
+            if (c == '\'' || c == '"' || c == '\u0060') {
+                quote = c;
+                stripped.append(' ');
+                continue;
+            }
+            stripped.append(c);
+        }
+        String text = stripped.toString();
+        Matcher tail = DEFINITION_TAIL.matcher(text);
+        return AUTO_POPULATED.matcher(tail.find() ? text.substring(0, tail.start()) : text).find();
+    }
+
+    /** True when the token after ADD / DROP names an object rather than a column. */
+    private boolean isNonColumnAction(String token) {
+        if (token == null) {
+            return false;
+        }
+        String raw = token.strip();
+        // A quoted identifier is a name by construction, even when it spells a keyword:
+        // ADD COLUMN "index" INT adds a column called index.
+        if (raw.startsWith("\u0060") || raw.startsWith("\"") || raw.startsWith("[")) {
+            return false;
+        }
+        return NON_COLUMN_DDL.contains(stripIdent(raw).toUpperCase(Locale.ROOT));
     }
 
     /** PostgreSQL/Oracle spell a type change as ALTER COLUMN c TYPE <type>; keep the type only. */
@@ -523,15 +721,6 @@ public class SqlAnalyzer {
             return def.substring(5).strip();
         }
         return def;
-    }
-
-    /** True for ADD INDEX / ADD CONSTRAINT / DROP KEY ...: a DDL action, but not a column. */
-    private boolean isNonColumnDefinition(String definition) {
-        if (definition == null || definition.isBlank()) {
-            return false;
-        }
-        String first = firstToken(definition.strip()).toUpperCase(Locale.ROOT);
-        return NON_COLUMN_DDL.contains(first);
     }
 
     /** Records the shape of a statement that field-level matching has to treat as a blind spot. */
@@ -547,22 +736,6 @@ public class SqlAnalyzer {
         }
     }
 
-    private void putDefinitionMeta(Sym sym, String definition) {
-        String def = definition == null ? "" : definition.strip();
-        String type = typeOf(def);
-        if (!type.isBlank()) {
-            sym.meta.put("ddlType", type);
-        }
-        Boolean nullable = nullableOf(def);
-        if (nullable != null) {
-            sym.meta.put("ddlNullable", nullable.toString());
-        }
-        String defaultValue = defaultValueOf(def);
-        if (defaultValue != null) {
-            sym.meta.put("ddlDefault", defaultValue);
-        }
-    }
-
     private void putSchemaMeta(Sym sym, String tableRef) {
         String schema = schemaOf(tableRef);
         if (schema != null) {
@@ -571,99 +744,127 @@ public class SqlAnalyzer {
     }
 
     /**
-     * Applies CREATE / ALTER statements to the schema snapshot of this revision.
+     * Applies one DDL statement to the schema snapshot of this revision, action by action.
      *
-     * Only the parts needed for compatibility decisions are kept: type, nullability and default.
-     * The snapshot is a static approximation, not a database: it lets a MODIFY be compared with the
-     * column it is modifying, and lets a widened column be recognised instead of reported as a break.
+     * Every action of a multi-action ALTER is applied in statement order, mirroring the database:
+     * {@code ADD a, DROP b} leaves both effects behind, and a rename moves the column's shape
+     * instead of losing it. Only the parts needed for compatibility decisions are kept: type,
+     * nullability and default. The snapshot is a static approximation, not a database: it lets a
+     * MODIFY be compared with the column it is modifying, and lets a widened column be recognised
+     * instead of reported as a break.
      */
-    private void applySchema(String sqlText) {
-        sqlText = sqlText.strip();
+    private void applySchema(String sqlText, List<DdlAction> actions) {
+        String sql = sqlText == null ? "" : sqlText.strip();
         // DDL only counts at the start of a statement. A string literal such as
         // INSERT ... VALUES ('create table fake (x int)') must not pollute the schema snapshot.
-        String upper = sqlText.toUpperCase(Locale.ROOT);
-        if (!upper.startsWith("CREATE TABLE") && !upper.startsWith("ALTER TABLE")
-                && !upper.startsWith("DROP TABLE")) {
-            return;
-        }
-        Matcher rename = ALTER_RENAME_COLUMN.matcher(sqlText);
-        if (rename.find()) {
-            String oldKey = columnKey(rename.group(1), rename.group(2));
-            String newKey = columnKey(rename.group(1), rename.group(3));
-            String type = index.columnTypes.remove(oldKey);
-            String nullable = index.columnNullability.remove(oldKey);
-            String defaultValue = index.columnDefaults.remove(oldKey);
-            if (type != null) {
-                index.columnTypes.put(newKey, type);
-            }
-            if (nullable != null) {
-                index.columnNullability.put(newKey, nullable);
-            }
-            if (defaultValue != null) {
-                index.columnDefaults.put(newKey, defaultValue);
-            }
-            return;
-        }
-        Matcher setNotNull = ALTER_SET_NOT_NULL.matcher(sqlText);
-        Matcher dropNotNull = ALTER_DROP_NOT_NULL.matcher(sqlText);
-        Matcher setDefault = ALTER_SET_DEFAULT.matcher(sqlText);
-        Matcher dropDefault = ALTER_DROP_DEFAULT.matcher(sqlText);
-        if (setNotNull.find()) {
-            index.columnNullability.put(columnKey(setNotNull.group(1), setNotNull.group(2)), "false");
-            return;
-        }
-        if (dropNotNull.find()) {
-            index.columnNullability.put(columnKey(dropNotNull.group(1), dropNotNull.group(2)), "true");
-            return;
-        }
-        if (setDefault.find()) {
-            index.columnDefaults.put(columnKey(setDefault.group(1), setDefault.group(2)), setDefault.group(3).strip());
-            return;
-        }
-        if (dropDefault.find()) {
-            index.columnDefaults.remove(columnKey(dropDefault.group(1), dropDefault.group(2)));
-            return;
-        }
-        Matcher create = CREATE_TABLE_HEAD.matcher(sqlText);
+        Matcher create = CREATE_TABLE_HEAD.matcher(sql);
         if (create.lookingAt()) {
             String table = normalizeTable(create.group(1));
-            String body = parenthesesBody(sqlText, create.end() - 1);
-            for (ColumnDef def : parseColumnDefs(body)) {
+            for (ColumnDef def : parseColumnDefs(parenthesesBody(sql, create.end() - 1))) {
                 remember(table, def);
             }
             return;
         }
-        Matcher add = ALTER_ADD_DEF.matcher(sqlText);
-        if (add.find()) {
-            if (!isNonColumnDefinition(add.group(2)) && !isNonColumnDefinition(add.group(3))) {
-                ColumnDef def = parseColumnDef(add.group(2), alterDefinition(add.group(3)));
-                if (def != null) {
-                    remember(normalizeTable(add.group(1)), def);
+        for (DdlAction action : actions) {
+            switch (action.kind) {
+                case "ADD_COLUMN", "MODIFY_COLUMN" -> applyColumnShape(action);
+                case "DROP_COLUMN" -> dropColumn(action);
+                case "RENAME_COLUMN" -> renameColumn(action);
+                case "RENAME_TABLE" -> renameTable(action.table, action.renamedTo);
+                default -> {
+                    // CREATE TABLE is handled above; DROP_TABLE adds nothing to the snapshot,
+                    // exactly as before this change.
                 }
             }
-            return;
-        }
-        Matcher modify = ALTER_MODIFY_DEF.matcher(sqlText);
-        if (modify.find()) {
-            if (!isNonColumnDefinition(modify.group(2)) && !isNonColumnDefinition(modify.group(3))) {
-                ColumnDef def = parseColumnDef(modify.group(2), alterDefinition(modify.group(3)));
-                if (def != null) {
-                    remember(normalizeTable(modify.group(1)), def);
-                }
-            }
-            return;
-        }
-        Matcher drop = ALTER_DROP.matcher(sqlText);
-        if (drop.find() && !isNonColumnDefinition(drop.group(2))) {
-            String key = columnKey(drop.group(1), drop.group(2));
-            index.columnTypes.remove(key);
-            index.columnNullability.remove(key);
-            index.columnDefaults.remove(key);
         }
     }
 
-    private String columnKey(String tableRef, String column) {
-        return normalizeTable(tableRef) + "." + stripIdent(column).toLowerCase(Locale.ROOT);
+    /** Applies an ADD / MODIFY definition to the snapshot the same way a CREATE TABLE column does. */
+    private void applyColumnShape(DdlAction action) {
+        String column = action.column.toLowerCase(Locale.ROOT);
+        if (action.type != null && !action.type.isBlank()) {
+            remember(action.table, columnDef(column, action));
+            return;
+        }
+        // ALTER COLUMN ... SET/DROP NOT NULL | DEFAULT states one property and leaves the rest
+        // alone: resetting the others would invent a schema change the DDL never stated.
+        String key = action.table + "." + column;
+        if (action.nullable != null) {
+            index.columnNullability.put(key, action.nullable);
+        }
+        if (action.defaultValue != null) {
+            if (action.defaultValue.isEmpty()) {
+                index.columnDefaults.remove(key);
+            } else {
+                index.columnDefaults.put(key, action.defaultValue);
+            }
+        }
+    }
+
+    private ColumnDef columnDef(String column, DdlAction action) {
+        ColumnDef def = new ColumnDef();
+        def.name = column;
+        def.type = action.type;
+        def.nullable = "true".equalsIgnoreCase(action.nullable) ? Boolean.TRUE
+                : "false".equalsIgnoreCase(action.nullable) ? Boolean.FALSE : null;
+        def.defaultValue = action.defaultValue;
+        return def;
+    }
+
+    private void dropColumn(DdlAction action) {
+        String key = action.table + "." + action.column.toLowerCase(Locale.ROOT);
+        index.columnTypes.remove(key);
+        index.columnNullability.remove(key);
+        index.columnDefaults.remove(key);
+    }
+
+    /** A rename keeps the column's shape: dropping it would turn every reader into a false alarm. */
+    private void renameColumn(DdlAction action) {
+        String oldKey = action.table + "." + action.column.toLowerCase(Locale.ROOT);
+        String newKey = action.table + "." + action.renamedTo.toLowerCase(Locale.ROOT);
+        moveEntry(index.columnTypes, oldKey, newKey);
+        moveEntry(index.columnNullability, oldKey, newKey);
+        moveEntry(index.columnDefaults, oldKey, newKey);
+        // MySQL CHANGE COLUMN carries a full new definition next to the new name.
+        if (action.type != null && !action.type.isBlank()) {
+            remember(action.table, columnDef(action.renamedTo.toLowerCase(Locale.ROOT), action));
+        }
+    }
+
+    /** A table rename moves the whole shape: the new name is the same table, not a new one. */
+    private void renameTable(String oldTable, String newTable) {
+        if (oldTable.isEmpty() || newTable.isEmpty() || oldTable.equals(newTable)) {
+            return;
+        }
+        moveTablePrefix(index.columnTypes, oldTable, newTable);
+        moveTablePrefix(index.columnNullability, oldTable, newTable);
+        moveTablePrefix(index.columnDefaults, oldTable, newTable);
+    }
+
+    private void moveTablePrefix(Map<String, String> columns, String oldTable, String newTable) {
+        String prefix = oldTable + ".";
+        List<String> keys = new ArrayList<>();
+        for (String key : columns.keySet()) {
+            if (key.startsWith(prefix)) {
+                keys.add(key);
+            }
+        }
+        for (String key : keys) {
+            String value = columns.remove(key);
+            if (value != null) {
+                columns.put(newTable + "." + key.substring(prefix.length()), value);
+            }
+        }
+    }
+
+    private void moveEntry(Map<String, String> columns, String oldKey, String newKey) {
+        if (oldKey.equals(newKey)) {
+            return;
+        }
+        String value = columns.remove(oldKey);
+        if (value != null) {
+            columns.put(newKey, value);
+        }
     }
 
     private void remember(String table, ColumnDef def) {
@@ -762,13 +963,39 @@ public class SqlAnalyzer {
         return value.isEmpty() ? null : value;
     }
 
+    /**
+     * Splits on commas that are inside neither a parenthesis nor a quoted string.
+     *
+     * A definition such as {@code DEFAULT 'a,b'} carries a comma that must stay inside its action,
+     * and the same scanner splits the column list of {@code CREATE TABLE t (...)}.
+     */
     private List<String> splitTopLevel(String body) {
         List<String> out = new ArrayList<>();
         int depth = 0;
         int start = 0;
+        boolean singleQuote = false;
+        boolean doubleQuote = false;
         for (int i = 0; i < body.length(); i++) {
             char c = body.charAt(i);
-            if (c == '(') {
+            if (singleQuote) {
+                if (c == '\\') {
+                    i++; // the escaped character cannot close the string
+                } else if (c == '\'') {
+                    singleQuote = false;
+                }
+                continue;
+            }
+            if (doubleQuote) {
+                if (c == '"') {
+                    doubleQuote = false;
+                }
+                continue;
+            }
+            if (c == '\'') {
+                singleQuote = true;
+            } else if (c == '"') {
+                doubleQuote = true;
+            } else if (c == '(') {
                 depth++;
             } else if (c == ')') {
                 depth--;
@@ -855,6 +1082,27 @@ public class SqlAnalyzer {
         String type;
         Boolean nullable;
         String defaultValue;
+    }
+
+    /**
+     * One action of a DDL statement, in statement order, as written to {@code ddlActions}.
+     *
+     * {@code column} is empty for a table-level action, {@code type}/{@code nullable}/{@code default}
+     * are null when the statement does not state them, and {@code defaultValue} is the empty string
+     * for {@code DROP DEFAULT} (a stated removal) as opposed to null (not stated at all).
+     */
+    private static final class DdlAction {
+        String kind;
+        /** Normalised table name without schema: the snapshot key. */
+        String table;
+        /** The table reference as written, for the legacy {@code ddlTable} key. */
+        String rawTable;
+        String column = "";
+        String type;
+        String nullable;
+        String defaultValue;
+        String schema = "";
+        String renamedTo = "";
     }
 
     // ---------------------------------------------------------------- linking

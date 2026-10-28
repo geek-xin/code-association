@@ -77,7 +77,8 @@ type：`feat` / `fix` / `docs` / `refactor` / `test` / `build` / `chore`
 
 1. 复现步骤（代码源类型、分析模式、是否选了 peer）
 2. 期望结果与实际结果
-3. 相关日志片段（`code-association.log`）
+3. 相关日志片段（`logs/code-association.log`，重要节点是 `event=...` 结构化行；
+   目录、事件目录与 grep 配方见 [日志规范](docs/wiki/日志规范.md)）
 4. 如果涉及解析失败，附上 `blindSpots` 内容
 
 ## 发布流程（维护者）

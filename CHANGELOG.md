@@ -2,6 +2,91 @@
 
 遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [未发布]
+
+### 新增
+
+- **日志落盘到独立目录，保留 7 天。** 此前只有 Spring Boot 默认的"一个文件一直追加"：
+  没有滚动、没有保留期，运维一个月后只会得到一个删不掉又不敢删的巨文件。现在由
+  `logback-spring.xml` 落实三件事——按天滚动（单文件超过 50MB 再切）、只留 7 天
+  （`maxHistory=7`，`cleanHistoryOnStart=true` 让"停了一周再启动"也立刻清掉过期归档）、
+  放进独立目录。
+  - 目录由 `code-association.log-dir` 决定，默认 `./logs`，环境变量 `LOG_DIR` 可覆盖（容器挂日志卷时用它）。
+    它刻意与数据目录 `.code-association` 分开：数据目录丢了要重新分析，日志目录随时可以清空，
+    两者的备份与清理节奏不同。
+  - 主日志 `logs/code-association.log` 是 INFO 及以上的完整时间线；ERROR 另有一份
+    `logs/code-association-error.log`，排障时先看它，不用在几万行 INFO 里翻。归档在
+    `logs/archive/*.log.gz`，主日志上限 500MB、错误日志 200MB，上限先于时间生效。
+  - 写盘走 `AsyncAppender`（主日志队列 2048、错误日志 512，`discardingThreshold=0`）：
+    分析线程不为日志 IO 停顿，队列满时阻塞而不是丢日志——诊断日志丢一条，事后就可能少一个关键节点。
+    两份文件各有一个异步器，因为 `AsyncAppender` 只接受一个 `appender-ref`，把两份挂在同一个
+    异步器上时第二个会被静默忽略（错误日志会变成永远空文件）。
+- **重要节点改成结构化事件行。** 以前只有零散的自然语言日志，"某次分析走到哪一步、每步花了多久"
+  只能靠读代码猜。现在开始 / 结束 / 结果 / 计数这些会被反复查询的节点统一写成
+  `event=analysis.done analysisId=42 source=order-service status=DONE durationMs=8421 high=1 medium=3 low=2`：
+  事件名小写点分且稳定，字段 camelCase，每条带定位 id（`analysisId` / `sourceId` / `peerId` / `trigger`）
+  与该节点的 `durationMs`。新增 `LogEvents` 负责渲染（`null` → `-`、空串 → `""`、
+  含空格 / 引号 / 等号的值加引号转义、单值超 200 字符截断），这样
+  `grep 'event=analysis.done'` 与按空白切字段都成立，自然语言只留给解释细节。
+  - 覆盖分析链路（`analysis.submit` → `analysis.start` → `analysis.prepare` / `analysis.diff` /
+    `analysis.detect` → 每个对比程序一行 `analysis.peer` → `analysis.done` 或 `analysis.failed`）、
+    定时扫描（`scan.start` / `scan.program` / `scan.done`）、代码源增删改与导入导出、
+    版本检查与更新、AI 配置与连接测试、进程启停（`app.start` / `app.stop`）。
+  - 默认 INFO；`analysis.index` / `index.done` / `scan.program` 是 DEBUG——它们每个程序都写一行，
+    只在排查"为什么没扫这个程序""索引里为什么没有这个类"时才打开；阶段推进的
+    `analysis.stage` 同样是 DEBUG，只在阶段完成或跳过时写一行。
+- **进程原始输出也收进 `logs/`。** `start.sh` / `start.ps1` 的默认输出文件从
+  `./code-association.log` 改为 `./logs/console.log`（Windows 的 stderr 为 `./logs/console.err.log`）。
+  它是每次启动截断的原始 stdout/stderr 捕获，装的是 logback 初始化之前就失败的报错与 JVM 崩溃输出——
+  这些以前散落在终端里，服务以隐藏窗口 / 后台方式启动时直接丢失。
+- **测试不落盘。** `src/test/resources/logback-test.xml` 只写控制台，跑测试不会污染 `logs/`，
+  也不会让 CI 因为日志文件残留而失败。
+
+### 修复
+
+- **一条 `ALTER TABLE` 里的多个动作不再只报第一个。** 以前每种动作只抓第一个：
+  `ADD a INT, ADD b INT` 只看得到 `a`，`ADD a, DROP b` 甚至把 `ADD` 的类型留在 `DROP` 的记录里。
+  现在按顶层逗号拆出全部动作（括号 / 字符串内的逗号不拆），每个动作记
+  `kind / table / column / type / nullable / default / schema / renamedTo`；变更检测按
+  `kind|table|column` 对齐两侧动作，每个新增、修改、移除的动作各生成一条 `DDL_CHANGED`——
+  加列、删列、改类型对读写方的后果不同，不能共用一条结论。语句级旧字段仍保留第一个动作，
+  旧索引仍可读、单动作记录的摘要与风险种子不变（只多了 `oldDefault` / `newDefault`）；
+  `ADD INDEX` / `ADD CONSTRAINT` / `ENGINE=` 等非列动作被忽略，不会猜成列。
+- **表重命名按旧表名的表级契约报告。** `ALTER TABLE orders RENAME TO orders_archive`
+  （含顶层 `RENAME TABLE ... TO ...`）以前只会被当成一条普通 SQL 变更、不产生表级契约；
+  现在生成 `RENAME_TABLE` 记录，
+  契约写旧表名 `orders`、风险种子 0.90，对方读、写、映射旧表的代码都会命中。新表名刻意不产生
+  候选：它是这次改名才出现的，不可能已经是对方的依赖，报它只会把同一次改名算两遍。
+- **列重命名不再被额外算成一次「不可观察加列」。** 逐动作记录只报旧列名消失
+  （`DROP` 语义 + `renamedTo`），但快照 diff 按列名集合比较，此前还会把新列名再记成一条
+  「新增列」并计入「对对方不可观察」。现在快照 ADD 分支会跳过「重命名目标」的列，
+  一次列重命名只留一条记录，也不再产生那条假计数。
+- **`NOT NULL` 且无默认值的加列 / 可空性收窄开始命中写入方。** 对方一条
+  `INSERT INTO orders (id) VALUES (?)` 省略了新增的必填列，MySQL 严格模式、PostgreSQL、Oracle
+  都会拒绝——这是真实不兼容，不该只算盲区。规则只命中完整的 `INSERT`（非动态 SQL）且列清单里
+  没有该列的语句；`UPDATE` / `DELETE` 不命中，`SELECT *` 与动态 SQL 仍计入字段盲区。
+  加列的风险种子从 0.40 提到 0.70 并在摘要里说明「写入方需补列」；可空、带默认值，或列由数据库
+  自动填充（`AUTO_INCREMENT` / `GENERATED` / `IDENTITY`）时都不算必填。
+- **报告新增「必填列变更」计数。** 这类变更不再同时计入「对对方不可观察」（否则同一件事既说
+  「对方看不见」又说「对方写入会失败」）；报告给出计数、后果说明与人工确认方式
+  （对方所有插入语句都要补齐该字段）。
+
+### 文档
+
+- 新增 [日志规范](docs/wiki/日志规范.md)：四份日志文件的分工（主日志 / 错误日志 / 归档 / 进程输出）、
+  保留策略（按天 + 50MB 滚动、7 天、总量上限、启动时清理）、行格式与线程名的作用、
+  全部事件的事件名 / 级别 / 关键字段、可直接复制的 grep 配方、DEBUG 开关与隐私边界。
+  它与 [故障排查](docs/wiki/故障排查.md) 分工明确：前者讲"有什么、怎么看"，后者讲"出了什么症状怎么修"。
+- 更新 README 的 2.1 / 2.2 节与「数据与存储」章节、CONTRIBUTING 的「报告问题」清单、
+  [快速上手](docs/wiki/快速上手.md) 与 [故障排查](docs/wiki/故障排查.md) 的日志路径与排障命令；
+  `docs/index.md` 与两处 wiki 索引都加入了新页面入口。
+- `start.sh` / `start.ps1` 的注释与启动提示区分「应用日志」与「进程输出」，
+  避免把 `logs/console.log` 当成应用日志来查——它没有历史，也不参与滚动与保留。
+- 更新 [数据库影响判断](docs/wiki/数据库影响判断.md)：一条 `ALTER` 多动作按动作报告、表重命名按
+  旧表名的表级契约、`NOT NULL` 无默认值的写方规则与自动填充列边界、盲区不重复计数、报告计数口径，
+  并从「已知限制」删掉已解决的多动作 `ALTER`；同步 [契约匹配详解](docs/wiki/契约匹配详解.md)、
+  [变更识别规则](docs/wiki/变更识别规则.md) 与 README 的数据库能力段。
+
 ## [0.6.1] - 2026-10-28
 
 ### 修复

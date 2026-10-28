@@ -991,6 +991,320 @@ class PeerImpactTest {
                 "the peer reads order_item.remark, which this change did not touch: " + describe(result));
     }
 
+    // ---------------------------------------- required columns and renamed tables
+    //
+    // A NOT NULL column without a default is not invisible: any INSERT that omits it is rejected by
+    // the database, so it must be judged against the peer's inserts instead of only being counted
+    // as a blind spot. The cases below build the ChangeRecord directly, because they describe the
+    // judging rule; the detector that produces the record has its own end-to-end coverage.
+
+    private static final String SHARED_DB = "jdbc:mysql://db:3306/order_db";
+
+    /** The changed program: a pom plus a datasource, so both sides share one database identity. */
+    private static CodeIndex changedProgram(Path root) throws IOException {
+        write(root, "pom.xml", WRITER_POM);
+        write(root, "src/main/resources/application.yml", datasource(SHARED_DB));
+        return index(root);
+    }
+
+    /** The peer program: one mapper holding the given SQL statements, tagged by their first word. */
+    private static CodeIndex peerWithSql(Path root, String... statements) throws IOException {
+        write(root, "pom.xml", "<project><modelVersion>4.0.0</modelVersion>"
+                + "<groupId>com.example</groupId><artifactId>other-service</artifactId><version>1.0</version></project>");
+        write(root, "src/main/resources/application.yml", datasource(SHARED_DB));
+        StringBuilder mapper = new StringBuilder("<mapper namespace=\"com.example.other.OtherMapper\">");
+        int index = 0;
+        for (String statement : statements) {
+            String lower = statement.strip().toLowerCase(java.util.Locale.ROOT);
+            String tag = lower.startsWith("insert") ? "insert"
+                    : lower.startsWith("update") ? "update"
+                    : lower.startsWith("delete") ? "delete" : "select";
+            mapper.append('<').append(tag).append(" id=\"statement").append(index++).append("\">")
+                    .append(statement)
+                    .append("</").append(tag).append('>');
+        }
+        mapper.append("</mapper>");
+        write(root, "src/main/resources/mapper/OtherMapper.xml", mapper.toString());
+        return index(root);
+    }
+
+    /** A DDL change record, built directly so the case describes the rule rather than the detector. */
+    private static ChangeRecord ddlRecord(String kind, String table, String column) {
+        ChangeRecord cr = new ChangeRecord();
+        cr.id = 1;
+        cr.changeType = ChangeDetector.DDL_CHANGED;
+        cr.symbolKey = "sql:V1__orders.sql#" + kind + "." + table + "." + column;
+        cr.qualifiedName = "V1__orders.sql";
+        cr.filePath = "src/main/resources/db/migration/V1__orders.sql";
+        cr.riskSeed = 0.8;
+        cr.tags.add("DATA");
+        cr.tags.add("CONTRACT");
+        cr.extra.put("ddl", kind);
+        cr.extra.put("table", table);
+        cr.extra.put("column", column);
+        cr.extra.put("ddlSchema", "");
+        return cr;
+    }
+
+    private static ChangeRecord addedColumnRecord(String table, String column, String nullable, String def) {
+        ChangeRecord cr = ddlRecord("ADD_COLUMN", table, column);
+        cr.extra.put("newType", "VARCHAR(64)");
+        cr.extra.put("newNullable", nullable);
+        cr.extra.put("newDefault", def);
+        cr.extra.put("schemaChange", "");
+        return cr;
+    }
+
+    private static ChangeRecord madeRequiredRecord(String table, String column) {
+        ChangeRecord cr = ddlRecord("MODIFY_COLUMN", table, column);
+        cr.extra.put("oldType", "VARCHAR(64)");
+        cr.extra.put("newType", "VARCHAR(64)");
+        cr.extra.put("oldNullable", "true");
+        cr.extra.put("newNullable", "false");
+        cr.extra.put("newDefault", "");
+        cr.extra.put("schemaChange", "NULLABILITY");
+        return cr;
+    }
+
+    private static PeerImpact analyzeRecords(List<ChangeRecord> records, CodeIndex own, CodeIndex peer) {
+        PeerImpact info = new PeerImpact();
+        info.peerSourceName = "other-service";
+        return new PeerImpactEngine(PROPS).analyze(records, own, peer, info);
+    }
+
+    /**
+     * The headline rule of this feature: a NOT NULL column with no default rejects the INSERT that
+     * omits it, so the peer insert is an impact - not merely a blind spot to review by hand.
+     */
+    @Test
+    void addingARequiredColumnReachesTheInsertThatOmitsIt(@TempDir Path tmp) throws IOException {
+        ChangeRecord change = addedColumnRecord("orders", "remark", "false", "");
+        CodeIndex peer = peerWithSql(tmp.resolve("peer"),
+                "INSERT INTO orders (id, status) VALUES (#{id}, #{status})");
+
+        PeerImpact result = analyzeRecords(List.of(change), changedProgram(tmp.resolve("own")), peer);
+
+        PeerImpact.ContractMatch match = result.matches.stream()
+                .filter(m -> "DB_COLUMN".equals(m.kind) && "orders.remark".equals(m.contract))
+                .findFirst()
+                .orElseThrow(() -> new AssertionError(
+                        "an INSERT that omits a required column is rejected by the database: " + describe(result)));
+        assertEquals("writer", match.usage,
+                "the rejecting statement is a writer, not a reader: " + describe(result));
+        assertEquals("db:table:orders", match.contractSymbolKey,
+                "a statement that names no column can only be matched through the table: " + describe(result));
+        assertEquals(0.85, match.confidence, 0.0001,
+                "both programs declare the same database, so the table match keeps its full confidence");
+        assertEquals(1, result.dbRequiredColumnChanges,
+                "the required-column change must be counted once: " + result.dbRequiredColumnExamples);
+        assertTrue(result.dbRequiredColumnExamples.stream().anyMatch(e -> e.startsWith("orders.remark")),
+                "the example must name the column an INSERT has to provide: " + result.dbRequiredColumnExamples);
+        assertEquals(0, result.dbNonObservableChanges,
+                "a required column is observable through the rejected INSERT, so it must not also be counted invisible");
+    }
+
+    /** An INSERT that already names the column satisfies the new constraint: no impact, no blind spot. */
+    @Test
+    void insertThatNamesTheRequiredColumnIsNotAffected(@TempDir Path tmp) throws IOException {
+        ChangeRecord change = addedColumnRecord("orders", "remark", "false", "");
+        CodeIndex peer = peerWithSql(tmp.resolve("peer"),
+                "INSERT INTO orders (id, status, remark) VALUES (#{id}, #{status}, #{remark})");
+
+        PeerImpact result = analyzeRecords(List.of(change), changedProgram(tmp.resolve("own")), peer);
+
+        assertTrue(result.matches.isEmpty(),
+                "an INSERT that provides the column cannot be rejected by it: " + describe(result));
+        assertEquals(0, result.unparsedColumnStatements,
+                "a statement that names its columns is matched or excluded, never a blind spot");
+    }
+
+    /** UPDATE / DELETE never have to provide the column, so the new constraint cannot break them. */
+    @Test
+    void updateAndDeleteAreNotRejectedByARequiredColumn(@TempDir Path tmp) throws IOException {
+        ChangeRecord change = addedColumnRecord("orders", "remark", "false", "");
+        CodeIndex peer = peerWithSql(tmp.resolve("peer"),
+                "UPDATE orders SET status = #{status} WHERE id = #{id}",
+                "DELETE FROM orders WHERE id = #{id}");
+
+        PeerImpact result = analyzeRecords(List.of(change), changedProgram(tmp.resolve("own")), peer);
+
+        assertTrue(result.matches.isEmpty(),
+                "UPDATE and DELETE do not insert a row, so omitting the column is not an error: "
+                        + describe(result));
+    }
+
+    /**
+     * A nullable column - and a NOT NULL column with a default - can still be left out of an INSERT.
+     * They stay invisible changes, counted rather than reported as a break.
+     */
+    @Test
+    void nullableOrDefaultedAddedColumnStaysNonObservable(@TempDir Path tmp) throws IOException {
+        CodeIndex own = changedProgram(tmp.resolve("own"));
+        CodeIndex peer = peerWithSql(tmp.resolve("peer"),
+                "INSERT INTO orders (id, status) VALUES (#{id}, #{status})");
+
+        PeerImpact nullable = analyzeRecords(List.of(addedColumnRecord("orders", "remark", "", "")), own, peer);
+        assertTrue(nullable.matches.isEmpty(),
+                "a nullable column accepts an INSERT that omits it: " + describe(nullable));
+        assertEquals(1, nullable.dbNonObservableChanges,
+                "the nullable addition must still be counted as invisible, not dropped");
+        assertEquals(0, nullable.dbRequiredColumnChanges,
+                "an unspecified nullability is not evidence of a required column");
+
+        PeerImpact defaulted = analyzeRecords(
+                List.of(addedColumnRecord("orders", "remark", "false", "'note'")), own, peer);
+        assertTrue(defaulted.matches.isEmpty(),
+                "a default lets the database fill the column in, so the INSERT still works: "
+                        + describe(defaulted));
+        assertEquals(1, defaulted.dbNonObservableChanges,
+                "the defaulted addition must still be counted as invisible, not dropped");
+        assertEquals(0, defaulted.dbRequiredColumnChanges,
+                "a NOT NULL column with a default is not a required column");
+    }
+
+    /**
+     * An INSERT without a column list gives the new column nowhere to go. It is matched, so it must
+     * not be counted again as a blind spot - the report would otherwise say the same statement both
+     * hit and cannot be judged.
+     */
+    @Test
+    void columnLessInsertIsMatchedRatherThanCountedAsABlindSpot(@TempDir Path tmp) throws IOException {
+        ChangeRecord change = addedColumnRecord("orders", "remark", "false", "");
+        CodeIndex peer = peerWithSql(tmp.resolve("peer"), "INSERT INTO orders VALUES (#{id}, #{status})");
+
+        PeerImpact result = analyzeRecords(List.of(change), changedProgram(tmp.resolve("own")), peer);
+
+        assertTrue(result.matches.stream().anyMatch(m -> "DB_COLUMN".equals(m.kind)
+                        && "orders.remark".equals(m.contract) && "writer".equals(m.usage)),
+                "an INSERT that names no column cannot provide the new required one: " + describe(result));
+        assertEquals(0, result.unparsedColumnStatements,
+                "the matched statement must not be counted as a blind spot too: " + result.unparsedColumnFiles);
+    }
+
+    /**
+     * Dynamic SQL has no reliable column list, so it must not be matched as an omitting INSERT:
+     * the table-level guess would claim a break the analyser cannot prove. It stays a blind spot.
+     */
+    @Test
+    void dynamicInsertStaysABlindSpotInsteadOfAMatch(@TempDir Path tmp) throws IOException {
+        ChangeRecord change = addedColumnRecord("orders", "remark", "false", "");
+        CodeIndex peer = peerWithSql(tmp.resolve("peer"),
+                "INSERT INTO orders <include refid=\"cols\"/> VALUES (#{id})");
+
+        PeerImpact result = analyzeRecords(List.of(change), changedProgram(tmp.resolve("own")), peer);
+
+        assertTrue(result.matches.isEmpty(),
+                "an unresolved include means the column list is unknown, not that the column is missing: "
+                        + describe(result));
+        assertEquals(1, result.unparsedColumnStatements,
+                "the unjudgeable statement must be surfaced as a blind spot instead");
+    }
+
+    /** A SELECT * still names no column, so it stays a blind spot rather than a clean result. */
+    @Test
+    void selectStarRemainsABlindSpotForARequiredColumn(@TempDir Path tmp) throws IOException {
+        ChangeRecord change = addedColumnRecord("orders", "remark", "false", "");
+        CodeIndex peer = peerWithSql(tmp.resolve("peer"), "SELECT * FROM orders WHERE id = #{id}");
+
+        PeerImpact result = analyzeRecords(List.of(change), changedProgram(tmp.resolve("own")), peer);
+
+        assertTrue(result.matches.isEmpty(), "SELECT * names no column, so it cannot be matched as a writer");
+        assertEquals(1, result.unparsedColumnStatements,
+                "the read side is still unjudgeable and must be surfaced as a blind spot");
+    }
+
+    /**
+     * Tightening an existing column to NOT NULL is the same rule, and it must coexist with the
+     * column-level writer match: a writer that names the column breaks, and an INSERT that omits it
+     * is rejected - both are real impacts.
+     */
+    @Test
+    void makingAColumnRequiredMatchesTheOmittingInsertAndTheNamingWriter(@TempDir Path tmp) throws IOException {
+        ChangeRecord change = madeRequiredRecord("orders", "remark");
+        CodeIndex peer = peerWithSql(tmp.resolve("peer"),
+                "INSERT INTO orders (id, status) VALUES (#{id}, #{status})",
+                "UPDATE orders SET remark = #{remark} WHERE id = #{id}");
+
+        PeerImpact result = analyzeRecords(List.of(change), changedProgram(tmp.resolve("own")), peer);
+
+        assertTrue(result.matches.stream().anyMatch(m -> "db:table:orders".equals(m.contractSymbolKey)
+                        && "writer".equals(m.usage)),
+                "the INSERT that omits the column is rejected once it is NOT NULL: " + describe(result));
+        assertTrue(result.matches.stream().anyMatch(m -> "db:column:orders.remark".equals(m.contractSymbolKey)),
+                "the existing column-level writer match must survive the new table-level one: "
+                        + describe(result));
+        assertEquals(1, result.dbRequiredColumnChanges, "the tightening is one required-column change");
+    }
+
+    /**
+     * A renamed table leaves no old name behind: every reader and writer of the old name breaks at
+     * once. The new name is not a contract, because this rename is what created it.
+     */
+    @Test
+    void renamingATableReachesReadersAndWritersOfTheOldName(@TempDir Path tmp) throws IOException {
+        ChangeRecord change = ddlRecord("RENAME_TABLE", "orders", "");
+        change.extra.put("renamedToTable", "orders_v2");
+        CodeIndex peer = peerWithSql(tmp.resolve("peer"),
+                "SELECT id, status FROM orders WHERE id = #{id}",
+                "UPDATE orders SET status = #{status} WHERE id = #{id}",
+                "SELECT id FROM orders_v2 WHERE id = #{id}");
+
+        PeerImpact result = analyzeRecords(List.of(change), changedProgram(tmp.resolve("own")), peer);
+
+        PeerImpact.ContractMatch reader = result.matches.stream()
+                .filter(m -> "DB_TABLE".equals(m.kind) && "orders".equals(m.contract) && "reader".equals(m.usage))
+                .findFirst()
+                .orElseThrow(() -> new AssertionError(
+                        "the old table name is what readers still use: " + describe(result)));
+        assertEquals(0.9, reader.confidence, 0.0001,
+                "a rename is a certain break for everything using the old name, not a hint");
+        assertTrue(result.matches.stream().anyMatch(m -> "orders".equals(m.contract) && "writer".equals(m.usage)),
+                "writers of the old table break too: " + describe(result));
+        assertTrue(result.matches.stream().noneMatch(m -> "orders_v2".equals(m.contract)),
+                "the new name cannot already be a dependency, so matching it would be a false positive: "
+                        + describe(result));
+        assertEquals(0, result.dbNonObservableChanges,
+                "a rename is a real break, not an invisible change");
+    }
+
+    /**
+     * The required-column count describes the change list, which every peer is measured against, so
+     * the report must read it back with max() and show one note - not one per compared program.
+     */
+    @Test
+    void requiredColumnCountIsReportedOncePerChangeNotPerPeer(@TempDir Path tmp) throws IOException {
+        ChangeRecord change = addedColumnRecord("orders", "remark", "false", "");
+        CodeIndex own = changedProgram(tmp.resolve("own"));
+        CodeIndex peer = peerWithSql(tmp.resolve("peer"),
+                "INSERT INTO orders (id, status) VALUES (#{id}, #{status})");
+
+        PeerImpact first = analyzeRecords(List.of(change), own, peer);
+        PeerImpact second = analyzeRecords(List.of(change), own, peer);
+        assertEquals(1, first.dbRequiredColumnChanges);
+        assertEquals(1, second.dbRequiredColumnChanges,
+                "each peer is analysed against the same change, so both count it once");
+
+        RevisionPair revisions = new RevisionPair();
+        revisions.note = "user-service";
+        revisions.base = new DirSource(tmp.resolve("own"), "base", PROPS.getMaxFiles());
+        revisions.head = new DirSource(tmp.resolve("own"), "head", PROPS.getMaxFiles());
+        revisions.mode = "GIT_DIFF";
+        revisions.baseRef = "base";
+        revisions.headRef = "head";
+
+        ImpactReport report = new ReportBuilder().build(revisions, own, own,
+                List.of(change), List.of(), Map.of(), List.of(first, second));
+
+        List<String> notes = report.notes.stream()
+                .filter(n -> n.contains("必填"))
+                .toList();
+        assertEquals(1, notes.size(), "the required-column note must not repeat per peer: " + report.notes);
+        assertTrue(notes.get(0).contains("有 1 条表结构变更"),
+                "the count is the change count, not change x peer: " + notes.get(0));
+        assertTrue(notes.get(0).contains("INSERT"),
+                "the note must name the consequence so the reader knows to check the inserts: " + notes.get(0));
+    }
+
     private static String describe(PeerImpact impact) {
         return impact.matches.stream().map(m -> m.kind + ":" + m.contract + ":" + m.usage).toList().toString();
     }

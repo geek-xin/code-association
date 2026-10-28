@@ -96,7 +96,8 @@ PORT=8080 ./start.sh  # 同上，环境变量方式
 ```
 
 `start.sh` 会把进程从当前 shell 完全脱离（PPID=1、独立进程组），关掉终端不会带走服务；
-日志写到 `code-association.log`，PID 写到 `.code-association.pid`。
+应用日志写到 `logs/code-association.log`（按天滚动、保留 7 天），进程原始输出在 `logs/console.log`，
+PID 写到 `.code-association.pid`。日志目录、事件名与排查命令见 [日志规范](docs/wiki/日志规范.md)。
 脱离方式按平台自动选择：Linux 用 `setsid`，macOS 没有 `setsid` 时用 `python3` 双 fork，
 两者都没有则退化为 `nohup` 并提示。同理，健康检查与查监听进程也不硬依赖 `curl` / `lsof`，
 见 [INSTALL.md](INSTALL.md) 的兼容表。
@@ -113,8 +114,9 @@ stop.bat            :: 停止
 
 `start.bat` / `stop.bat` 是薄封装，内部带 `-ExecutionPolicy Bypass` 调用同目录的
 `start.ps1` / `stop.ps1`，所以**不需要修改系统的 PowerShell 执行策略**。
-Windows 上以隐藏窗口后台启动，日志写到 `code-association.log`，
-启动期错误单独写到 `code-association.err.log`。
+Windows 上以隐藏窗口后台启动，进程原始输出写到 `logs/console.log`，
+启动期错误单独写到 `logs/console.err.log`（cmd 不允许两个重定向写同一文件）；
+应用日志与 Linux / macOS 相同，都是 `logs/code-association.log`。
 
 ### 2.3 前台运行（调试用，三平台通用）
 
@@ -283,7 +285,7 @@ impact:
 | `FIELD_TYPE_CHANGED` | 字段类型变化 | 类型 / 序列化影响 |
 | `ENUM_CONSTANT_REMOVED` | 枚举常量缺失 | 编译 + 契约 |
 | `API_CONTRACT_CHANGED` | 同一端点响应类型变化 | 接口契约 → 消费方 |
-| `SQL_CHANGED` / `DDL_CHANGED` | SQL 体或 DDL 语句变化 | 数据影响 → Mapper/Entity |
+| `SQL_CHANGED` / `DDL_CHANGED` | SQL 体或 DDL 语句变化（一条多动作 DDL 按动作拆成多条记录） | 数据影响 → Mapper/Entity |
 | `CONFIG_CHANGED` | 配置键值变化 | 配置影响 → 读取方 |
 | `TOPIC_REMOVED` / `TOPIC_ADDED` | 消息主题缺失 / 新增 | 消息契约 → 生产者、消费者 |
 | `MESSAGE_ROUTE_CHANGED` | Topic、Exchange、Queue、Routing Key 或 Tag 变化 | 投递路径 → 两端代码 |
@@ -461,7 +463,7 @@ C 影响对象重要程度    U 分析不确定性（= 1 - 置信度）
 | 契约 | 对齐方式 |
 |---|---|
 | HTTP 接口 | 按规范化路径模板匹配，调用方写的是具体路径也能对上（`/api/users/42` ↔ `/api/users/{id}`，`"/api/users/" + id` 拼接写法同样识别） |
-| 数据库字段 | 契约单位是 `表.字段`。先确认两侧声明的是同一数据库对象（JDBC URL / 显式 schema），再按「变更可被观察」与「类型兼容」准入：删列 / 收窄命中读写与映射；加列、建表、删除迁移脚本、类型放宽不扩散；写入字段集合变化只命中读方；`SELECT *` 与动态 SQL 计入字段盲区。详见 [数据库影响判断](docs/wiki/数据库影响判断.md) |
+| 数据库字段 | 契约单位是 `表.字段`。先确认两侧声明的是同一数据库对象（JDBC URL / 显式 schema），再按「变更可被观察」与「类型兼容」准入：删列 / 收窄命中读写与映射；表重命名按旧表名的表级契约命中；`NOT NULL` 且无默认值的加列会命中省略该列的 INSERT 写方（自动填充列除外）；加列、建表、删除迁移脚本、类型放宽不扩散；写入字段集合变化只命中读方；一条 `ALTER` 的多个动作逐动作报告；`SELECT *` 与动态 SQL 计入字段盲区。详见 [数据库影响判断](docs/wiki/数据库影响判断.md) |
 | 配置项 | 按 key 匹配，`a.b.c` 的改动也会命中绑定 `a.b` 前缀的代码 |
 | Maven 依赖 | 对方声明了对本程序模块的依赖，即视为编译期契约 |
 | 消息主题 | Kafka / RocketMQ Topic、RabbitMQ Queue 路由按规范化标识匹配 |
@@ -474,7 +476,7 @@ C 影响对象重要程度    U 分析不确定性（= 1 - 置信度）
 
 - 只比较**本次真正改动过**的契约。共享接口没被改动就不算影响，否则结果会退化成一份清单。
 - 对方程序按当前工作区索引；无法读取时只在该条目上给出原因，不会让整次分析失败。
-- 数据库契约还会校验两侧的数据源身份与类型兼容性：同名表在不同库不命中；加列、建表、删除迁移脚本、类型放宽不扩散，只计数并在报告中说明。未知项进入「字段盲区」，不会被当成干净结果。
+- 数据库契约还会校验两侧的数据源身份与类型兼容性：同名表在不同库不命中；表重命名按旧表名命中读写与映射；加列、建表、删除迁移脚本、类型放宽不扩散，只计数并在报告中说明；`NOT NULL` 且无默认值的加列会命中省略该列的 INSERT 写方（自动填充列除外），并单独计数而不是并入「不可观察」。未知项进入「字段盲区」，不会被当成干净结果。
 
 结果展示在**总览**和**影响审核**两页的「对其他程序的影响」卡片里：命中哪些契约、对方哪段代码在用、
 影响在对方内部继续传播到哪里。两个页面都放，是因为审核时同样要判断「这次改动要不要通知另一个团队」。
@@ -672,6 +674,12 @@ SDK、数据库导出或改了扩展名的 jar。超过上限的文件不读取�
 > 不会被 `catch (IOException)` 拦住。仓库里只要有一个这样的文件，**该程序的每一次分析都会失败**，
 > 且错误信息只有 `Object unknown object exceeds 20,971,520 limit`，看不出是哪个文件造成的。
 
+**日志。** 应用日志在 `logs/` 下：`code-association.log`（INFO 及以上，一次运行的完整时间线）、
+`code-association-error.log`（只收 ERROR）、`archive/*.log.gz`（滚动归档，保留 7 天）；
+进程原始输出在 `logs/console.log`。目录由 `code-association.log-dir` 决定（默认 `./logs`，
+环境变量 `LOG_DIR` 可覆盖）。它刻意与数据目录 `.code-association` 分开：数据丢了要重新分析，
+日志随时可以清空。事件名、字段与排查命令见 [日志规范](docs/wiki/日志规范.md)。
+
 ---
 
 ## 6.1 版本检查与自动更新
@@ -742,7 +750,7 @@ export GITHUB_TOKEN=ghp_xxx
   设置页版本卡片上方也有一条同样的进度条，会依次走「下载 → 校验 → 替换 jar → 重启」。
 - 总大小未知时（代理剥掉 `Content-Length`）不编造百分比：进度条走不确定态条纹，只显示已接收字节数。
 - 成功后停留 5 秒再淡出；**失败会留下一条红色横幅，写明原因（`error`）**，不会自动消失——
-  可在设置页重试，或查看 `code-association.log`。
+  可在设置页重试，或查看 `logs/code-association.log` 里 `event=update.download` / `event=update.apply` 那几行。
 - 进度来自轻量的 `GET /api/update/progress`（运行中每 2 秒一次，结束后停止；另有 15 秒一次的
   发现探测，用来察觉页面打开后才开始的后台更新），不反复拉取整个版本列表。
 
@@ -843,6 +851,7 @@ mvn -q -DskipTests package && ./start.sh
 | 动态 SQL（`<if>` 拼接） | 解析静态部分，动态部分进入盲区 |
 | `SELECT *` / 列名无法解析 | 数据库契约按字段匹配，这类语句不命中字段级契约，会计数并标注「字段盲区」 |
 | 数据库身份 | 从 JDBC URL 与 SQL/DDL 的显式 schema 推断；读不到时按未知处理（保留匹配、降低置信度），不连接数据库核实 |
+| 必填列 / 自动填充列 | `NOT NULL` 且无默认值的加列会命中省略该列的 INSERT；`AUTO_INCREMENT` / `GENERATED` / `IDENTITY` 列由数据库补值，不算必填（只识别 `ALTER` 列定义文本，触发器 / 序列等其他机制不识别） |
 | 值语义（如 status 1 → 2） | 写入列集合不变，不产生数据库 delta；当前不检测，属于已知漏报 |
 | 配置中心（Nacos/Apollo） | 仅分析仓库内配置与代码引用 |
 | 跨仓库依赖 | 需分别登记代码源；单次分析在同一仓库内完成 |
@@ -1112,6 +1121,9 @@ mvn -q -DskipTests package
 改动界面时，请先读 [界面规范](docs/wiki/界面规范.md)，改完同步 [界面实现映射](docs/wiki/界面实现映射.md)。
 `UiContractTest` 会校验规范里的关键令牌、类名双向契约、断点、焦点与 reduced-motion、
 首帧防闪脚本是否仍在代码中——它不检查"好不好看"，只保证规范与实现没有走散。
+
+改动日志时，请先读 [日志规范](docs/wiki/日志规范.md)：事件名、字段与级别都在那里定义，
+新增重要节点要同时更新事件目录与故障排查里的 grep 配方。
 
 改动启停脚本时请注意：`start.sh` / `stop.sh` 必须同时能在 Linux 与 macOS 跑，
 Windows 的 `start.ps1` / `stop.ps1` 保持 UTF-8 BOM + CRLF、`start.bat` / `stop.bat` 保持纯 ASCII + CRLF。

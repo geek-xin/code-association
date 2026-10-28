@@ -70,6 +70,11 @@ public class RepositoryPreparer {
         RepoSource source = request.source;
         String type = source.type == null ? "LOCAL_DIR" : source.type.toUpperCase();
         String mode = request.mode == null ? "GIT_DIFF" : request.mode.toUpperCase();
+        // ref 解析是"这次分析到底读了哪个版本"的起点。DEBUG 保留入口参数：事后追问
+        // "为什么基线和预期不一样"时，不必再去猜调用方传了什么。位置不打印（可能带凭据）。
+        log.debug("prepare {} type={} mode={} base={} target={} pr={} commits={}",
+                source.name, type, mode, request.baseRef, request.targetRef, request.pullRequest,
+                request.commits == null ? 0 : request.commits.size());
         if ("WORKTREE_DIFF".equals(mode) && !isRemote(type)) {
             return worktreeDiff(request);
         }
@@ -665,6 +670,10 @@ public class RepositoryPreparer {
             pair.baseRef = Texts.isBlank(request.baseRef) ? (baseId == null ? "" : shortName(repo, baseId)) : request.baseRef;
             pair.headRef = targetRef;
             pair.mode = "GIT_DIFF";
+            // 解析结果本身就是排障对象：同样的 base/target 输入，解析出的 head 不同，报告就完全不同。
+            log.debug("resolved refs of {}: targetRef={} head={} base={}",
+                    request.source.name, targetRef, shortId(headId),
+                    baseId == null ? "empty" : shortId(baseId));
             // A branch/tag comparison is also a commit range; listing it costs one bounded walk and
             // is what tells a reviewer whether "main..HEAD" means one commit or fifty.
             fillCommits(pair, repo, baseId, headId);

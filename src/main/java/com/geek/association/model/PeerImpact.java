@@ -74,6 +74,19 @@ public class PeerImpact {
     public int dbNonObservableChanges;
     /** A few examples behind {@link #dbNonObservableChanges}, capped for display. */
     public List<String> dbNonObservableExamples = new ArrayList<>();
+    /**
+     * Schema changes that made a column required: {@code NOT NULL} and no default.
+     *
+     * An INSERT in the other program that omits such a column is rejected by the database (MySQL
+     * strict mode, PostgreSQL, Oracle), so this is a real incompatibility and not merely a blind
+     * spot. The matched INSERTs are reported as writer impacts; this counter says how many changes
+     * were judged that way, so the report can state the consequence and ask for the dynamic
+     * statements to be confirmed by hand. Counted once per change - every peer is measured against
+     * the same change list - so the report aggregates it with {@code max()} rather than a sum.
+     */
+    public int dbRequiredColumnChanges;
+    /** A few examples behind {@link #dbRequiredColumnChanges}, capped for display. */
+    public List<String> dbRequiredColumnExamples = new ArrayList<>();
     /** Matches kept although one side's database identity is unknown; confidence is lowered. */
     public int dbIdentityUnknownMatches;
 
