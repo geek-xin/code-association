@@ -89,6 +89,16 @@ public class PeerImpact {
     public List<String> dbRequiredColumnExamples = new ArrayList<>();
     /** Matches kept although one side's database identity is unknown; confidence is lowered. */
     public int dbIdentityUnknownMatches;
+    /**
+     * Matches that are only a hint: the peer maps the same column, but the change was a Java
+     * entity-field edit. An entity mapping is not the database schema, so no consumer of the
+     * column is impacted; these matches are counted and explained instead of being turned into
+     * impacts. Without this, the shared column node would propagate to every SQL reader of the
+     * column in the peer - a false positive the report used to show as a HIGH DATA impact.
+     */
+    public int mappingHintMatches;
+    /** A few examples behind {@link #mappingHintMatches}, capped for display. */
+    public List<String> mappingHintExamples = new ArrayList<>();
 
     /**
      * One shared contract: the changed thing on this side, and the code on the peer side that
@@ -118,5 +128,11 @@ public class PeerImpact {
         public double confidence;
         /** How the peer uses it: caller, reader, writer, config consumer, dependency. */
         public String usage;
+        /**
+         * Informational only: the peer maps the same column, but the originating change was a
+         * Java entity-field edit, not a schema change. Such a match is reported as a hint and
+         * must never seed an impact: the peer's own mapping and SQL still see the same column.
+         */
+        public boolean mappingHint;
     }
 }

@@ -92,6 +92,12 @@ public class PeerImpactEngine {
             if (match.contractSymbolKey == null) {
                 continue; // dependency-only match: reported, but there is nothing to traverse
             }
+            if (match.mappingHint) {
+                // An entity-field edit is not a schema change: the peer still sees the same column.
+                // Starting at the column here used to pull every SQL reader/writer of it into the
+                // report as a DATA impact - a false positive that looked exactly like a real one.
+                continue;
+            }
             ChangeRecord cr = new ChangeRecord();
             // Keep the original change id so the peer impact can be joined back to the report's
             // change list. Several contracts may share the same originating change.
@@ -234,8 +240,18 @@ public class PeerImpactEngine {
                 if ("MAPS_COLUMN".equals(relation) && e.confidence > 0) {
                     confidence = Math.min(confidence, e.confidence);
                 }
-                add(out, seen, delta.kind, delta.contract, change, shared.key, e.from, peer, e,
-                        delta.usageOf(relation), confidence);
+                PeerImpact.ContractMatch match = add(out, seen, delta.kind, delta.contract, change,
+                        shared.key, e.from, peer, e, delta.usageOf(relation), confidence);
+                if (match != null && "MAPPING".equals(delta.operation)) {
+                    // The peer maps the same column, but this program only removed/edited a Java
+                    // entity field: the database column still exists and the peer's own mapping
+                    // and SQL are untouched. Keep the match as a low-confidence hint instead of
+                    // letting it seed column-level propagation.
+                    match.mappingHint = true;
+                    peerInfo.mappingHintMatches++;
+                    addExample(peerInfo.mappingHintExamples,
+                            delta.contract + "（对方也映射该列）");
+                }
             }
         }
     }
@@ -1056,12 +1072,12 @@ public class PeerImpactEngine {
         }
     }
 
-    private void add(List<PeerImpact.ContractMatch> out, Set<String> seen, String kind, String contract,
-                     ChangeRecord change, String contractSymbolKey, String peerSymbolKey, CodeIndex peer,
-                     Edge edge, String usage, double confidence) {
+    private PeerImpact.ContractMatch add(List<PeerImpact.ContractMatch> out, Set<String> seen, String kind,
+                     String contract, ChangeRecord change, String contractSymbolKey, String peerSymbolKey,
+                     CodeIndex peer, Edge edge, String usage, double confidence) {
         String dedupe = kind + "|" + contract + "|" + peerSymbolKey;
         if (!seen.add(dedupe)) {
-            return;
+            return null;
         }
         Sym sym = peer.symbol(peerSymbolKey);
         PeerImpact.ContractMatch m = new PeerImpact.ContractMatch();
@@ -1078,5 +1094,6 @@ public class PeerImpactEngine {
         m.usage = usage;
         m.confidence = confidence;
         out.add(m);
+        return m;
     }
 }

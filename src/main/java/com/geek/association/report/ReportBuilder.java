@@ -317,6 +317,17 @@ public class ReportBuilder {
                             + "对比程序中省略该字段的 INSERT 会被数据库拒绝，已按「写入方必填字段」命中；"
                             + "请确认对方所有插入语句都补齐该字段，动态 SQL 与 SELECT * 处仍属字段盲区，需人工确认。");
         }
+        // An entity-field edit only produces a low-confidence mapping hint, never a column-level
+        // impact. Saying so keeps "no impact" from hiding a match the reader may still want to
+        // check - especially when both programs share the model class through a Maven dependency.
+        int mappingHints = peers.stream().mapToInt(p -> p.mappingHintMatches).sum();
+        if (mappingHints > 0) {
+            ImpactReport.addNote(report.notes, seen,
+                    "有 " + mappingHints + " 条低置信度映射提示：对比程序也映射了同一列，"
+                            + "但本次变化是本程序删除/修改 Java 实体字段，数据库列并没有变化，"
+                            + "因此未计入跨程序影响；若两边共用同一模型类（Maven 依赖），"
+                            + "请按编译契约单独确认。");
+        }
         int dbUnknown = peers.stream().mapToInt(p -> p.dbIdentityUnknownMatches).sum();
         if (dbUnknown > 0) {
             ImpactReport.addNote(report.notes, seen,

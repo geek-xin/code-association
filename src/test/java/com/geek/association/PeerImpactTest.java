@@ -870,6 +870,88 @@ class PeerImpactTest {
     }
 
     /**
+     * A peer that maps the same column is a hint, not an impact: the deletion happened in this
+     * program's Java entity, so the database column still exists and the peer's own mapping and
+     * SQL are intact. Seeding the shared column node used to pull every reader of that column in
+     * the peer into the report as a HIGH DATA impact - a false positive indistinguishable from a
+     * real dropped column.
+     */
+    @Test
+    void aPeerMappingTheSameColumnIsAHintNotAnImpact(@TempDir Path tmp) throws IOException {
+        String entityBefore = """
+                package com.example.w;
+
+                import jakarta.persistence.Column;
+                import jakarta.persistence.Entity;
+                import jakarta.persistence.Table;
+
+                @Entity
+                @Table(name = "orders")
+                public class Order {
+                    @Column(name = "id")
+                    private Long id;
+
+                    @Column(name = "remark")
+                    private String remark;
+                }
+                """;
+        String entityAfter = """
+                package com.example.w;
+
+                import jakarta.persistence.Column;
+                import jakarta.persistence.Entity;
+                import jakarta.persistence.Table;
+
+                @Entity
+                @Table(name = "orders")
+                public class Order {
+                    @Column(name = "id")
+                    private Long id;
+                }
+                """;
+        Path base = tmp.resolve("base");
+        write(base, "pom.xml", WRITER_POM);
+        write(base, "src/main/java/com/example/w/Order.java", entityBefore);
+        Path head = tmp.resolve("head");
+        write(head, "pom.xml", WRITER_POM);
+        write(head, "src/main/java/com/example/w/Order.java", entityAfter);
+        Change change = detectChanges(base, head);
+
+        Path peerDir = tmp.resolve("peer");
+        write(peerDir, "pom.xml", WRITER_POM);
+        write(peerDir, "src/main/java/com/example/p/Order.java", """
+                package com.example.p;
+
+                import jakarta.persistence.Column;
+                import jakarta.persistence.Entity;
+                import jakarta.persistence.Table;
+
+                @Entity
+                @Table(name = "orders")
+                public class Order {
+                    @Column(name = "remark")
+                    private String remark;
+                }
+                """);
+        write(peerDir, "src/main/resources/mapper/OrderMapper.xml",
+                "<mapper namespace=\"com.example.p.OrderMapper\">"
+                        + "<select id=\"loadOrder\">SELECT remark FROM orders WHERE id = #{id}</select>"
+                        + "</mapper>");
+
+        PeerImpact result = analyzeAgainst(change, index(peerDir));
+
+        assertTrue(result.matches.stream().anyMatch(m -> "mapping".equals(m.usage)),
+                "the peer maps the same column, so the low-confidence hint must stay visible: "
+                        + describe(result));
+        assertTrue(result.impacts.isEmpty(),
+                "an entity field edit does not change the column: the peer's mapper must not become "
+                        + "an impact: " + describe(result));
+        assertEquals(1, result.mappingHintMatches,
+                "the hint must be counted instead of silently dropped: " + result.mappingHintExamples);
+        assertFalse(result.mappingHintExamples.isEmpty(), "the hint must name the column for the reader");
+    }
+
+    /**
      * A peer statement that touches the table but names no column cannot be judged either way. It
      * must be counted, because an empty match list would otherwise read as "nothing to check".
      */
