@@ -43,6 +43,7 @@ public class ReportBuilder {
         report.commits = revisions.commits == null ? new ArrayList<>() : revisions.commits;
         report.commitCount = report.commits.size();
         report.rangeNote = revisions.rangeNote == null ? "" : revisions.rangeNote;
+        report.selectedCommits = revisions.selectedCommits;
         report.summary.commitCount = report.commitCount;
         report.generatedAt = java.time.Instant.now().toString();
         report.diffs = diffs;

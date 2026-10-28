@@ -46,6 +46,15 @@ public class RepositoryPreparer {
         public String targetRef;
         public Integer pullRequest;
         public boolean includeUncommitted = true;
+        /**
+         * Hand-picked commits to review, when the user selected them instead of typing a range.
+         *
+         * A range answers "what does this branch line up to the endpoint"; a selection answers
+         * "what do these N commits change". They are not the same question: in a range of forty
+         * commits the user may care about three, and the other thirty-seven only add noise to the
+         * report. Empty means "use {@link #baseRef} / {@link #targetRef} instead".
+         */
+        public List<String> commits = new ArrayList<>();
     }
 
     /**
@@ -204,6 +213,12 @@ public class RepositoryPreparer {
      * built from it would look legitimate while answering the wrong question.
      */
     private RevisionPair commitRange(Request request) throws IOException {
+        // A hand-picked set of commits is a different question from a range, and it is answered
+        // before the two-endpoint form is even looked at: the endpoints may legitimately be blank
+        // when the user selected commits instead of typing a range.
+        if (request.commits != null && !request.commits.isEmpty()) {
+            return selectedCommits(request);
+        }
         if (Texts.isBlank(request.baseRef) || Texts.isBlank(request.targetRef)) {
             throw new IOException("提交范围需要同时指定起始提交与结束提交");
         }
@@ -242,6 +257,156 @@ public class RepositoryPreparer {
             fillCommits(pair, repo, baseId, headId);
             return pair;
         }
+    }
+
+    /**
+     * Analyses exactly the commits the user picked, ignoring everything else in between.
+     *
+     * <p>The head snapshot is the parent of the oldest selected commit with every selected commit's
+     * tree applied on top, so the diff contains precisely the files those commits touched. The base
+     * is that oldest commit's parent, which is the only choice that makes "these three commits" a
+     * well-defined change set: the older commits of the branch are not part of the question.</p>
+     *
+     * <p>Ordering is by commit topology, not by the order the user clicked: a selection is a set,
+     * and applying an older commit over a newer one would resurrect files the newer commit deleted.
+     * A selection that spans two lines of history is refused for the same reason a range is - the
+     * combined tree would be a state that never existed.</p>
+     */
+    private RevisionPair selectedCommits(Request request) throws IOException {
+        RepoSource source = request.source;
+        String token = tokenOf(source);
+        try (Repository repo = openRepository(source, token)) {
+            // Resolve every selected commit up front so a typo is reported against the sha the user
+            // typed, not as a confusing failure three steps later.
+            List<ObjectId> ids = new ArrayList<>();
+            for (String ref : request.commits) {
+                if (Texts.isBlank(ref)) {
+                    continue;
+                }
+                ObjectId id = resolveWithFetch(repo, ref.strip(), token);
+                if (id == null) {
+                    throw new IOException("找不到提交：" + ref.strip() + "（它可能已被 rebase 或 force-push 覆盖）");
+                }
+                if (!ids.contains(id)) {
+                    ids.add(id);
+                }
+            }
+            if (ids.isEmpty()) {
+                throw new IOException("请至少选择一个提交");
+            }
+            // Oldest first, so the overlay can be applied in that order below.
+            ids = sortByTopology(repo, ids);
+
+            ObjectId oldest = ids.get(0);
+            ObjectId newest = ids.get(ids.size() - 1);
+            ObjectId baseId = parentOf(repo, oldest);
+            if (baseId == null) {
+                throw new IOException("选中的提交 " + shortId(oldest)
+                        + " 是仓库的第一个提交，没有可比对的父提交");
+            }
+            // Every pick must lie on the line that ends at the newest one. Checking "is it a
+            // descendant of the base" is not enough: two commits that both descend from the base
+            // but from different branches would each pass, and the overlay would then describe a
+            // tree that never existed.
+            for (ObjectId id : ids) {
+                if (!id.equals(newest) && !GitSupport.isAncestor(repo, id, newest)) {
+                    throw new IOException("选中的提交不在同一条提交线上（" + shortId(id)
+                            + " 不是 " + shortId(newest) + " 的祖先），无法合并成一次变更");
+                }
+            }
+
+            int maxFiles = properties.getMaxFiles();
+            int maxBytes = properties.maxFileBytes();
+            // Start from the base tree and overlay each selected commit in order: the result is the
+            // state the repository would be in if only those commits had been applied.
+            Map<String, String> overlay = GitTreeSource.treeEntries(repo, baseId, maxFiles);
+            for (int i = 0; i < ids.size(); i++) {
+                ObjectId id = ids.get(i);
+                ObjectId parent = parentOf(repo, id);
+                Map<String, String> mine = GitTreeSource.treeEntries(repo, id, maxFiles);
+                Map<String, String> theirs = parent == null
+                        ? Map.of() : GitTreeSource.treeEntries(repo, parent, maxFiles);
+                applyDiff(overlay, theirs, mine);
+            }
+
+            RevisionPair pair = new RevisionPair();
+            pair.repoPath = repo.getDirectory().getParent();
+            pair.note = source.name;
+            pair.mode = "COMMIT_RANGE";
+            pair.base = new GitTreeSource(repo, baseId, "base " + shortId(baseId), maxFiles, maxBytes);
+            pair.head = GitTreeSource.ofBlobs(repo, overlay,
+                    ids.size() == 1 ? "selected " + shortId(ids.get(0))
+                            : "selected " + ids.size() + " commits", maxFiles, maxBytes);
+            pair.baseCommit = baseId.name();
+            pair.headCommit = newest.name();
+            pair.baseRef = shortId(baseId);
+            pair.headRef = ids.size() == 1 ? shortId(newest) : ids.size() + " 个选中提交";
+            pair.selectedCommits = ids.size();
+            // Newest first, matching what every other mode puts in this list (and what the report
+            // header reads as "本次包含的提交").
+            pair.commits = new ArrayList<>();
+            for (int i = ids.size() - 1; i >= 0; i--) {
+                try (org.eclipse.jgit.revwalk.RevWalk walk =
+                             new org.eclipse.jgit.revwalk.RevWalk(repo)) {
+                    pair.commits.add(GitSupport.toInfo(walk.parseCommit(ids.get(i))));
+                }
+            }
+            pair.rangeNote = "只分析了选中的 " + ids.size() + " 个提交";
+            return pair;
+        }
+    }
+
+    /** Rewrites {@code target} so it holds exactly the changes between {@code from} and {@code to}. */
+    private static void applyDiff(Map<String, String> target, Map<String, String> from,
+                                  Map<String, String> to) {
+        for (Map.Entry<String, String> e : to.entrySet()) {
+            String before = from.get(e.getKey());
+            if (!e.getValue().equals(before)) {
+                target.put(e.getKey(), e.getValue());
+            }
+        }
+        for (String path : from.keySet()) {
+            if (!to.containsKey(path)) {
+                // Deleted by this commit: the overlay must delete it too, or the diff would
+                // resurrect a file that no longer exists at the end of the selection.
+                target.remove(path);
+            }
+        }
+    }
+
+    /** The commit's first parent, or null for a root commit. */
+    private static ObjectId parentOf(Repository repo, ObjectId commitId) {
+        try (org.eclipse.jgit.revwalk.RevWalk walk = new org.eclipse.jgit.revwalk.RevWalk(repo)) {
+            org.eclipse.jgit.revwalk.RevCommit commit = walk.parseCommit(commitId);
+            return commit.getParentCount() == 0 ? null : commit.getParent(0).getId();
+        } catch (IOException | RuntimeException e) {
+            log.debug("cannot read the parent of {}: {}", commitId.name(), GitSupport.describe(e));
+            return null;
+        }
+    }
+
+    /**
+     * Orders the selection oldest-first along the commit graph.
+     *
+     * The user's click order is arbitrary and must not decide how the overlay is applied: a
+     * selection containing both a commit and its ancestor has to apply the ancestor first, or the
+     * ancestor's tree would overwrite the newer commit's changes to the same files.
+     */
+    private static List<ObjectId> sortByTopology(Repository repo, List<ObjectId> ids) {
+        List<ObjectId> sorted = new ArrayList<>(ids);
+        sorted.sort((a, b) -> {
+            if (a.equals(b)) {
+                return 0;
+            }
+            if (GitSupport.isAncestor(repo, a, b)) {
+                return -1;
+            }
+            if (GitSupport.isAncestor(repo, b, a)) {
+                return 1;
+            }
+            return 0;
+        });
+        return sorted;
     }
 
     /**

@@ -68,6 +68,14 @@ public class AnalysisService {
         public String baseRef;
         public String targetRef;
         public Integer pullRequest;
+        /**
+         * Hand-picked commits, when the reviewer selected them instead of naming a range.
+         *
+         * Null-tolerant on purpose: the field is absent from every request the UI made before
+         * this existed, and an absent list must mean "use baseRef / targetRef", not "empty
+         * selection".
+         */
+        public List<String> commits;
         public boolean includeTests = false;
         public boolean includeUncommitted = true;
         /** Other programs to scan for cross-program impact, by source id. */
@@ -117,6 +125,7 @@ public class AnalysisService {
             prep.targetRef = request.targetRef;
             prep.pullRequest = request.pullRequest;
             prep.includeUncommitted = request.includeUncommitted;
+            prep.commits = request.commits == null ? new ArrayList<>() : request.commits;
             RevisionPair revisions = preparer.prepare(prep);
             progress.complete("PREPARE", "DIFF", 10, "读取代码差异", "比较基线与目标版本");
 

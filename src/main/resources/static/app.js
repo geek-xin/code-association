@@ -172,6 +172,14 @@ var state = {
   /** 复核发现列表的当前页（从 1 开始）；切标签、换分析时回到第 1 页。 */
   reviewPage: 1,
   /**
+   * Commits ticked in the run modal's range preview, keyed by full sha.
+   *
+   * Lives here rather than in the DOM because the preview is re-rendered on every keystroke and
+   * every debounced refetch: reading the ticks back out of a list that is about to be replaced is
+   * how a selection silently disappears while the user is still choosing.
+   */
+  rangePicked: {},
+  /**
    * 被复核决策改了数据、但当时不在屏幕上的页面。
    *
    * 页面是预渲染后用 CSS 显隐切换的，所以一次确认不必立刻重绘另外两张页面；
@@ -5262,6 +5270,13 @@ async function loadCommits(sourceId) {
 var rangePreviewTimer = null;
 /** Bumped per request so a slow answer for an old range cannot overwrite a newer one. */
 var rangePreviewSeq = 0;
+/**
+ * The last range payload rendered, kept so a tick can update the hint without refetching.
+ *
+ * Without it every checkbox click would either re-run git or update nothing; the counts it needs
+ * (total, note) are already in the payload that produced the rows on screen.
+ */
+var lastRangePayload = null;
 
 function scheduleRangePreview() {
   if (rangePreviewTimer) clearTimeout(rangePreviewTimer);
@@ -5317,18 +5332,51 @@ function renderRangePreview(payload) {
     hint.textContent = payload.note || '这个范围内没有提交。';
     return;
   }
-  var shown = commits.slice(0, 8);
-  hint.textContent = '共 ' + (payload.count != null ? payload.count : commits.length) + ' 个提交' +
-    (payload.note ? ' · ' + payload.note : '');
-  host.innerHTML = shown.map(function (c) {
-    return '<div class="commit-row">' +
-      '<span class="commit-sha">' + esc(c.shortSha || String(c.sha || '').slice(0, 8)) + '</span>' +
+  var shown = commits.slice(0, 30);
+  lastRangePayload = payload;
+  var picked = state.rangePicked || {};
+  // Every listed commit gets a checkbox: the range says what *could* be reviewed, and the ticks
+  // say what actually is. Selection survives a re-render because it lives in state.rangePicked
+  // keyed by full sha - rebuilding the list after each keystroke must not silently clear it.
+  var rows = shown.map(function (c) {
+    var sha = c.sha || '';
+    var on = picked[sha] === true;
+    return '<label class="commit-row selectable' + (on ? ' selected' : '') + '">' +
+      '<input type="checkbox" data-range-commit="' + esc(sha) + '"' + (on ? ' checked' : '') + '/>' +
+      '<span class="commit-sha">' + esc(c.shortSha || String(sha).slice(0, 8)) + '</span>' +
       '<span class="commit-subject">' + esc(c.subject || '') + '</span>' +
       '<span class="commit-meta">' + esc(c.author || '') + ' · ' + esc(fmtTime(c.date)) + '</span>' +
-      '</div>';
-  }).join('') + (commits.length > shown.length
-    ? '<div class="commit-more">还有 ' + (commits.length - shown.length) + ' 个提交未列出</div>'
+      '</label>';
+  }).join('');
+  host.innerHTML = rows + (commits.length > shown.length
+    ? '<div class="commit-more">还有 ' + (commits.length - shown.length) + ' 个提交未列出，缩小范围可看到更多</div>'
     : '');
+  renderRangePickHint(payload);
+}
+
+/** The full shas of the ticked commits, in list order (newest first). */
+function selectedRangeCommits() {
+  var picked = state.rangePicked || {};
+  return Object.keys(picked).filter(function (sha) {
+    return picked[sha] === true;
+  });
+}
+
+/** How many commits are ticked, and what the run will therefore analyse. */
+function renderRangePickHint(payload) {
+  var hint = $('mr-range-hint');
+  if (!hint) return;
+  var count = Object.keys(state.rangePicked || {}).filter(function (k) {
+    return state.rangePicked[k] === true;
+  }).length;
+  var total = payload && payload.count != null ? payload.count : 0;
+  var base = '共 ' + total + ' 个提交';
+  if (payload && payload.note) base += ' · ' + payload.note;
+  // Ticking nothing is the normal state and means "review the whole range", so it must not read
+  // like an error the user has to fix before starting.
+  hint.textContent = count
+    ? base + ' · 已选 ' + count + ' 个，将只分析这些提交'
+    : base + ' · 勾选可只分析其中几个，不勾则分析整个范围';
 }
 
 /**
@@ -5360,6 +5408,9 @@ function applyRunMode(mode) {
   }
 
   if (range) {
+    // Switching modes starts a new question, so a selection made for the previous range must not
+    // carry over: the same sha would then be analysed against a different base.
+    state.rangePicked = {};
     loadCommits(Number($('mr-source').value));
     scheduleRangePreview();
   } else {
@@ -5580,6 +5631,7 @@ function resetSourceModal() {
 async function runAnalysisFromModal() {
   var sourceId = Number($('mr-source').value);
   var mode = $('mr-mode').value;
+  var pickedCommits = mode === 'COMMIT_RANGE' ? selectedRangeCommits() : [];
   var body = {
     sourceId: sourceId,
     mode: mode,
@@ -5588,6 +5640,9 @@ async function runAnalysisFromModal() {
     pullRequest: mode === 'PULL_REQUEST' ? Number($('mr-pr').value) || null : null,
     peerSourceIds: selectedPeerIds()
   };
+  // Sent only when the user actually ticked something: an empty list would mean "no commits",
+  // while the absent field means "analyse the range the two inputs describe".
+  if (pickedCommits.length) body.commits = pickedCommits;
   // Sent only when the checkbox is actually usable: an unconfigured server would ignore it anyway,
   // and leaving the field out keeps the request identical to what it was before the feature.
   var aiBox = $('mr-ai');
@@ -5603,8 +5658,10 @@ async function runAnalysisFromModal() {
     return;
   }
   // A range with one end missing would silently fall back to the whole history on the server, so
-  // both ends are required and the message names the one that is missing.
-  if (mode === 'COMMIT_RANGE') {
+  // both ends are required and the message names the one that is missing. A hand-picked selection
+  // is exempt: it names its commits directly, and requiring two endpoints as well would force the
+  // user to retype exactly what they just ticked.
+  if (mode === 'COMMIT_RANGE' && !pickedCommits.length) {
     if (!body.baseRef) { showModalError('mr-error', '请填写起始提交（不含）'); return; }
     if (!body.targetRef) { showModalError('mr-error', '请填写结束提交（含）'); return; }
   }
@@ -6162,6 +6219,25 @@ function bindEvents() {
       if (mode && mode.value === 'COMMIT_RANGE') scheduleRangePreview();
     });
   });
+  // The commit list is rebuilt on every preview, so the tick handler is delegated from the stable
+  // container instead of being bound to rows that no longer exist a keystroke later.
+  var rangeList = $('mr-range-list');
+  if (rangeList) {
+    rangeList.addEventListener('change', function (ev) {
+      var box = ev.target.closest('input[data-range-commit]');
+      if (!box) return;
+      var sha = box.getAttribute('data-range-commit');
+      if (!sha) return;
+      state.rangePicked = state.rangePicked || {};
+      if (box.checked) state.rangePicked[sha] = true;
+      else delete state.rangePicked[sha];
+      var row = box.closest('.commit-row');
+      if (row) row.classList.toggle('selected', box.checked);
+      // Only the hint changes, so re-rendering the whole list would drop keyboard focus from the
+      // checkbox the user just pressed space on.
+      renderRangePickHint(lastRangePayload);
+    });
+  }
   var mrStart = $('mr-start');
   if (mrStart) mrStart.addEventListener('click', runAnalysisFromModal);
 

@@ -46,6 +46,55 @@ public class GitTreeSource implements FileSource {
         this.maxFileBytes = maxFileBytes;
     }
 
+    /**
+     * A view over an explicit path-to-blob map, for trees that exist only in memory.
+     *
+     * The one caller is a "review only these commits" run: the head snapshot it needs is the base
+     * tree with a handful of files replaced, and materialising that as a real commit would mean
+     * writing to the user's repository. Reusing this class keeps the read path - including the
+     * per-file size limit and the skipped-file bookkeeping - identical to a real tree, so a
+     * synthesized snapshot cannot behave differently from an ordinary one.
+     */
+    public static GitTreeSource ofBlobs(Repository repository, Map<String, String> blobs, String label,
+                                        int maxFiles, int maxFileBytes) {
+        GitTreeSource source = new GitTreeSource(repository, null, label, maxFiles, maxFileBytes);
+        source.blobs = new LinkedHashMap<>(blobs);
+        source.cached = new ArrayList<>(source.blobs.keySet());
+        source.cached.sort(Comparator.naturalOrder());
+        return source;
+    }
+
+    /**
+     * Every path of a commit's tree mapped to its blob id.
+     *
+     * Exposed for the same reason as {@link #ofBlobs}: comparing two of these maps is how "which
+     * files did this commit change" is answered without a working tree or a diff driver, and
+     * {@code .class} / {@code .jar} entries are skipped exactly as {@link #load()} skips them.
+     */
+    public static Map<String, String> treeEntries(Repository repository, ObjectId commitId, int maxFiles) {
+        Map<String, String> out = new LinkedHashMap<>();
+        if (commitId == null) {
+            return out;
+        }
+        try (RevWalk walk = new RevWalk(repository)) {
+            RevCommit commit = walk.parseCommit(commitId);
+            try (TreeWalk tw = new TreeWalk(repository)) {
+                tw.addTree(commit.getTree());
+                tw.setRecursive(true);
+                while (tw.next() && out.size() < maxFiles) {
+                    String path = tw.getPathString();
+                    if (path.endsWith(".class") || path.endsWith(".jar")) {
+                        continue;
+                    }
+                    out.put(path, tw.getObjectId(0).name());
+                }
+            }
+        } catch (IOException | RuntimeException e) {
+            // Same contract as load(): a tree that cannot be walked yields what was read so far.
+        }
+        return out;
+    }
+
     private void load() {
         if (blobs != null) {
             return;

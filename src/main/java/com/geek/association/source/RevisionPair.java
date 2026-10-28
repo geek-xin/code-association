@@ -28,6 +28,14 @@ public class RevisionPair {
     public List<CommitInfo> commits = new ArrayList<>();
     /** Why {@link #commits} is not the complete range, or "" when it is. */
     public String rangeNote = "";
+    /**
+     * How many commits the user hand-picked, or 0 for a run that named a range instead.
+     *
+     * Carried separately from {@link #commits} because that list is capped for the report while
+     * this number is the actual size of the question being answered - and the UI has to be able to
+     * say "只分析了选中的 3 个提交" without re-deriving it from a truncated list.
+     */
+    public int selectedCommits = 0;
 
     public boolean isGit() {
         return !repoPath.isBlank();

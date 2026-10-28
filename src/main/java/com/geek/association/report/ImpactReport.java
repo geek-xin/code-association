@@ -58,6 +58,13 @@ public class ImpactReport {
     public int commitCount = 0;
     /** Why {@link #commits} is shorter than the range, or "" when it is complete. */
     public String rangeNote = "";
+    /**
+     * How many commits the user hand-picked, or 0 when the run named a range instead.
+     *
+     * The difference matters to the reader: a range of forty commits and a hand-picked three can
+     * produce the same file list, and only this number says which question was asked.
+     */
+    public int selectedCommits = 0;
 
     public static class Summary {
         public int changedModules;
