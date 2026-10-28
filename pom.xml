@@ -13,7 +13,7 @@
 
   <groupId>com.geek</groupId>
   <artifactId>code-association</artifactId>
-  <version>0.5.0</version>
+  <version>0.6.0</version>
   <name>code-association</name>
   <description>Cross-module change impact analysis for Java / Maven repositories</description>
 
