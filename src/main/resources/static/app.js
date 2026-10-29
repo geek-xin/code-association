@@ -2076,6 +2076,159 @@ function renderAnalysis() {
 /* ------------------------------------------------------- ai review (report) */
 
 /**
+ * Labels for the line-anchored review comments.
+ *
+ * The severity order is not the alphabetical one: the list in the report is sorted by severity
+ * server-side, and the mapping here only decides the label and the accent colour. Unknown values
+ * fall back to the neutral bucket - a model that invents "SEVERE" must not produce an unstyled
+ * comment that reads like a real severity.
+ */
+var AI_SEVERITY_LABEL = {
+  BLOCKER: '阻断',
+  CRITICAL: '严重',
+  MAJOR: '主要',
+  MINOR: '次要',
+  INFO: '信息'
+};
+var AI_CATEGORY_LABEL = {
+  CORRECTNESS: '正确性',
+  SECURITY: '安全',
+  PERFORMANCE: '性能',
+  RELIABILITY: '可靠性',
+  MAINTAINABILITY: '可维护性',
+  IMPACT: '影响面'
+};
+var AI_ANCHOR_LABEL = {
+  HUNK: '变更块内匹配',
+  FILE: '整文件匹配',
+  RELOCATED: '模型重定位',
+  NONE: '未定位'
+};
+
+/** Lower-case severity key for the CSS modifier; whitelisted, never interpolated raw. */
+function aiSeverityKey(severity) {
+  var key = String(severity == null ? '' : severity).toUpperCase();
+  return AI_SEVERITY_LABEL[key] ? key.toLowerCase() : 'info';
+}
+
+/** "12" when start and end are the same, "12-14" otherwise, "" when the comment has no line. */
+function aiLineRange(comment) {
+  var start = Number(comment && comment.startLine) || 0;
+  var end = Number(comment && comment.endLine) || 0;
+  if (!start) return '';
+  return end > start ? start + '-' + end : String(start);
+}
+
+/**
+ * One comment, as escaped markup.
+ *
+ * Every field is model output, so each one goes through esc() or textContent - the numbers and
+ * the severity/class keys are the only values that reach the markup unescaped, and they are
+ * coerced through Number() or whitelisted first. This is the same rule the summary text follows.
+ */
+function aiCommentHtml(comment) {
+  var c = comment || {};
+  var sevKey = aiSeverityKey(c.severity);
+  var sevLabel = AI_SEVERITY_LABEL[String(c.severity == null ? '' : c.severity).toUpperCase()] || '信息';
+  var html = '<div class="ai-comment sev-' + sevKey + '">';
+  var head = '<div class="ai-comment-head">' +
+    '<span class="ai-comment-sev sev-' + sevKey + '">' + esc(sevLabel) + '</span>';
+  if (c.category) {
+    var categoryKey = String(c.category).toUpperCase();
+    head += '<span class="ai-comment-cat">' + esc(AI_CATEGORY_LABEL[categoryKey] || String(c.category)) + '</span>';
+  }
+  head += '<span class="ai-comment-title">' + esc(c.title || '（无标题）') + '</span>';
+  var range = aiLineRange(c);
+  if (c.file) {
+    head += '<span class="ai-comment-loc mono">' + esc(c.file) + (range ? ':' + range : '') + '</span>';
+  }
+  html += head + '</div>';
+  if (c.detail) html += '<div class="ai-comment-body">' + esc(c.detail) + '</div>';
+  if (c.suggestion) html += '<div class="ai-comment-suggestion">建议：' + esc(c.suggestion) + '</div>';
+  if (c.existingCode) {
+    html += '<pre class="ai-comment-code"><code>' + esc(String(c.existingCode).replace(/\s+$/, '')) + '</code></pre>';
+  }
+  var meta = [];
+  var anchorKey = String(c.anchor == null ? 'NONE' : c.anchor).toUpperCase();
+  meta.push('定位：' + (AI_ANCHOR_LABEL[anchorKey] || '未定位'));
+  if (String(c.side == null ? '' : c.side).toUpperCase() === 'OLD') meta.push('删除行');
+  // Tolerate a malformed payload: a non-array here must not blank the whole comment block.
+  if (c.evidence && typeof c.evidence.length === 'number' && c.evidence.length) {
+    var evidenceIds = [];
+    for (var i = 0; i < Math.min(c.evidence.length, 6); i++) evidenceIds.push(String(c.evidence[i]));
+    meta.push('证据 ' + evidenceIds.join('、'));
+  }
+  var confidence = Number(c.confidence);
+  if (!isNaN(confidence) && confidence > 0) {
+    meta.push('置信度 ' + Math.round(Math.max(0, Math.min(1, confidence)) * 100) + '%');
+  }
+  html += '<div class="ai-comment-meta">' + esc(meta.join(' · ')) + '</div>';
+  return html + '</div>';
+}
+
+/**
+ * The one-line review tally under the comments.
+ *
+ * Written as "what happened to the candidates" rather than as a model confidence: the numbers
+ * explain where comments went (unlocated, filtered, merged) so a short list does not read as the
+ * model having found little. Notes stay small because they are diagnostics, not review findings.
+ */
+function aiReviewStatsHtml(stats) {
+  if (!stats || typeof stats !== 'object') return '';
+  var parts = [];
+  var reviewed = Number(stats.filesReviewed);
+  var skipped = Number(stats.filesSkipped);
+  var kept = Number(stats.commentsKept);
+  var unlocated = Number(stats.commentsDroppedUnlocated);
+  var filtered = Number(stats.commentsDroppedFiltered);
+  var reflected = Number(stats.commentsDroppedReflection);
+  var merged = Number(stats.commentsMerged);
+  var relocations = Number(stats.relocationCalls);
+  var tokens = Number(stats.estimatedTokens);
+  if (reviewed > 0) parts.push('审阅 ' + reviewed + ' 个文件');
+  if (skipped > 0) parts.push('跳过 ' + skipped + ' 个');
+  if (kept >= 0 && !isNaN(kept)) parts.push('保留 ' + kept + ' 条');
+  if (unlocated > 0) parts.push('未定位丢弃 ' + unlocated + ' 条');
+  if (filtered > 0) parts.push('过滤 ' + filtered + ' 条');
+  if (reflected > 0) parts.push('反思删除 ' + reflected + ' 条');
+  if (merged > 0) parts.push('合并 ' + merged + ' 条');
+  if (relocations > 0) parts.push('重定位 ' + relocations + ' 次');
+  if (tokens > 0) parts.push('约 ' + tokens + ' tokens');
+  if (stats.reflectionRan === true) parts.push('反思已执行');
+  var html = '';
+  if (parts.length) html += '<div class="ai-comment-stats">' + esc(parts.join(' · ')) + '</div>';
+  var notes = stats.notes;
+  if (Array.isArray(notes) && notes.length) {
+    html += '<div class="ai-comment-note">' + esc(notes.slice(0, 5).map(function (n) { return String(n); }).join('；')) + '</div>';
+  }
+  return html;
+}
+
+/**
+ * The comment block under the summary.
+ *
+ * Three cases, and "absent" is deliberately different from "empty": an old report has no
+ * `comments` key at all and must render exactly as it did before this feature existed, while an
+ * empty array means the pipeline ran and found nothing to say - that is worth one sentence, or the
+ * reader cannot tell "nothing found" from "the feature is broken".
+ */
+function aiCommentsHtml(section) {
+  if (!section || !Array.isArray(section.comments)) return '';
+  var html = '<div class="ai-comments">' +
+    '<div class="ai-comments-head"><span class="ai-comments-title">逐条评审意见</span>' +
+    '<span class="pill neutral">' + section.comments.length + ' 条</span></div>';
+  if (section.comments.length) {
+    for (var i = 0; i < section.comments.length; i++) html += aiCommentHtml(section.comments[i]);
+  } else {
+    html += '<div class="ai-comment-empty">本次变更未发现需要评论的问题</div>';
+  }
+  html += '</div>';
+  var failure = section.reviewError || (section.reviewStats && section.reviewStats.error);
+  if (failure) html += '<div class="ai-comment-note">逐条评审部分失败：' + esc(failure) + '</div>';
+  return html + aiReviewStatsHtml(section.reviewStats);
+}
+
+/**
  * The AI section of an analysis page.
  *
  * Four states, and the difference between them is the whole point of the card: a generated review
@@ -2086,6 +2239,10 @@ function renderAnalysis() {
  *
  * Hidden entirely while AI is not configured AND the report has no AI section: an installation that
  * never turns this on must not see a new card appear on every analysis it opens.
+ *
+ * The line-anchored comments (report.ai.comments) are rendered under the summary by
+ * aiCommentsHtml(): absent key = an old report and no extra block, empty array = the pipeline ran
+ * and found nothing, which is stated in one sentence rather than left as a blank area.
  */
 function renderAnalysisAi(report) {
   var host = $('an-ai-body');
@@ -2135,6 +2292,7 @@ function renderAnalysisAi(report) {
     // renderNotes is the escaped, no-markdown-library renderer already used for release notes:
     // model output must never reach innerHTML unescaped, and this is the one place it could.
     html += '<div class="ai-text">' + renderNotes(section.text || '') + '</div>';
+    html += aiCommentsHtml(section);
     var foot = [];
     if (section.model) foot.push('模型 ' + esc(section.model));
     if (section.generatedAt) foot.push('生成于 ' + esc(fmtTime(section.generatedAt)));
@@ -2162,7 +2320,9 @@ function renderAnalysisAi(report) {
     if (sub) sub.textContent = '本次分析没有生成 AI 审核，可按需补生成';
     html += '<div class="callout">' + icon('i-sparkles') + '<div>' +
       '这次分析只包含静态分析事实。模型 ' + esc(ai.data.model || '') +
-      ' 可以基于这些事实写一份评审要点，发送内容仅限本页摘要。' +
+      ' 可以基于这些事实写一份评审要点' +
+      (ai.data.comments ? '和逐条评审意见（发送本次变更片段）' : '') +
+      '，不发送源码全文。' +
       '</div></div>';
     buttons = '<button class="btn btn-sm btn-primary" data-ai-generate type="button"' + (busy ? ' disabled' : '') + '>' +
       (busy ? '<span class="spinner"></span>生成中…' : icon('i-sparkles') + '生成 AI 评审') + '</button>';
@@ -2197,8 +2357,10 @@ async function generateAiReview() {
   try {
     var result = await api('/analyses/' + id + '/ai-review', { method: 'POST' });
     state.report.ai = result;
-    if (result && result.generated) toast('AI 评审说明已生成', 'success');
-    else toast('AI 评审说明生成失败：' + ((result && result.error) || '未知原因'), 'danger');
+    if (result && result.generated) {
+      var kept = result.comments && result.comments.length;
+      toast('AI 评审说明已生成' + (kept ? '，含 ' + kept + ' 条逐条意见' : ''), 'success');
+    } else toast('AI 评审说明生成失败：' + ((result && result.error) || '未知原因'), 'danger');
   } catch (e) {
     toast('生成失败：' + (e && e.message ? e.message : String(e)), 'danger');
   } finally {
@@ -2822,7 +2984,8 @@ function renderAiStatus() {
   if (d.ready) {
     pillHost.className = 'pill success';
     pillHost.textContent = '已启用';
-    noteHost.textContent = '模型 ' + (d.model || '—') + ' · 每次最多送审 ' + d.maxImpacts + ' 条影响';
+    noteHost.textContent = '模型 ' + (d.model || '—') + ' · 每次最多送审 ' + d.maxImpacts + ' 条影响' +
+      (d.comments ? ' · 逐条意见最多 ' + (d.maxComments || 0) + ' 条' : ' · 未开启逐条意见');
   } else if (d.enabled) {
     pillHost.className = 'pill warning';
     pillHost.textContent = '配置不完整';
@@ -2849,6 +3012,9 @@ function fillAiForm(d) {
   }
   if ($('ai-max-impacts')) $('ai-max-impacts').value = d.maxImpacts;
   if ($('ai-timeout')) $('ai-timeout').value = d.timeoutSeconds;
+  if ($('ai-comments')) $('ai-comments').checked = d.comments === true;
+  if ($('ai-max-comments')) $('ai-max-comments').value = d.maxComments;
+  if ($('ai-reflection')) $('ai-reflection').checked = d.reflection === true;
   if ($('ai-default-runs')) $('ai-default-runs').checked = d.defaultForRuns === true;
   ai.formFilled = true;
 }
@@ -2861,6 +3027,9 @@ function aiFormBody() {
     model: $('ai-model') ? $('ai-model').value.trim() : '',
     maxImpacts: Number($('ai-max-impacts') ? $('ai-max-impacts').value : 0) || undefined,
     timeoutSeconds: Number($('ai-timeout') ? $('ai-timeout').value : 0) || undefined,
+    comments: !!($('ai-comments') && $('ai-comments').checked),
+    maxComments: Number($('ai-max-comments') ? $('ai-max-comments').value : 0) || undefined,
+    reflection: !!($('ai-reflection') && $('ai-reflection').checked),
     defaultForRuns: !!($('ai-default-runs') && $('ai-default-runs').checked)
   };
   var key = $('ai-api-key') ? $('ai-api-key').value.trim() : '';
@@ -5125,6 +5294,11 @@ async function openRunModal() {
   $('mr-target').value = current.defaultRef || '';
   $('mr-base').value = '';
   $('mr-pr').value = '';
+  ['mr-since', 'mr-until'].forEach(function (id) { if ($(id)) $(id).value = ''; });
+  // A commit selection from a previous visit describes a branch window that is not on screen
+  // anymore, so it must not survive into the new form.
+  state.rangePicked = {};
+  lastRangePayload = null;
   $('mr-mode').value = 'GIT_DIFF';
   // Reset through the same switch the select uses, so labels, datalists and the preview cannot
   // drift out of sync with the mode after a modal was left in range mode.
@@ -5172,7 +5346,7 @@ async function primeRunAiOption() {
   box.checked = ready && ai.data.defaultForRuns === true;
   if (hint) {
     hint.textContent = ready
-      ? '只发送本次分析摘要（变更、影响路径与原因、盲区），不发送源码全文。'
+      ? '只发送本次分析摘要与变更片段，不发送源码全文。'
       : 'AI 审核未配置完成：' + (ai.data.reason || '缺少接口地址或模型') + '。可在「设置 → AI 审核」中启用。';
   }
 }
@@ -5231,50 +5405,20 @@ async function loadRefs(sourceId) {
 /* ------------------------------------------------------------- commit range */
 
 /**
- * Commit suggestions for the range pickers.
+ * The commits of the current branch/date window, shown so the user can tick what to analyse.
  *
- * The list is filled from the ref currently in the target box, because that is the branch the user
- * is already thinking about; without it the picker would only offer the repository default and the
- * user would have to type a sha from memory.
- */
-async function loadCommits(sourceId) {
-  var list = $('mr-commits');
-  if (!list || !sourceId) return;
-  list.innerHTML = '';
-  // The branch the user is already pointed at, or the source default before anything is typed.
-  var ref = $('mr-target') ? $('mr-target').value.trim() : '';
-  if (!ref) {
-    var src = state.sources.filter(function (x) { return x.id === sourceId; })[0];
-    ref = (src && src.defaultRef) || '';
-  }
-  var query = '/sources/' + sourceId + '/commits?limit=30' + (ref ? '&ref=' + encodeURIComponent(ref) : '');
-  try {
-    var payload = await api(query);
-    var commits = (payload && payload.commits) || [];
-    list.innerHTML = commits.map(function (c) {
-      var sha = c.shortSha || String(c.sha || '').slice(0, 8);
-      return '<option value="' + esc(sha) + '" label="' + esc(c.subject || '') + '"></option>';
-    }).join('');
-  } catch (e) {
-    // Suggestions are a convenience; an unreadable repository must not block the modal. The
-    // preview area is where the user learns why, so nothing is reported here.
-  }
-}
-
-/**
- * The commits the current range would analyse, shown before the run starts.
- *
- * Debounced because both inputs fire on every keystroke and each call shells out to git; a range
- * half typed is also not worth a request, so it only runs once both ends are non-empty.
+ * Debounced because the branch box fires on every keystroke and each call shells out to git; the
+ * date inputs only fire once a complete date is picked, but they ride the same timer so choosing a
+ * start and an end in quick succession produces one request instead of two.
  */
 var rangePreviewTimer = null;
-/** Bumped per request so a slow answer for an old range cannot overwrite a newer one. */
+/** Bumped per request so a slow answer for an old window cannot overwrite a newer one. */
 var rangePreviewSeq = 0;
 /**
- * The last range payload rendered, kept so a tick can update the hint without refetching.
+ * The last payload rendered, kept so a tick can update the hint without refetching.
  *
  * Without it every checkbox click would either re-run git or update nothing; the counts it needs
- * (total, note) are already in the payload that produced the rows on screen.
+ * (count, note, more) are already in the payload that produced the rows on screen.
  */
 var lastRangePayload = null;
 
@@ -5286,30 +5430,72 @@ function scheduleRangePreview() {
   }, 300);
 }
 
+/** The date inputs as the server expects them (yyyy-MM-dd), or "" when the user left one empty. */
+function rangeFilterDates() {
+  var since = $('mr-since') ? $('mr-since').value : '';
+  var until = $('mr-until') ? $('mr-until').value : '';
+  return { since: since || '', until: until || '' };
+}
+
+/**
+ * Empties the picker together with its selection.
+ *
+ * The ticks live in state and are sent as the run request, so a list cleared without them would
+ * submit commits that are no longer on screen - exactly the ones the new filter was meant to drop.
+ */
+function clearRangeList() {
+  var host = $('mr-range-list');
+  if (host) host.innerHTML = '';
+  setRangeActionsVisible(false);
+  state.rangePicked = {};
+  lastRangePayload = null;
+}
+
+function setRangeActionsVisible(visible) {
+  var actions = $('mr-range-actions');
+  if (actions) actions.classList.toggle('hidden', !visible);
+}
+
+/** Drops ticks that the latest list no longer contains; a filtered-out tick must not be sent. */
+function pruneRangePicked(commits) {
+  var keep = {};
+  (commits || []).forEach(function (c) { if (c && c.sha) keep[c.sha] = true; });
+  var picked = state.rangePicked || {};
+  Object.keys(picked).forEach(function (sha) {
+    if (!keep[sha]) delete picked[sha];
+  });
+}
+
 async function loadRangePreview() {
   var host = $('mr-range-list');
   var hint = $('mr-range-hint');
   if (!host || !hint) return;
-  var base = $('mr-base').value.trim();
-  var target = $('mr-target').value.trim();
-  if (!base || !target) {
-    host.innerHTML = '';
-    hint.textContent = '两端都填好后，这里会列出范围内的提交。';
-    return;
-  }
   var sourceId = Number($('mr-source').value);
   if (!sourceId) {
-    host.innerHTML = '';
+    clearRangeList();
     hint.textContent = '请先选择代码源。';
     return;
   }
+  var dates = rangeFilterDates();
+  // An inverted window can only answer "no commits", which reads like an empty repository; naming
+  // the mistake is more useful, and it saves a git call that cannot succeed.
+  if (dates.since && dates.until && dates.since > dates.until) {
+    clearRangeList();
+    hint.textContent = '起始日期不能晚于结束日期';
+    return;
+  }
+  var ref = $('mr-target') ? $('mr-target').value.trim() : '';
+  var query = '/sources/' + sourceId + '/commits?limit=100';
+  if (ref) query += '&ref=' + encodeURIComponent(ref);
+  if (dates.since) query += '&since=' + encodeURIComponent(dates.since);
+  if (dates.until) query += '&until=' + encodeURIComponent(dates.until);
   var seq = ++rangePreviewSeq;
   hint.textContent = '读取中…';
   host.innerHTML = '';
+  setRangeActionsVisible(false);
   try {
-    var payload = await api('/sources/' + sourceId + '/commits?base=' + encodeURIComponent(base) +
-      '&target=' + encodeURIComponent(target) + '&limit=100');
-    // A newer keystroke already asked for a different range; this answer is stale.
+    var payload = await api(query);
+    // A newer keystroke already asked for a different window; this answer is stale.
     if (seq !== rangePreviewSeq) return;
     renderRangePreview(payload || {});
   } catch (e) {
@@ -5317,8 +5503,8 @@ async function loadRangePreview() {
     // One line, no toast: the server answers 200 with a note for the expected failures (not a
     // repository, unknown ref), so a thrown error here is the unexpected path and still must not
     // turn into an error dialog.
-    hint.textContent = '无法读取提交范围：' + e.message;
-    host.innerHTML = '';
+    clearRangeList();
+    hint.textContent = '无法读取提交：' + e.message;
   }
 }
 
@@ -5327,18 +5513,21 @@ function renderRangePreview(payload) {
   var hint = $('mr-range-hint');
   if (!host || !hint) return;
   var commits = payload.commits || [];
+  // The ticked set belongs to the list on screen: a commit the new window hid must not stay
+  // selected in state where the user cannot see it.
+  pruneRangePicked(commits);
+  lastRangePayload = payload;
   if (!commits.length) {
     host.innerHTML = '';
-    hint.textContent = payload.note || '这个范围内没有提交。';
+    setRangeActionsVisible(false);
+    renderRangePickHint(payload);
     return;
   }
-  var shown = commits.slice(0, 30);
-  lastRangePayload = payload;
   var picked = state.rangePicked || {};
-  // Every listed commit gets a checkbox: the range says what *could* be reviewed, and the ticks
-  // say what actually is. Selection survives a re-render because it lives in state.rangePicked
-  // keyed by full sha - rebuilding the list after each keystroke must not silently clear it.
-  var rows = shown.map(function (c) {
+  // Every listed commit gets a checkbox: the list says what *could* be analysed, and the ticks say
+  // what actually is. Selection survives a re-render because it lives in state.rangePicked keyed by
+  // full sha - rebuilding the list after a keystroke must not silently clear it.
+  host.innerHTML = commits.map(function (c) {
     var sha = c.sha || '';
     var on = picked[sha] === true;
     return '<label class="commit-row selectable' + (on ? ' selected' : '') + '">' +
@@ -5348,9 +5537,7 @@ function renderRangePreview(payload) {
       '<span class="commit-meta">' + esc(c.author || '') + ' · ' + esc(fmtTime(c.date)) + '</span>' +
       '</label>';
   }).join('');
-  host.innerHTML = rows + (commits.length > shown.length
-    ? '<div class="commit-more">还有 ' + (commits.length - shown.length) + ' 个提交未列出，缩小范围可看到更多</div>'
-    : '');
+  setRangeActionsVisible(true);
   renderRangePickHint(payload);
 }
 
@@ -5366,61 +5553,71 @@ function selectedRangeCommits() {
 function renderRangePickHint(payload) {
   var hint = $('mr-range-hint');
   if (!hint) return;
-  var count = Object.keys(state.rangePicked || {}).filter(function (k) {
-    return state.rangePicked[k] === true;
-  }).length;
-  var total = payload && payload.count != null ? payload.count : 0;
-  var base = '共 ' + total + ' 个提交';
-  if (payload && payload.note) base += ' · ' + payload.note;
-  // Ticking nothing is the normal state and means "review the whole range", so it must not read
-  // like an error the user has to fix before starting.
-  hint.textContent = count
-    ? base + ' · 已选 ' + count + ' 个，将只分析这些提交'
-    : base + ' · 勾选可只分析其中几个，不勾则分析整个范围';
+  var commits = (payload && payload.commits) || [];
+  if (!commits.length) {
+    hint.textContent = (payload && payload.note) || '这个时间范围内没有提交。';
+    return;
+  }
+  var total = payload && payload.count != null ? payload.count : commits.length;
+  var text = '共 ' + total + ' 个提交';
+  // The list is capped server-side; saying so is what tells the user that a narrower date window
+  // is how the missing commits become reachable.
+  if (payload.more) text += '（只列出最新的 ' + commits.length + ' 个，可用时间范围缩小）';
+  // Ticking nothing means there is nothing to analyse, so it is a required action rather than an
+  // optional filter - the opposite of the old "no ticks = whole range" wording.
+  var selected = selectedRangeCommits().length;
+  text += ' · ' + (selected > 0
+    ? '已选 ' + selected + ' 个，将只分析这些提交'
+    : '勾选要分析的提交（至少 1 个）');
+  hint.textContent = text;
 }
 
 /**
- * Switches the modal between "pick a branch" and "pick a commit range".
+ * Switches the modal between "pick a branch" and "pick the commits to analyse".
  *
- * Labels, datalist and placeholder all change together: leaving the old label ("基线") above a
- * commit-sha input would describe the wrong thing, since the start of a range is exclusive.
+ * Every mode-specific label, hint and block changes together: leaving "基线" above a branch box
+ * would describe the wrong thing, and a 起始提交 input in range mode would ask for something the
+ * mode no longer uses - the ticks are the request there.
  */
 function applyRunMode(mode) {
   var range = mode === 'COMMIT_RANGE';
   $('mr-pr-wrap').classList.toggle('hidden', mode !== 'PULL_REQUEST');
-  $('mr-base-wrap').classList.toggle('hidden', mode === 'WORKTREE_DIFF');
+  // Range mode starts from a branch and a date window, not from two named endpoints.
+  $('mr-base-wrap').classList.toggle('hidden', range || mode === 'WORKTREE_DIFF');
+  var filter = $('mr-range-filter');
+  if (filter) filter.classList.toggle('hidden', !range);
   var preview = $('mr-range-preview');
   if (preview) preview.classList.toggle('hidden', !range);
+  // With the base field gone the shared two-column row would keep an empty half-column.
+  var scopeRow = $('mr-scope-row');
+  if (scopeRow) scopeRow.classList.toggle('single', range);
 
   var baseLabel = $('mr-base-label');
   var targetLabel = $('mr-target-label');
-  if (baseLabel) baseLabel.textContent = range ? '起始提交（不含）' : '基线';
-  if (targetLabel) targetLabel.textContent = range ? '结束提交（含）' : '目标';
+  if (baseLabel) baseLabel.textContent = '基线';
+  if (targetLabel) targetLabel.textContent = range ? '分支 / 引用' : '目标';
 
-  $('mr-base').setAttribute('list', range ? 'mr-commits' : 'mr-refs');
-  $('mr-target').setAttribute('list', range ? 'mr-commits' : 'mr-refs');
-  if (range) {
-    $('mr-base').placeholder = 'abc1234 或 HEAD~3';
-    $('mr-target').placeholder = 'def5678 或 HEAD';
-  } else {
-    $('mr-base').placeholder = '留空 = 目标提交的父提交';
-    $('mr-target').placeholder = 'HEAD';
-  }
+  // The target box only ever suggests refs now: the sha datalist existed for the removed
+  // 起始提交 / 结束提交 inputs.
+  $('mr-target').setAttribute('list', 'mr-refs');
+  $('mr-target').placeholder = range ? '留空 = 默认分支' : 'HEAD';
+  if (!range) $('mr-base').placeholder = '留空 = 目标提交的父提交';
 
   if (range) {
-    // Switching modes starts a new question, so a selection made for the previous range must not
-    // carry over: the same sha would then be analysed against a different base.
+    // Entering the mode starts a new question: dates and ticks carried over from a previous visit
+    // would describe a different window and must not be submitted unseen.
+    if ($('mr-since')) $('mr-since').value = '';
+    if ($('mr-until')) $('mr-until').value = '';
     state.rangePicked = {};
-    loadCommits(Number($('mr-source').value));
+    lastRangePayload = null;
     scheduleRangePreview();
   } else {
     if (rangePreviewTimer) { clearTimeout(rangePreviewTimer); rangePreviewTimer = null; }
-    // Invalidate any in-flight preview so its answer cannot land in a hidden, reused container.
+    // Invalidate any in-flight list so its answer cannot land in a hidden, reused container.
     rangePreviewSeq++;
-    var host = $('mr-range-list');
+    clearRangeList();
     var hint = $('mr-range-hint');
-    if (host) host.innerHTML = '';
-    if (hint) hint.textContent = '两端都填好后，这里会列出范围内的提交。';
+    if (hint) hint.textContent = '选择代码源与该分支后，这里会列出可勾选的提交。';
   }
 }
 
@@ -5635,14 +5832,16 @@ async function runAnalysisFromModal() {
   var body = {
     sourceId: sourceId,
     mode: mode,
-    baseRef: mode === 'WORKTREE_DIFF' ? null : ($('mr-base').value.trim() || null),
-    targetRef: $('mr-target').value.trim() || null,
+    // Range mode names its commits directly; sending a ref as well would make the server re-derive
+    // a window that no longer matches what the user ticked.
+    baseRef: mode === 'WORKTREE_DIFF' || mode === 'COMMIT_RANGE' ? null : ($('mr-base').value.trim() || null),
+    targetRef: mode === 'COMMIT_RANGE' ? null : ($('mr-target').value.trim() || null),
     pullRequest: mode === 'PULL_REQUEST' ? Number($('mr-pr').value) || null : null,
     peerSourceIds: selectedPeerIds()
   };
-  // Sent only when the user actually ticked something: an empty list would mean "no commits",
-  // while the absent field means "analyse the range the two inputs describe".
-  if (pickedCommits.length) body.commits = pickedCommits;
+  // The ticked list is the whole selection for this mode: always sent, because an absent field
+  // would fall back to a range the form no longer asks for.
+  if (mode === 'COMMIT_RANGE') body.commits = pickedCommits;
   // Sent only when the checkbox is actually usable: an unconfigured server would ignore it anyway,
   // and leaving the field out keeps the request identical to what it was before the feature.
   var aiBox = $('mr-ai');
@@ -5657,13 +5856,11 @@ async function runAnalysisFromModal() {
     showModalError('mr-error', '请填写 PR / MR 编号');
     return;
   }
-  // A range with one end missing would silently fall back to the whole history on the server, so
-  // both ends are required and the message names the one that is missing. A hand-picked selection
-  // is exempt: it names its commits directly, and requiring two endpoints as well would force the
-  // user to retype exactly what they just ticked.
+  // Nothing ticked means there is nothing to analyse: the mode has no refs to fall back on, so this
+  // is the one thing the user must do before starting.
   if (mode === 'COMMIT_RANGE' && !pickedCommits.length) {
-    if (!body.baseRef) { showModalError('mr-error', '请填写起始提交（不含）'); return; }
-    if (!body.targetRef) { showModalError('mr-error', '请填写结束提交（含）'); return; }
+    showModalError('mr-error', '请至少勾选一个提交');
+    return;
   }
   var btn = $('mr-start');
   btn.disabled = true;
@@ -6195,11 +6392,15 @@ function bindEvents() {
       if (s) {
         $('mr-target').value = s.defaultRef || '';
         loadRefs(s.id);
-        // Commit suggestions belong to the repository, so they must be re-read for the new one;
-        // the range itself is now meaningless and is cleared rather than previewed.
+        // The listed commits belong to the repository, so the ticks made against the previous one
+        // must not carry over; the date window stays, it describes the period the user wants, not
+        // the repository.
         if (mode && mode.value === 'COMMIT_RANGE') {
-          $('mr-base').value = '';
-          loadCommits(s.id);
+          state.rangePicked = {};
+          lastRangePayload = null;
+          // An answer still in flight belongs to the previous repository and must not repaint this
+          // list; the scheduled request below takes a fresh sequence number of its own.
+          rangePreviewSeq++;
           scheduleRangePreview();
         }
         // The peer list must not offer the program now being analysed.
@@ -6207,9 +6408,10 @@ function bindEvents() {
       }
     });
   }
-  // Both range inputs drive the preview; 'input' also catches a value picked from the datalist on
-  // browsers that do not fire 'change' for it.
-  ['mr-base', 'mr-target'].forEach(function (id) {
+  // The branch box and both date inputs drive the commit list. 'input' on the branch box also
+  // catches a value picked from the datalist on browsers that do not fire 'change' for it; a date
+  // input only fires 'change' once a complete date is picked.
+  ['mr-target', 'mr-since', 'mr-until'].forEach(function (id) {
     var el = $(id);
     if (!el) return;
     el.addEventListener('input', function () {
@@ -6236,6 +6438,27 @@ function bindEvents() {
       // Only the hint changes, so re-rendering the whole list would drop keyboard focus from the
       // checkbox the user just pressed space on.
       renderRangePickHint(lastRangePayload);
+    });
+  }
+  // 全选 / 清空 rewrite the state rather than the DOM: the rows are rendered from state, and the
+  // two must never disagree about what the run will analyse.
+  var rangeAll = $('mr-range-all');
+  if (rangeAll) {
+    rangeAll.addEventListener('click', function () {
+      if (!lastRangePayload) return;
+      state.rangePicked = {};
+      (lastRangePayload.commits || []).forEach(function (c) {
+        if (c && c.sha) state.rangePicked[c.sha] = true;
+      });
+      renderRangePreview(lastRangePayload);
+    });
+  }
+  var rangeNone = $('mr-range-none');
+  if (rangeNone) {
+    rangeNone.addEventListener('click', function () {
+      if (!lastRangePayload) return;
+      state.rangePicked = {};
+      renderRangePreview(lastRangePayload);
     });
   }
   var mrStart = $('mr-start');

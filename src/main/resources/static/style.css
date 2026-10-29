@@ -1292,8 +1292,11 @@ svg:not([width]) { width: 1em; height: 1em; flex: none; }
 .field > label .req { color: var(--danger-strong); }
 .field .hint { font-size: 11px; color: var(--text-3); line-height: 1.5; }
 .field-row { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+/* One field alone in the shared row (提交范围 hides the 基线 input): two columns would leave a
+   dead half-row that reads like a missing control. */
+.field-row.single { grid-template-columns: minmax(0, 1fr); }
 
-input[type="text"], input[type="number"], input:not([type]), select, textarea {
+input[type="text"], input[type="number"], input[type="date"], input:not([type]), select, textarea {
   font-family: inherit;
   font-size: 12.5px;
   color: var(--text);
@@ -1319,6 +1322,8 @@ select {
   padding-right: 28px;
 }
 input[type="checkbox"] { width: 14px; height: 14px; accent-color: var(--primary); }
+/* The native calendar glyph is the only way to open the picker; make it look clickable. */
+input[type="date"]::-webkit-calendar-picker-indicator { cursor: pointer; }
 .checkbox { display: inline-flex; align-items: center; gap: 7px; font-size: 12px; color: var(--text-2); cursor: pointer; }
 
 .filter-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
@@ -1469,7 +1474,8 @@ input[type="checkbox"] { width: 14px; height: 14px; accent-color: var(--primary)
 .commit-sha { font-family: var(--mono); font-size: 11px; color: var(--primary); flex: none; }
 .commit-subject { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
 .commit-meta { color: var(--text-3); font-size: 10.5px; flex: none; }
-.commit-more { padding: 5px 8px; color: var(--text-3); font-size: 10.5px; }
+/* 全选 / 清空 sit above the scroll box so they stay reachable however long the list is. */
+.commit-actions { display: flex; align-items: center; gap: 6px; margin: 2px 0 4px; }
 
 /* Commit range card on the analysis page; the four columns mirror the change list above it. */
 /* A wide range can list hundreds of commits, which would push the change list far below the fold.
@@ -2114,7 +2120,83 @@ body.compact .row-desc { -webkit-line-clamp: 1; }
 }
 .ai-verified-note svg { width: 13px; height: 13px; flex: none; margin-top: 1px; }
 
+/* Line-anchored review comments (report.ai.comments).
+   The severity lives on the left edge, not only in the pill: the list is scanned top to bottom,
+   and "is anything blocking" has to be answerable without reading every header. The comment body
+   keeps the same reading size and 1.65 leading as .ai-text, so a comment does not read as an
+   alert box - it is still prose the model wrote, not an analysis fact. */
+.ai-comments { margin-top: 14px; display: flex; flex-direction: column; gap: 8px; }
+.ai-comments-head { display: flex; align-items: center; gap: 8px; }
+.ai-comments-title { font-size: 12.5px; font-weight: 600; color: var(--text); }
+.ai-comment {
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--risk-info);
+  border-radius: var(--r-tile);
+  background: var(--surface-2);
+  padding: 9px 11px;
+  font-size: 12px;
+  line-height: 1.65;
+  color: var(--text-body);
+}
+.ai-comment.sev-blocker,
+.ai-comment.sev-critical { border-left-color: var(--risk-critical); }
+.ai-comment.sev-major { border-left-color: var(--risk-high); }
+.ai-comment.sev-minor { border-left-color: var(--risk-medium); }
+.ai-comment.sev-info { border-left-color: var(--risk-info); }
+.ai-comment-head { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+.ai-comment-sev {
+  flex: none;
+  padding: 0 7px;
+  border-radius: var(--r-pill);
+  font-size: 10.5px;
+  font-weight: 600;
+  line-height: 1.6;
+  background: var(--surface-3);
+  color: var(--text-2);
+}
+.ai-comment-sev.sev-blocker,
+.ai-comment-sev.sev-critical { background: var(--danger-bg); color: var(--danger-strong); }
+.ai-comment-sev.sev-major { background: var(--warning-bg); color: var(--warning-fg); }
+.ai-comment-sev.sev-minor { background: var(--primary-50); color: var(--primary-700); }
+.ai-comment-sev.sev-info { background: var(--surface-3); color: var(--text-2); }
+.ai-comment-cat { flex: none; font-size: 10.5px; color: var(--text-3); }
+.ai-comment-title { min-width: 0; font-size: 12px; font-weight: 600; color: var(--text); }
+.ai-comment-loc { margin-left: auto; font-size: 11px; color: var(--text-2); }
+.ai-comment-body { margin-top: 5px; white-space: pre-wrap; word-break: break-word; }
+.ai-comment-suggestion { margin-top: 5px; color: var(--text-2); }
+/* Quoted code is a citation, not a diff: no add/del colours, because the comment may quote an
+   unchanged line the model found while the hunk itself is elsewhere. */
+.ai-comment-code {
+  margin: 7px 0 0;
+  padding: 7px 9px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r-control);
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.55;
+  color: var(--text-body);
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-x: auto;
+}
+.ai-comment-meta { margin-top: 6px; font-size: 11px; color: var(--text-3); }
+/* The tally sits below the list: it explains where comments went, so a short list does not read
+   as the model having found little. */
+.ai-comment-stats { margin-top: 9px; font-size: 11px; color: var(--text-3); line-height: 1.6; }
+.ai-comment-note { margin-top: 4px; font-size: 11px; color: var(--text-3); line-height: 1.6; word-break: break-word; }
+.ai-comment-empty {
+  padding: 12px 14px;
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--r-tile);
+  font-size: 12px;
+  color: var(--text-2);
+}
+
 @media (max-width: 860px) {
   .ai-presets { width: 100%; }
+  /* The location is the one part of the header that cannot shrink; give it its own line instead
+     of letting it squeeze the title into a one-character column. */
+  .ai-comment-loc { margin-left: 0; width: 100%; }
 }
 

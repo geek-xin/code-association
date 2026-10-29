@@ -174,26 +174,27 @@ public final class GitSupport {
      * 300k commits would otherwise be walked in full just to fill a dropdown.
      */
     public static List<CommitInfo> commits(Repository repo, ObjectId head, int limit) {
-        List<CommitInfo> out = new ArrayList<>();
-        if (head == null || limit <= 0) {
-            return out;
-        }
-        try (RevWalk walk = new RevWalk(repo)) {
-            walk.markStart(walk.parseCommit(head));
-            walk.sort(org.eclipse.jgit.revwalk.RevSort.TOPO);
-            walk.sort(org.eclipse.jgit.revwalk.RevSort.COMMIT_TIME_DESC, true);
-            for (RevCommit commit : walk) {
-                if (out.size() >= limit) {
-                    break;
-                }
-                out.add(toInfo(commit));
-            }
-        } catch (IOException | RuntimeException e) {
-            // A truncated or shallow clone can fail mid-walk; the commits collected so far are still
-            // true, and the caller shows the list rather than an error page.
-            log.debug("commit walk from {} stopped early: {}", head.name(), describe(e));
-        }
-        return out;
+        return commits(repo, head, limit, null, null);
+    }
+
+    /**
+     * The newest commits of {@code head} inside an optional committer-time window, newest first.
+     *
+     * Bounds are inclusive epoch seconds - exactly what {@link RevCommit#getCommitTime()} returns,
+     * i.e. the same instant the commit list renders as its date. Filtering on any other clock (the
+     * author date, for instance) would let a commit be shown as Tuesday and rejected by a Tuesday
+     * filter. {@code null} means "no bound", so the older three-argument method can delegate here
+     * instead of keeping a second walk in sync.
+     *
+     * Because the walk is sorted newest first, a window is applied as "skip until it starts, stop
+     * after it ends": commits newer than {@code until} are skipped (they are just history the
+     * dropdown did not ask for), and the first commit older than {@code since} ends the walk,
+     * since everything after it is older still. Stopping is the point of the design - a filter near
+     * the end of a long history must not cost a full walk.
+     */
+    public static List<CommitInfo> commits(Repository repo, ObjectId head, int limit,
+                                           Long sinceEpochSecond, Long untilEpochSecond) {
+        return collect(repo, null, head, limit, sinceEpochSecond, untilEpochSecond);
     }
 
     /**
@@ -204,27 +205,61 @@ public final class GitSupport {
      * case (a first commit has no parent to exclude).
      */
     public static List<CommitInfo> commitsInRange(Repository repo, ObjectId base, ObjectId head, int limit) {
+        return commitsInRange(repo, base, head, limit, null, null);
+    }
+
+    /**
+     * The commits of {@code base}..{@code head} inside an optional committer-time window.
+     *
+     * The window composes with the range rather than replacing it: "the commits merged into this
+     * branch between these two days" is a question that neither the endpoints nor the dates answer
+     * on their own.
+     */
+    public static List<CommitInfo> commitsInRange(Repository repo, ObjectId base, ObjectId head, int limit,
+                                                  Long sinceEpochSecond, Long untilEpochSecond) {
+        return collect(repo, base, head, limit, sinceEpochSecond, untilEpochSecond);
+    }
+
+    /**
+     * One bounded, newest-first walk shared by both public forms.
+     *
+     * {@code base} is excluded when present; the time window is applied per commit as described on
+     * {@link #commits(Repository, ObjectId, int, Long, Long)}. A failure is logged and the commits
+     * collected so far returned: the caller is a picker that must stay usable on a truncated or
+     * shallow clone.
+     */
+    private static List<CommitInfo> collect(Repository repo, ObjectId base, ObjectId head, int limit,
+                                            Long sinceEpochSecond, Long untilEpochSecond) {
         List<CommitInfo> out = new ArrayList<>();
         if (head == null || limit <= 0) {
             return out;
         }
+        String walkName = base == null ? "commit walk from " + head.name()
+                : "range walk " + base.name() + ".." + head.name();
         try (RevWalk walk = new RevWalk(repo)) {
-            RevCommit headCommit = walk.parseCommit(head);
-            walk.markStart(headCommit);
+            walk.markStart(walk.parseCommit(head));
             if (base != null && !base.equals(head)) {
                 walk.markUninteresting(walk.parseCommit(base));
             }
             walk.sort(org.eclipse.jgit.revwalk.RevSort.TOPO);
             walk.sort(org.eclipse.jgit.revwalk.RevSort.COMMIT_TIME_DESC, true);
             for (RevCommit commit : walk) {
-                if (out.size() >= limit) {
+                int committedAt = commit.getCommitTime();
+                if (untilEpochSecond != null && committedAt > untilEpochSecond) {
+                    continue;
+                }
+                if (sinceEpochSecond != null && committedAt < sinceEpochSecond) {
                     break;
                 }
                 out.add(toInfo(commit));
+                if (out.size() >= limit) {
+                    break;
+                }
             }
         } catch (IOException | RuntimeException e) {
-            log.debug("range walk {}..{} stopped early: {}",
-                    base == null ? "(root)" : base.name(), head.name(), describe(e));
+            // A truncated or shallow clone can fail mid-walk; the commits collected so far are still
+            // true, and the caller shows the list rather than an error page.
+            log.debug("{} stopped early: {}", walkName, describe(e));
         }
         return out;
     }

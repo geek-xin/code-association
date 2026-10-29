@@ -793,6 +793,83 @@ class PeerImpactTest {
                 "a dropped column is observable, so it must not be counted as non-observable");
     }
 
+    /**
+     * Deleting a mapper statement that wrote a column is not dropping the column.
+     *
+     * This is the reported false positive: `updateErrorMessage` was removed, and the report put
+     * every other program that reads `igm_card_right_log.error_reason` into the impact list. The
+     * column still exists; the peer's SELECT still returns a value. Only an explicit DROP COLUMN
+     * migration can make the column unreadable.
+     */
+    @Test
+    void removingAWriteStatementIsNotADroppedColumn(@TempDir Path tmp) throws IOException {
+        Change change = mapperChange(tmp,
+                "<update id=\"updateErrorMessage\">UPDATE igm_card_right_log "
+                        + "SET error_reason = #{errorReason} WHERE id = #{id}</update>",
+                "<select id=\"noop\">SELECT 1</select>");
+        assertTrue(change.records.stream().anyMatch(c -> ChangeDetector.SQL_REMOVED.equals(c.changeType)),
+                "removing the statement must be detected: " + change.records);
+
+        Path peerDir = tmp.resolve("r");
+        write(peerDir, "pom.xml", "<project><modelVersion>4.0.0</modelVersion>"
+                + "<groupId>com.example</groupId><artifactId>reader</artifactId><version>1.0</version></project>");
+        write(peerDir, "src/main/resources/mapper/AuthMapper.xml",
+                "<mapper namespace=\"com.example.r.AuthMapper\">"
+                        + "<select id=\"getRightLogList\">SELECT error_reason FROM igm_card_right_log "
+                        + "WHERE id = #{id}</select></mapper>");
+        PeerImpact result = analyzeAgainst(change, index(peerDir));
+
+        assertTrue(result.matches.isEmpty(),
+                "a removed writer does not delete the column a peer reads: " + describe(result));
+        assertTrue(result.impacts.isEmpty(), "and it must not produce an impact row: " + describe(result));
+        assertTrue(result.dbNonObservableChanges > 0,
+                "the change must still be counted as reviewed: " + result.dbNonObservableExamples);
+        assertTrue(result.dbNonObservableExamples.stream()
+                        .anyMatch(e -> e.contains("igm_card_right_log.error_reason")),
+                "the count must name the column: " + result.dbNonObservableExamples);
+    }
+
+    /**
+     * A column missing from a snapshot comparison is not proof that a migration dropped it.
+     *
+     * If the CREATE TABLE script is edited to stop listing the column, the deployed schema is
+     * unchanged (the migration already ran); only an explicit DROP COLUMN action can be deployed as
+     * a deletion. Reporting the snapshot difference as a drop made every peer reader a false alarm.
+     */
+    @Test
+    void snapshotInferredColumnDisappearanceWithoutDropScriptIsNotADrop(@TempDir Path tmp) throws IOException {
+        Path base = tmp.resolve("base");
+        write(base, "pom.xml", WRITER_POM);
+        write(base, "src/main/resources/db/migration/V1__right_log.sql",
+                "CREATE TABLE igm_card_right_log (id BIGINT PRIMARY KEY, error_reason VARCHAR(64));");
+        Path head = tmp.resolve("head");
+        write(head, "pom.xml", WRITER_POM);
+        write(head, "src/main/resources/db/migration/V1__right_log.sql",
+                "CREATE TABLE igm_card_right_log (id BIGINT PRIMARY KEY);");
+        Change change = detectChanges(base, head);
+
+        assertTrue(change.records.stream().anyMatch(c -> ChangeDetector.DDL_CHANGED.equals(c.changeType)
+                        && "DROP_COLUMN".equals(c.extra.get("ddl"))
+                        && "true".equals(c.extra.get("schemaDiff"))),
+                "the snapshot difference is recorded, but marked as inferred: " + change.records);
+
+        Path peerDir = tmp.resolve("r");
+        write(peerDir, "pom.xml", "<project><modelVersion>4.0.0</modelVersion>"
+                + "<groupId>com.example</groupId><artifactId>reader</artifactId><version>1.0</version></project>");
+        write(peerDir, "src/main/resources/mapper/AuthMapper.xml",
+                "<mapper namespace=\"com.example.r.AuthMapper\">"
+                        + "<select id=\"getRightLogList\">SELECT error_reason FROM igm_card_right_log "
+                        + "WHERE id = #{id}</select></mapper>");
+        PeerImpact result = analyzeAgainst(change, index(peerDir));
+
+        assertTrue(result.matches.isEmpty(),
+                "an inferred drop without a DROP COLUMN script is not a schema break: " + describe(result));
+        assertTrue(result.impacts.isEmpty(), "and it must not produce an impact row: " + describe(result));
+        assertTrue(result.dbNonObservableExamples.stream()
+                        .anyMatch(e -> e.contains("igm_card_right_log.error_reason")),
+                "the change must be counted with the column name: " + result.dbNonObservableExamples);
+    }
+
     /** Dropping a whole table leaves no column to name, so the table itself becomes the contract. */
     @Test
     void droppingATableFallsBackToTheTableContract(@TempDir Path tmp) throws IOException {

@@ -13,6 +13,7 @@ import com.geek.association.model.RepoSource;
 import com.geek.association.parse.CodeIndexer;
 import com.geek.association.report.AiExplainer;
 import com.geek.association.report.ImpactReport;
+import com.geek.association.review.FileContent;
 import com.geek.association.report.ReportBuilder;
 import com.geek.association.source.GitSupport;
 import com.geek.association.source.RepositoryPreparer;
@@ -226,7 +227,10 @@ public class AnalysisService {
                     // turn a good analysis into a FAILED row.
                     long aiStart = System.currentTimeMillis();
                     try {
-                        report.ai = aiExplainer.explain(report, properties.getAi().getMaxImpacts());
+                        // The head snapshot is the only place the full new file exists; passing it
+                        // enables the locator's second layer for this live run.
+                        FileContent head = revisions.head == null ? FileContent.NONE : revisions.head::read;
+                        report.ai = aiExplainer.explain(report, properties.getAi().getMaxImpacts(), head);
                         log.info(LogEvents.of("analysis.ai",
                                 "analysisId", analysis.id,
                                 "generated", generatedOf(report.ai),

@@ -22,6 +22,20 @@ public final class MarkdownReport {
             "DATA", "数据", "CONFIG", "配置", "TYPE", "类型", "STRUCTURE", "结构", "SECURITY", "安全",
             "MESSAGE_CONTRACT", "消息契约", "MESSAGE_BEHAVIOR", "消息行为");
 
+    /**
+     * Severity of a review comment, mapped to the same colour language as impact risk levels so a
+     * reader does not have to learn a second scale for the new section.
+     */
+    private static final Map<String, String> COMMENT_ICON = Map.of(
+            "BLOCKER", "🔴", "CRITICAL", "🔴", "MAJOR", "🟠", "MINOR", "🟡", "INFO", "⚪");
+
+    /** Where the line number came from; the reader needs to know how much to trust the anchor. */
+    private static final Map<String, String> ANCHOR_LABEL = Map.of(
+            "HUNK", "变更块内匹配", "FILE", "整文件匹配", "RELOCATED", "模型重定位", "NONE", "未定位");
+
+    /** Hard stop for the PR comment: a runaway list must not push the analysis limits off screen. */
+    private static final int MAX_COMMENTS = 50;
+
     private MarkdownReport() {
     }
 
@@ -156,6 +170,141 @@ public final class MarkdownReport {
             sb.append(" · 生成于 ").append(generatedAt);
         }
         sb.append("</sub>\n\n");
+        appendAiComments(sb, report.ai.get("comments"), report.ai.get("reviewStats"));
+    }
+
+    /**
+     * The line-anchored comments, printed only when there is at least one.
+     *
+     * Same rule as the summary: an absent or empty list prints nothing, so an installation that
+     * never enabled comments (or a run that found none) produces byte-for-byte the old output.
+     * The section is explicitly "待验证" because the model wrote the wording; only the line number
+     * is deterministic, and that is what the anchor note tells the reader.
+     */
+    private static void appendAiComments(StringBuilder sb, Object rawComments, Object rawStats) {
+        if (!(rawComments instanceof List<?> comments) || comments.isEmpty()) {
+            return;
+        }
+        sb.append("### AI 逐条评审意见（待验证）\n\n");
+        // The model never writes the line number: it quotes code and the pipeline places it. Saying
+        // so here keeps "line 42" from reading as an analysis fact.
+        sb.append("> 行号由变更片段与文件内容匹配得出，不是模型写的；无法定位到具体行的评论已丢弃。\n\n");
+        int index = 0;
+        for (Object item : comments) {
+            if (index >= MAX_COMMENTS) {
+                break;
+            }
+            if (!(item instanceof Map<?, ?> comment)) {
+                continue;
+            }
+            index++;
+            String severity = upper(comment.get("severity"));
+            String title = text(comment.get("title"));
+            sb.append(index).append(". ").append(COMMENT_ICON.getOrDefault(severity, "⚪"))
+                    .append(" **").append(severity.isEmpty() ? "INFO" : severity).append("** · ")
+                    .append(title).append('\n');
+            sb.append("   - 位置：").append(code(location(comment))).append(locationNote(comment)).append('\n');
+            String detail = text(comment.get("detail"));
+            if (!detail.isBlank()) {
+                sb.append("   - 正文：").append(detail).append('\n');
+            }
+            String suggestion = text(comment.get("suggestion"));
+            if (!suggestion.isBlank()) {
+                sb.append("   - 建议：").append(suggestion).append('\n');
+            }
+            String existingCode = text(comment.get("existingCode")).strip();
+            if (!existingCode.isEmpty()) {
+                if (existingCode.contains("\n")) {
+                    // A multi-line quote stays verbatim: collapsing it would change the very thing
+                    // the reader is asked to verify against the file.
+                    sb.append("   - 代码：\n\n     ").append(CODE).append(CODE).append(CODE)
+                            .append("text\n");
+                    for (String line : existingCode.split("\n", -1)) {
+                        sb.append("     ").append(line).append('\n');
+                    }
+                    sb.append("     ").append(CODE).append(CODE).append(CODE).append('\n');
+                } else {
+                    sb.append("   - 代码：").append(code(existingCode)).append('\n');
+                }
+            }
+        }
+        if (index < comments.size()) {
+            sb.append("\n还有 ").append(comments.size() - index).append(" 条评论未在 PR 评论中展开。\n");
+        }
+        sb.append('\n');
+        appendReviewStats(sb, rawStats);
+    }
+
+    /** One line of counts: where the comments went, so a short list is explainable. */
+    private static void appendReviewStats(StringBuilder sb, Object rawStats) {
+        if (!(rawStats instanceof Map<?, ?> stats)) {
+            return;
+        }
+        List<String> parts = new java.util.ArrayList<>();
+        addCount(parts, "审阅文件", stats.get("filesReviewed"));
+        addCount(parts, "跳过文件", stats.get("filesSkipped"));
+        addCount(parts, "保留评论", stats.get("commentsKept"));
+        addCount(parts, "未定位丢弃", stats.get("commentsDroppedUnlocated"));
+        addCount(parts, "过滤", stats.get("commentsDroppedFiltered"));
+        addCount(parts, "反思删除", stats.get("commentsDroppedReflection"));
+        addCount(parts, "合并", stats.get("commentsMerged"));
+        addCount(parts, "重定位调用", stats.get("relocationCalls"));
+        if (Boolean.TRUE.equals(stats.get("reflectionRan"))) {
+            parts.add("反思已执行");
+        }
+        Object tokens = stats.get("estimatedTokens");
+        if (tokens instanceof Number number && number.longValue() > 0) {
+            parts.add("约 " + number.longValue() + " tokens");
+        }
+        if (!parts.isEmpty()) {
+            sb.append("统计：").append(String.join(" · ", parts)).append("\n\n");
+        }
+    }
+
+    private static void addCount(List<String> parts, String label, Object value) {
+        if (value instanceof Number number && number.longValue() > 0) {
+            parts.add(label + " " + number.longValue());
+        }
+    }
+
+    /** "path:start-end", or "path:start" when the comment covers one line. */
+    private static String location(Map<?, ?> comment) {
+        String file = text(comment.get("file"));
+        int start = integer(comment.get("startLine"));
+        int end = integer(comment.get("endLine"));
+        if (start <= 0) {
+            return file;
+        }
+        return file + ":" + start + (end > start ? "-" + end : "");
+    }
+
+    /** The old/new side and the anchor quality, in one parenthesis after the location. */
+    private static String locationNote(Map<?, ?> comment) {
+        List<String> parts = new java.util.ArrayList<>();
+        parts.add("OLD".equalsIgnoreCase(text(comment.get("side"))) ? "删除行" : "新增行");
+        String anchor = upper(comment.get("anchor"));
+        parts.add("定位 " + ANCHOR_LABEL.getOrDefault(anchor, "未定位"));
+        Object evidence = comment.get("evidence");
+        if (evidence instanceof List<?> ids && !ids.isEmpty()) {
+            parts.add("证据 " + String.join("、", ids.stream().map(Object::toString).toList()));
+        }
+        Object confidence = comment.get("confidence");
+        if (confidence instanceof Number number && number.doubleValue() > 0) {
+            parts.add("置信度 " + Math.round(Math.min(1.0, number.doubleValue()) * 100) + "%");
+        }
+        return "（" + String.join(" · ", parts) + "）";
+    }
+
+    private static int integer(Object value) {
+        return value instanceof Number number ? number.intValue() : 0;
+    }
+
+    private static String upper(Object value) {
+        return value == null ? "" : value.toString().strip().toUpperCase();
+    }
+
+    private static String text(Object value) {
+        return value == null ? "" : value.toString();
     }
 
     private static String code(String value) {

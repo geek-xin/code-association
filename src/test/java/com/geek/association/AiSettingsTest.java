@@ -51,6 +51,10 @@ class AiSettingsTest {
         assertEquals(true, view.get("ready"));
         assertEquals("", view.get("reason"));
         assertEquals("file", view.get("configuredBy"));
+        // The comment layer is on by default and bounded like the impact list.
+        assertEquals(true, view.get("comments"));
+        assertEquals(12, view.get("maxComments"));
+        assertEquals(true, view.get("reflection"));
         assertFalse(view.containsKey("apiKey"), "the key itself must never be part of the payload");
 
         String raw = Json.write(view);
@@ -106,6 +110,10 @@ class AiSettingsTest {
                 () -> settings.update(Map.of("timeoutSeconds", 4)));
         assertEquals("请求超时需在 5..300 秒之间", timeout.getMessage());
 
+        IllegalArgumentException comments = assertThrows(IllegalArgumentException.class,
+                () -> settings.update(Map.of("maxComments", 51)));
+        assertEquals("每条分析最多评论条数需在 1..50 之间", comments.getMessage());
+
         // A rejected request must not have applied the fields it carried.
         assertEquals("", settings.view().get("baseUrl"));
         assertEquals(12, settings.view().get("maxImpacts"));
@@ -131,14 +139,17 @@ class AiSettingsTest {
     @Test
     void settingsSurviveARestartAndTheFileIsOwnerOnly(@TempDir Path tmp) throws Exception {
         AiSettings first = settings(tmp);
-        first.update(Map.of(
-                "enabled", true,
-                "baseUrl", "https://api.openai.com/v1",
-                "model", "gpt-4o-mini",
-                "apiKey", "sk-persist-1234567890",
-                "maxImpacts", 20,
-                "timeoutSeconds", 120,
-                "defaultForRuns", false));
+        first.update(Map.ofEntries(
+                Map.entry("enabled", true),
+                Map.entry("baseUrl", "https://api.openai.com/v1"),
+                Map.entry("model", "gpt-4o-mini"),
+                Map.entry("apiKey", "sk-persist-1234567890"),
+                Map.entry("maxImpacts", 20),
+                Map.entry("timeoutSeconds", 120),
+                Map.entry("defaultForRuns", false),
+                Map.entry("comments", false),
+                Map.entry("maxComments", 8),
+                Map.entry("reflection", false)));
 
         // A new instance is what the next process start does: read the file over the baseline.
         AppProperties restarted = new AppProperties();
@@ -153,6 +164,9 @@ class AiSettingsTest {
         assertEquals(20, view.get("maxImpacts"));
         assertEquals(120, view.get("timeoutSeconds"));
         assertEquals(false, view.get("defaultForRuns"));
+        assertEquals(false, view.get("comments"));
+        assertEquals(8, view.get("maxComments"));
+        assertEquals(false, view.get("reflection"));
         assertEquals("file", view.get("configuredBy"));
         assertEquals(true, view.get("apiKeySet"), "the key has to survive the restart too");
 

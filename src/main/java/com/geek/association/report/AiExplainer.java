@@ -5,6 +5,9 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.geek.association.config.AppProperties;
 import com.geek.association.model.ImpactResult;
+import com.geek.association.review.AiReviewPipeline;
+import com.geek.association.review.FileContent;
+import com.geek.association.review.ReviewComment;
 import com.geek.association.util.Json;
 import com.geek.association.util.LogEvents;
 import com.geek.association.util.Texts;
@@ -19,7 +22,9 @@ import java.net.http.HttpResponse;
 import java.net.http.HttpTimeoutException;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -52,9 +57,19 @@ public class AiExplainer {
     private static final int TEST_MAX_TOKENS = 8;
 
     private final AppProperties properties;
+    /**
+     * The comment pipeline is created once and reads the live settings on every call, so a settings
+     * save takes effect without rebuilding any bean.
+     */
+    private final AiReviewPipeline reviewPipeline;
 
     public AiExplainer(AppProperties properties) {
         this.properties = properties;
+        this.reviewPipeline = new AiReviewPipeline((systemPrompt, prompt, maxTokens) -> {
+            AppProperties.Ai current = properties.getAi();
+            return call(prompt, current.getTimeoutSeconds(), systemPrompt,
+                    current.getBaseUrl(), current.getModel(), current.getApiKey(), maxTokens);
+        });
     }
 
     /**
@@ -93,6 +108,18 @@ public class AiExplainer {
      * @param maxImpacts how many impact rows may be sent; the prompt is the cost of the call
      */
     public Map<String, Object> explain(ImpactReport report, int maxImpacts) {
+        return explain(report, maxImpacts, FileContent.NONE);
+    }
+
+    /**
+     * Same call, with the head snapshot available for the second localization layer.
+     *
+     * A live run passes the head source, so a comment quoting code from an unchanged part of a
+     * changed file can still be placed. Regenerating a historical report passes
+     * {@link FileContent#NONE}: only the stored hunks are available, and the pipeline skips the
+     * full-file layer rather than pretending it ran.
+     */
+    public Map<String, Object> explain(ImpactReport report, int maxImpacts, FileContent files) {
         if (!ready()) {
             return null;
         }
@@ -112,10 +139,55 @@ public class AiExplainer {
             // a补生成 hours later must not inherit the analysis time.
             out.put("generatedAt", Instant.now().toString());
             out.put("maxImpacts", maxImpacts);
+            appendComments(out, report, files, maxImpacts);
             return out;
         } catch (Exception e) {
             log.warn("AI review failed: {}", describeFailure(e, ai.getTimeoutSeconds(), ai));
             return failure(describeFailure(e, ai.getTimeoutSeconds(), ai));
+        }
+    }
+
+    /**
+     * Adds the line-anchored comments to an already successful summary.
+     *
+     * Deliberately separate from the summary call and deliberately non-fatal: the summary is the
+     * existing promise, and a model that answers the summary but fails every comment request must
+     * leave the report with a usable AI section instead of turning it into a failure.
+     */
+    private void appendComments(Map<String, Object> out, ImpactReport report, FileContent files,
+                                int maxImpacts) {
+        AppProperties.Ai ai = properties.getAi();
+        if (!ai.isComments()) {
+            return;
+        }
+        long started = System.currentTimeMillis();
+        try {
+            AiReviewPipeline.Result result = reviewPipeline.review(report, files, maxImpacts,
+                    ai.getMaxComments(), ai.isReflection());
+            List<Map<String, Object>> comments = new ArrayList<>();
+            for (ReviewComment comment : result.comments) {
+                comments.add(comment.view());
+            }
+            out.put("comments", comments);
+            out.put("reviewStats", result.stats);
+            if (result.error != null) {
+                out.put("reviewError", Texts.truncate(result.error, 300));
+            }
+            log.info(LogEvents.of("ai.review",
+                    "comments", comments.size(),
+                    "files", result.stats.get("filesReviewed"),
+                    "unlocated", result.stats.get("commentsDroppedUnlocated"),
+                    "filtered", result.stats.get("commentsDroppedFiltered"),
+                    "reflected", result.stats.get("commentsDroppedReflection"),
+                    "durationMs", LogEvents.msSince(started),
+                    "error", result.error));
+        } catch (RuntimeException e) {
+            // Comments are the new layer; their bug must not take the summary down with them.
+            out.put("comments", List.of());
+            Map<String, Object> stats = new LinkedHashMap<>();
+            stats.put("error", Texts.truncate(e.toString(), 300));
+            out.put("reviewStats", stats);
+            log.warn("AI review comments failed: {}", e.toString());
         }
     }
 

@@ -48,6 +48,9 @@ public class AiSettings {
     private static final int MAX_IMPACTS_MAX = 50;
     private static final int TIMEOUT_MIN = 5;
     private static final int TIMEOUT_MAX = 300;
+    /** Bounds of {@link AppProperties.Ai#getMaxComments()}, same reasoning as maxImpacts. */
+    private static final int MAX_COMMENTS_MIN = 1;
+    private static final int MAX_COMMENTS_MAX = 50;
 
     private final AppProperties properties;
     /** Whether the file was read successfully, which is what {@code configuredBy} reports. */
@@ -75,7 +78,9 @@ public class AiSettings {
                     "file", file, "enabled", properties.getAi().isEnabled(),
                     "baseUrl", properties.getAi().getBaseUrl(),
                     "model", properties.getAi().getModel(),
-                    "maxImpacts", properties.getAi().getMaxImpacts()));
+                    "maxImpacts", properties.getAi().getMaxImpacts(),
+                    "comments", properties.getAi().isComments(),
+                    "maxComments", properties.getAi().getMaxComments()));
             return;
         }
         try {
@@ -111,10 +116,21 @@ public class AiSettings {
             if (root.has("defaultForRuns")) {
                 ai.setDefaultForRuns(root.path("defaultForRuns").asBoolean(ai.isDefaultForRuns()));
             }
+            if (root.has("comments")) {
+                ai.setComments(root.path("comments").asBoolean(ai.isComments()));
+            }
+            if (root.has("maxComments")) {
+                int value = root.path("maxComments").asInt(ai.getMaxComments());
+                ai.setMaxComments(clamp(value, MAX_COMMENTS_MIN, MAX_COMMENTS_MAX, ai.getMaxComments()));
+            }
+            if (root.has("reflection")) {
+                ai.setReflection(root.path("reflection").asBoolean(ai.isReflection()));
+            }
             loadedFromFile = true;
             log.info(LogEvents.of("ai.settings", "loaded", true, "source", "file", "file", file,
                     "enabled", ai.isEnabled(), "baseUrl", ai.getBaseUrl(),
-                    "model", ai.getModel(), "maxImpacts", ai.getMaxImpacts()));
+                    "model", ai.getModel(), "maxImpacts", ai.getMaxImpacts(),
+                    "comments", ai.isComments(), "maxComments", ai.getMaxComments()));
         } catch (IOException | RuntimeException e) {
             // The file is user-writable and may be truncated by a crash or edited by hand. Losing
             // the customisations is recoverable; refusing to boot over a settings file is not.
@@ -147,6 +163,9 @@ public class AiSettings {
         out.put("maxImpacts", ai.getMaxImpacts());
         out.put("timeoutSeconds", ai.getTimeoutSeconds());
         out.put("defaultForRuns", ai.isDefaultForRuns());
+        out.put("comments", ai.isComments());
+        out.put("maxComments", ai.getMaxComments());
+        out.put("reflection", ai.isReflection());
         out.put("ready", ai.ready());
         out.put("reason", ai.notReadyReason());
         out.put("configuredBy", loadedFromFile ? "file" : "application.yml");
@@ -182,6 +201,12 @@ public class AiSettings {
                     ? number(body.get("timeoutSeconds"), ai.getTimeoutSeconds()) : ai.getTimeoutSeconds();
             boolean defaultForRuns = body != null && body.containsKey("defaultForRuns")
                     ? flag(body.get("defaultForRuns"), ai.isDefaultForRuns()) : ai.isDefaultForRuns();
+            boolean comments = body != null && body.containsKey("comments")
+                    ? flag(body.get("comments"), ai.isComments()) : ai.isComments();
+            int maxComments = body != null && body.containsKey("maxComments")
+                    ? number(body.get("maxComments"), ai.getMaxComments()) : ai.getMaxComments();
+            boolean reflection = body != null && body.containsKey("reflection")
+                    ? flag(body.get("reflection"), ai.isReflection()) : ai.isReflection();
 
             // The protocol is checked before "is it filled in" so a half-typed URL gets the message
             // that names the actual problem instead of "已启用但未填写接口地址".
@@ -200,6 +225,10 @@ public class AiSettings {
             }
             if (timeoutSeconds < TIMEOUT_MIN || timeoutSeconds > TIMEOUT_MAX) {
                 throw new IllegalArgumentException("请求超时需在 " + TIMEOUT_MIN + ".." + TIMEOUT_MAX + " 秒之间");
+            }
+            if (maxComments < MAX_COMMENTS_MIN || maxComments > MAX_COMMENTS_MAX) {
+                throw new IllegalArgumentException("每条分析最多评论条数需在 " + MAX_COMMENTS_MIN
+                        + ".." + MAX_COMMENTS_MAX + " 之间");
             }
 
             String apiKey = ai.getApiKey();
@@ -223,6 +252,9 @@ public class AiSettings {
             ai.setMaxImpacts(maxImpacts);
             ai.setTimeoutSeconds(timeoutSeconds);
             ai.setDefaultForRuns(defaultForRuns);
+            ai.setComments(comments);
+            ai.setMaxComments(maxComments);
+            ai.setReflection(reflection);
 
             loadedFromFile = persist(ai);
         }
@@ -234,7 +266,9 @@ public class AiSettings {
         log.info(LogEvents.of("ai.settings", "loaded", loadedFromFile,
                 "source", loadedFromFile ? "file" : "default",
                 "enabled", applied.isEnabled(), "baseUrl", applied.getBaseUrl(),
-                "model", applied.getModel(), "maxImpacts", applied.getMaxImpacts()));
+                "model", applied.getModel(), "maxImpacts", applied.getMaxImpacts(),
+                "comments", applied.isComments(), "maxComments", applied.getMaxComments(),
+                "reflection", applied.isReflection()));
         return view();
     }
 
@@ -265,6 +299,9 @@ public class AiSettings {
         snapshot.put("maxImpacts", ai.getMaxImpacts());
         snapshot.put("timeoutSeconds", ai.getTimeoutSeconds());
         snapshot.put("defaultForRuns", ai.isDefaultForRuns());
+        snapshot.put("comments", ai.isComments());
+        snapshot.put("maxComments", ai.getMaxComments());
+        snapshot.put("reflection", ai.isReflection());
 
         Path tmp = file.resolveSibling(file.getFileName() + ".tmp");
         try {

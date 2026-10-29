@@ -951,7 +951,7 @@
           <div class="card-head">
             <div>
               <div class="card-title">AI 审核（可选）</div>
-              <div class="card-sub">来自 /api/ai · 只有启用后才会把分析摘要发送给模型服务</div>
+              <div class="card-sub">来自 /api/ai · 只有启用后才会把分析摘要（开启逐条意见时还有变更片段）发送给模型服务</div>
             </div>
             <div class="card-head-actions">
               <button class="btn btn-sm" id="ai-test" data-ai-test type="button"
@@ -1022,11 +1022,21 @@
               </div>
             </div>
 
+            <label class="checkbox"><input type="checkbox" id="ai-comments" checked/> 生成逐条评审意见（发送变更片段，不发送源码全文）</label>
+            <div class="field">
+              <label for="ai-max-comments">每条分析最多评论</label>
+              <input id="ai-max-comments" type="number" min="1" max="50" step="1" placeholder="12"/>
+              <div class="hint">1–50 条。评论必须能定位到具体代码行才保留；超出上限时按严重级截断。</div>
+            </div>
+            <label class="checkbox"><input type="checkbox" id="ai-reflection" checked/> 用反思模型过滤误报（额外一次模型调用）</label>
+
             <label class="checkbox"><input type="checkbox" id="ai-default-runs"/> 默认在每次分析时生成 AI 审核</label>
 
             <div class="callout" id="ai-privacy">
               <svg><use href="#i-shield"/></svg>
-              <div>只发送分析摘要：变更清单、影响路径与原因、盲区与统计。不发送源码全文，也不发送仓库地址。
+              <div>默认只发送分析摘要：变更清单、影响路径与原因、盲区与统计。开启「生成逐条评审意见」后，
+                额外发送本次变更的代码片段（diff 中的变更行及其上下文），用于把意见锚定到具体行；
+                不发送源码全文（未变更部分只在本机扫描定位），也不发送仓库地址。
                 生成结果标注为「AI 生成 · 待验证」，与静态分析结论分开存放。</div>
             </div>
 
@@ -1185,7 +1195,7 @@
           <option value="COMMIT_RANGE">提交范围</option>
         </select>
       </div>
-      <div class="field-row">
+      <div class="field-row" id="mr-scope-row">
         <div class="field" id="mr-base-wrap">
           <label for="mr-base" id="mr-base-label">基线</label>
           <input id="mr-base" list="mr-refs" placeholder="留空 = 目标提交的父提交"/>
@@ -1196,12 +1206,31 @@
         </div>
       </div>
       <datalist id="mr-refs"></datalist>
-      <datalist id="mr-commits"></datalist>
-      <!-- Commit range preview. Hidden for every other mode: it is the answer to "which commits am
-           I actually about to analyse", a question only the range mode asks. -->
+      <!-- Date window for the commit picker. Only the range mode asks it: "which commits" is a
+           question about a branch and a period, not about two named endpoints. -->
+      <div class="field hidden" id="mr-range-filter">
+        <div class="field-row">
+          <div class="field">
+            <label for="mr-since">起始日期（含）</label>
+            <input id="mr-since" type="date"/>
+          </div>
+          <div class="field">
+            <label for="mr-until">结束日期（含）</label>
+            <input id="mr-until" type="date"/>
+          </div>
+        </div>
+        <div class="hint">不填日期时列出该分支最新的 100 个提交。</div>
+      </div>
+      <!-- Commit picker. Hidden for every other mode: it is the answer to "which commits am I
+           actually about to analyse", a question only the range mode asks. The ticks are the
+           request - without at least one there is nothing to analyse. -->
       <div class="field hidden" id="mr-range-preview">
-        <label>本次包含的提交</label>
-        <div class="hint" id="mr-range-hint">两端都填好后，这里会列出范围内的提交。</div>
+        <label>选择要分析的提交 <span class="req">*</span></label>
+        <div class="hint" id="mr-range-hint">选择代码源与该分支后，这里会列出可勾选的提交。</div>
+        <div class="commit-actions hidden" id="mr-range-actions">
+          <button class="btn btn-sm" type="button" id="mr-range-all">全选</button>
+          <button class="btn btn-sm" type="button" id="mr-range-none">清空</button>
+        </div>
         <div class="commit-list" id="mr-range-list"></div>
       </div>
       <div class="field hidden" id="mr-pr-wrap">
@@ -1225,7 +1254,7 @@
            switch in 设置, not in a dialog the user opens to start a scan. -->
       <div class="field hidden" id="mr-ai-wrap">
         <label class="checkbox"><input type="checkbox" id="mr-ai"/> 同时生成 AI 评审说明（可选）</label>
-        <div class="hint" id="mr-ai-hint">只发送本次分析摘要，不发送源码全文。</div>
+        <div class="hint" id="mr-ai-hint">只发送本次分析摘要与变更片段，不发送源码全文。</div>
       </div>
 
       <div class="callout" id="mr-error" style="display:none">

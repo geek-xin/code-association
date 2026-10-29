@@ -13,6 +13,11 @@ import org.springframework.stereotype.Component;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.LocalDate;
+import java.time.LocalTime;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -502,13 +507,68 @@ public class RepositoryPreparer {
      * unreachable, so a failure is reported as an empty list plus one sentence a person can act on.
      */
     public Map<String, Object> commits(RepoSource source, String base, String target, int limit) {
+        return commits(source, base, target, limit, null, null);
+    }
+
+    /**
+     * The same picker narrowed by a committer-time window.
+     *
+     * <p>The window exists because the run form no longer needs a start commit: the user ticks
+     * commits from this list and only wants "the ones from last week" in front of them. It is
+     * applied while walking rather than on the client, so the response can also say {@code more}
+     * exactly - the client cannot know whether the unlisted commits exist.</p>
+     *
+     * <p>Both dates are {@code yyyy-MM-dd} in the JVM default zone and inclusive at both ends,
+     * which is what a person means by "from Monday to Wednesday": the whole of both days, not the
+     * instants the strings happen to denote. The filter reads the committer time, the same instant
+     * the list renders as a commit's date, so a commit shown as Tuesday is found by a Tuesday
+     * query.</p>
+     *
+     * <p>Bad input never throws: this is a form helper, so a malformed date or an inverted window
+     * keeps the response shape and puts the explanation in {@code note}. The window is validated
+     * before the repository is opened because a mistyped date is the more likely mistake and its
+     * message must not be buried under "this is not a git repository".</p>
+     *
+     * @param since first day to include, or null for no lower bound
+     * @param until last day to include, or null for no upper bound
+     */
+    public Map<String, Object> commits(RepoSource source, String base, String target, int limit,
+                                       String since, String until) {
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("commits", List.of());
         out.put("count", 0);
         out.put("ref", "");
         out.put("base", "");
         out.put("target", "");
+        out.put("since", "");
+        out.put("until", "");
+        out.put("more", false);
         out.put("note", "");
+        LocalDate sinceDate = parseCommitDate(since);
+        LocalDate untilDate = parseCommitDate(until);
+        if (!Texts.isBlank(since) && sinceDate == null) {
+            out.put("note", "时间范围格式不正确：" + since.strip());
+            return out;
+        }
+        if (!Texts.isBlank(until) && untilDate == null) {
+            out.put("note", "时间范围格式不正确：" + until.strip());
+            return out;
+        }
+        // Echo the parsed date rather than the typed text: the form re-renders its inputs from the
+        // response, and an accepted value must come back in one canonical form. An absent or
+        // unusable value stays "" so the form cannot mistake it for an applied filter.
+        out.put("since", sinceDate == null ? "" : sinceDate.toString());
+        out.put("until", untilDate == null ? "" : untilDate.toString());
+        if (sinceDate != null && untilDate != null && sinceDate.isAfter(untilDate)) {
+            out.put("note", "起始日期不能晚于结束日期");
+            return out;
+        }
+        ZoneId zone = ZoneId.systemDefault();
+        Long sinceEpoch = sinceDate == null ? null : sinceDate.atStartOfDay(zone).toEpochSecond();
+        // The last instant of the day, not its first: "until Friday" has to include a Friday
+        // evening commit, which is the one a reviewer usually means.
+        Long untilEpoch = untilDate == null ? null
+                : untilDate.atTime(LocalTime.MAX).atZone(zone).toEpochSecond();
         String type = source.type == null ? "LOCAL_DIR" : source.type.toUpperCase();
         if (!isRemote(type)) {
             try {
@@ -543,11 +603,19 @@ public class RepositoryPreparer {
                     return out;
                 }
             }
+            // One commit beyond the page is requested so {@code more} can be answered exactly: a
+            // flag derived from "count == limit" would lie whenever the window happens to end on
+            // the last listed commit.
             List<CommitInfo> list = baseId == null
-                    ? GitSupport.commits(repo, headId, capped)
-                    : GitSupport.commitsInRange(repo, baseId, headId, capped);
+                    ? GitSupport.commits(repo, headId, capped + 1, sinceEpoch, untilEpoch)
+                    : GitSupport.commitsInRange(repo, baseId, headId, capped + 1, sinceEpoch, untilEpoch);
+            boolean more = list.size() > capped;
+            if (more) {
+                list = new ArrayList<>(list.subList(0, capped));
+            }
             out.put("commits", list);
             out.put("count", list.size());
+            out.put("more", more);
             out.put("target", shortId(headId));
             if (baseId != null) {
                 out.put("base", shortId(baseId));
@@ -557,6 +625,24 @@ public class RepositoryPreparer {
             log.warn("commit list of {} failed: {}", source.name, GitSupport.describe(e));
             out.put("note", refsFailureNote(GitSupport.describe(e)));
             return out;
+        }
+    }
+
+    /**
+     * Parses a {@code yyyy-MM-dd} query value, or null when it is absent or malformed.
+     *
+     * The caller tells the two null causes apart by looking at the raw text: absent means "no
+     * bound", malformed means "explain it to the user". Keeping the raw value out of here is what
+     * lets the note name exactly what was typed.
+     */
+    private static LocalDate parseCommitDate(String raw) {
+        if (Texts.isBlank(raw)) {
+            return null;
+        }
+        try {
+            return LocalDate.parse(raw.strip(), DateTimeFormatter.ISO_LOCAL_DATE);
+        } catch (DateTimeParseException e) {
+            return null;
         }
     }
 

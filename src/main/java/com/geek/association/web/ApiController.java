@@ -535,6 +535,12 @@ public class ApiController {
      * "the commits this range would cover" (what the preview shows). The response shape is the same
      * either way, so the client has one thing to render.
      *
+     * {@code since} and {@code until} ({@code yyyy-MM-dd}, inclusive, JVM default zone) narrow
+     * either shape by committer time. They make the start commit optional: the user can browse the
+     * branch and tick commits without first choosing where a range begins, and the dates keep a
+     * long history from being scrolled through. The response echoes them as {@code since}/{@code
+     * until} and reports {@code more} when matching commits exist beyond {@code limit}.
+     *
      * A repository problem never becomes an HTTP error here: the caller is a form field, and an
      * empty list plus a readable {@code note} keeps the rest of the form usable.
      */
@@ -543,7 +549,9 @@ public class ApiController {
                                        @RequestParam(required = false) String ref,
                                        @RequestParam(required = false) String base,
                                        @RequestParam(required = false) String target,
-                                       @RequestParam(defaultValue = "30") int limit) {
+                                       @RequestParam(defaultValue = "30") int limit,
+                                       @RequestParam(required = false) String since,
+                                       @RequestParam(required = false) String until) {
         RepoSource source = store.source(id);
         if (source == null) {
             throw new IllegalArgumentException("unknown source: " + id);
@@ -551,7 +559,7 @@ public class ApiController {
         // target wins over ref when both are given: a range request always names its end, and the
         // branch is then only the fallback for the "which branch am I looking at" case.
         String headRef = Texts.isBlank(target) ? ref : target;
-        return preparer.commits(source, base, headRef, limit);
+        return preparer.commits(source, base, headRef, limit, since, until);
     }
 
     /** Branches and tags of a source, so the UI can offer real refs instead of free text. */

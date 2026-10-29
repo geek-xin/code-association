@@ -81,6 +81,9 @@ class AiExplainerTest {
         properties.getAi().setModel(model);
         properties.getAi().setApiKey(apiKey);
         properties.getAi().setTimeoutSeconds(5);
+        // These tests pin the summary layer; the comment layer has its own tests, and a fake
+        // endpoint that answers every request with the same JSON would only add noise here.
+        properties.getAi().setComments(false);
         return new AiExplainer(properties);
     }
 

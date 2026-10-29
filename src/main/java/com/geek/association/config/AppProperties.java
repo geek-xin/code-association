@@ -492,6 +492,33 @@ public class AppProperties {
         private boolean defaultForRuns = true;
 
         /**
+         * Whether the AI section also carries line-anchored review comments.
+         *
+         * A separate switch from {@link #enabled} because the two stages have different privacy
+         * costs: the summary sends only derived facts, while comments have to send the changed
+         * hunks for the model to review. An installation that accepted the old promise can keep it
+         * by leaving this off and still get the proof-carrying summary it always had.
+         */
+        private boolean comments = true;
+
+        /**
+         * Cap on comments in one report.
+         *
+         * Same shape as {@link #maxImpacts}: the first few comments carry almost all the review
+         * value, and a long list is both expensive and harder to act on. 1..50.
+         */
+        private int maxComments = 12;
+
+        /**
+         * Whether the reflection pass removes comments the diff contradicts.
+         *
+         * The pass costs one extra model call per report, so it is switchable; off means only the
+         * deterministic filters run. It never drops a comment merely for being unconvincing - that
+         * line is what keeps the filter from turning false positives into false negatives.
+         */
+        private boolean reflection = true;
+
+        /**
          * Whether this configuration can actually call a model.
          *
          * The single definition of "ready" for the whole backend: the settings page, the health
@@ -577,6 +604,30 @@ public class AppProperties {
 
         public void setDefaultForRuns(boolean defaultForRuns) {
             this.defaultForRuns = defaultForRuns;
+        }
+
+        public boolean isComments() {
+            return comments;
+        }
+
+        public void setComments(boolean comments) {
+            this.comments = comments;
+        }
+
+        public int getMaxComments() {
+            return maxComments;
+        }
+
+        public void setMaxComments(int maxComments) {
+            this.maxComments = maxComments;
+        }
+
+        public boolean isReflection() {
+            return reflection;
+        }
+
+        public void setReflection(boolean reflection) {
+            this.reflection = reflection;
         }
     }
 }

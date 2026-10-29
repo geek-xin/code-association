@@ -380,14 +380,23 @@ public class PeerImpactEngine {
         } else if (ChangeDetector.DDL_CHANGED.equals(change.changeType)) {
             dbDeltasForDdl(change, counter, deltas, seenDeltas);
         } else if (!isIncomplete(change)) {
-            // A plain statement edit: only the columns this program writes can reach the other side.
-            for (String column : changedWriteColumns(change)) {
+            // A plain statement edit: only the columns this program newly writes can reach the other
+            // side. A column it stopped writing is NOT a dropped column - the column still exists,
+            // and the peer's SELECT keeps returning a value. Reporting the reader as impacted was a
+            // false positive: deleting a mapper statement (or removing a column from its SET/INSERT
+            // list) left no trace in the deployed schema. A real drop requires a DROP COLUMN action
+            // in a migration script, which is detected as DDL_CHANGED and follows its own rule.
+            for (String column : addedWriteColumns(change)) {
                 addColumnDelta(deltas, seenDeltas, column, "WRITE_SET", true, false, false, 0.85);
             }
+            for (String column : removedWriteColumns(change)) {
+                countNonObservable(counter, column,
+                        "本程序停止写入该列，字段本身仍存在；读方 SQL 不会失败");
+            }
             for (String table : changedWriteTables(change)) {
-                // The statement started or stopped writing a whole table and named no column: this
-                // is a table-level change of the write contract, and readers see new rows. Writers
-                // are excluded: two programs writing the same table do not conflict through this.
+                // The statement started writing a whole table and named no column: this is a
+                // table-level change of the write contract, and readers see new rows. Writers are
+                // excluded: two programs writing the same table do not conflict through this.
                 addTableDelta(deltas, seenDeltas, table, "WRITE_SET", true, false, false, 0.65);
             }
         }
@@ -420,6 +429,15 @@ public class PeerImpactEngine {
         switch (kind) {
             case "DROP_COLUMN" -> {
                 if (!table.isBlank() && !column.isBlank()) {
+                    if ("true".equalsIgnoreCase(str(change.extra.get("schemaDiff")))) {
+                        // The column disappeared only because the snapshot's CREATE TABLE no longer
+                        // lists it. Without an explicit DROP COLUMN migration action the deployed
+                        // schema was not changed by this edit, so treating it as a drop would report
+                        // every peer reader of the column - the false positive this rule exists for.
+                        countNonObservable(counter, table + "." + column,
+                                "快照推断字段消失，但没有 DROP COLUMN 迁移脚本；不按字段删除传播");
+                        break;
+                    }
                     addColumnDelta(deltas, seen, table + "." + column, kind, true, true, true, 0.95);
                 }
             }
@@ -786,8 +804,8 @@ public class PeerImpactEngine {
         return d;
     }
 
-    /** Columns this program started or stopped writing, as {@code table.column}. */
-    private Set<String> changedWriteColumns(ChangeRecord change) {
+    /** Columns this program started writing, as {@code table.column}. */
+    private Set<String> addedWriteColumns(ChangeRecord change) {
         if (isIncomplete(change)) {
             return Set.of();
         }
@@ -795,10 +813,26 @@ public class PeerImpactEngine {
         Set<String> after = splitColumns(str(change.extra.get("newWritesColumns")));
         Set<String> out = new LinkedHashSet<>(after);
         out.removeAll(before);
+        return out;
+    }
+
+    /**
+     * Columns this program stopped writing.
+     *
+     * Separate from {@link #addedWriteColumns} because the two have opposite consequences: a newly
+     * written column is observable to a peer reader (the values it sees change), while a column that
+     * is no longer written still exists and still answers the peer's SELECT. Treating the removal as
+     * a column drop was the false positive that put every reader of the column in the report.
+     */
+    private Set<String> removedWriteColumns(ChangeRecord change) {
+        if (isIncomplete(change)) {
+            return Set.of();
+        }
+        Set<String> before = splitColumns(str(change.extra.get("oldWritesColumns")));
+        Set<String> after = splitColumns(str(change.extra.get("newWritesColumns")));
         Set<String> removed = new LinkedHashSet<>(before);
         removed.removeAll(after);
-        out.addAll(removed);
-        return out;
+        return removed;
     }
 
     /**

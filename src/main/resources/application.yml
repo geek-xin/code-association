@@ -103,9 +103,11 @@ code-association:
     respect-rate-limit: true
     # Run one check shortly after startup instead of waiting for the first cron boundary.
     check-on-startup: true
-  # Optional LLM review layer. Off by default: every conclusion in a report comes from static
-  # analysis, and the model only restates those facts in review language. When it is off, nothing
-  # is sent anywhere and the report is byte-for-byte what it was before this feature existed.
+  # Optional LLM review layer. Off by default: every impact conclusion in a report comes from static
+  # analysis, and the model restates those facts in review language. The optional comment layer also
+  # reviews the changed hunks themselves; it is the only part that sends source lines, and only the
+  # changed hunks - never a file body. When enabled is false, nothing is sent anywhere and the report
+  # is byte-for-byte what it was before this feature existed.
   # The settings page writes its own snapshot to {data-dir}/ai-settings.json and overrides the
   # values below on startup; this block stays the baseline for a headless/CLI install.
   ai:
@@ -127,6 +129,14 @@ code-association:
     # Default state of the "generate AI review" checkbox in the run dialog. Each run can still say
     # no, and this has no effect while enabled is false.
     default-for-runs: true
+    # Line-anchored review comments. Turn off to keep the old privacy contract exactly: the summary
+    # sends derived facts only and no source line ever leaves the process.
+    comments: true
+    # Cap on comments in one report (1..50), independent of max-impacts.
+    max-comments: 12
+    # One extra model call that removes only comments the diff factually contradicts. Off makes
+    # generation cheaper; the deterministic filters still run.
+    reflection: true
 
 # 级别是基线，落盘位置与滚动策略在 logback-spring.xml 里。
 # com.geek.association 保持 INFO：分析、扫描、更新这些"重要节点"都打在 INFO，
