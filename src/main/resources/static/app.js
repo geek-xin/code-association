@@ -238,6 +238,19 @@ var state = {
     test: null,
     /** Analysis id whose AI section is being (re)generated, or null. */
     generating: null
+  },
+  /**
+   * GitLab personal access token state. One object for the same reason as `ai`: the settings card
+   * is re-rendered on every poll tick, so `loaded` guards the one-time fetch and `formFilled`
+   * keeps that tick from rewriting the token input under the user's cursor.
+   */
+  gitlab: {
+    data: null,
+    loaded: false,
+    loading: false,
+    error: null,
+    formFilled: false,
+    saving: false
   }
 };
 
@@ -347,11 +360,12 @@ function initTheme() {
 /* ------------------------------------------------- collapsible navigation */
 
 /**
- * Folds the text menu away and leaves the icon rail, for narrow screens or when the content
- * needs the width. Two details matter:
+ * Folds the sidebar down to its icon column. Folded is the resting state; expanding is a
+ * deliberate choice. Two details matter:
  *
  *   1. It is persisted, because a layout choice that resets on reload is worse than none;
- *   2. It is applied before first paint (see boot), so the menu never flashes open and shut.
+ *   2. It is applied before first paint (the inline boot script in index.html), so an expanded
+ *      session never flashes closed.
  */
 function navCollapsed() {
   return document.querySelector('.app').classList.contains('nav-collapsed');
@@ -362,8 +376,8 @@ function applyNavCollapsed(collapsed, opts) {
   if (!app) return;
   app.classList.toggle('nav-collapsed', !!collapsed);
 
-  // The toggle inside the menu is gone once folded, so both affordances carry the same state
-  // for assistive tech: a stale aria-expanded on a hidden button is worse than omitting it.
+  // The sidebar never unmounts; both chevrons stay in the DOM and publish the state they
+  // actually represent, so assistive tech never reads a stale aria-expanded.
   var collapseBtn = $('nav-collapse');
   if (collapseBtn) collapseBtn.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
   var expandBtn = $('nav-expand');
@@ -379,7 +393,7 @@ function setNavCollapsed(collapsed, opts) {
   applyNavCollapsed(collapsed, opts);
   if (!(opts && opts.silent)) {
     try { localStorage.setItem(NAV_KEY, collapsed ? 'collapsed' : 'expanded'); } catch (e) { /* ignore quota */ }
-    toast(collapsed ? '已收起菜单栏' : '已展开菜单栏');
+    toast(collapsed ? '已收起侧栏' : '已展开侧栏');
   }
 }
 
@@ -390,10 +404,10 @@ function toggleNav() {
 function initNav() {
   var saved = null;
   try { saved = localStorage.getItem(NAV_KEY); } catch (e) { /* ignore */ }
-  // Narrow viewports start folded: at 860px the menu is already hidden by CSS, so starting
-  // expanded would only make the first toggle a no-op.
-  var narrow = window.matchMedia && window.matchMedia('(max-width: 860px)').matches;
-  applyNavCollapsed(saved ? saved === 'collapsed' : narrow, { silent: true });
+  // Folded is the default on every width: the icon column is the resting state, and expanding
+  // is a deliberate choice that is then remembered. The inline boot script in index.html has
+  // already applied the same rule before first paint.
+  applyNavCollapsed(saved ? saved === 'collapsed' : true, { silent: true });
 
   var collapseBtn = $('nav-collapse');
   if (collapseBtn) collapseBtn.addEventListener('click', toggleNav);
@@ -879,10 +893,7 @@ function go(page) {
   for (var i = 0; i < sections.length; i++) {
     sections[i].classList.toggle('hidden', sections[i].getAttribute('data-page') !== page);
   }
-  var railBtns = document.querySelectorAll('.rail-btn[data-nav]');
-  for (var j = 0; j < railBtns.length; j++) {
-    railBtns[j].classList.toggle('active', railBtns[j].getAttribute('data-nav') === page);
-  }
+  // One sidebar carries every destination now, so a single pass keeps the active state in sync.
   var navItems = document.querySelectorAll('.nav-item[data-nav]');
   for (var k = 0; k < navItems.length; k++) {
     navItems[k].classList.toggle('active', navItems[k].getAttribute('data-nav') === page);
@@ -902,7 +913,7 @@ function go(page) {
 
   renderMapsFor(page);
   // Page switches do not re-fetch anything, but the notice is page-independent and cheap to
-  // re-evaluate; doing it here keeps the rail dot in sync without a poll-time API call.
+  // re-evaluate; doing it here keeps the sidebar dot in sync without a poll-time API call.
   renderUpdateNotice();
 }
 
@@ -930,17 +941,6 @@ function renderMapsFor(page) {
 /* -------------------------------------------------------------- nav render */
 
 /* --------------------------------------------------------- cross-program */
-
-/**
- * Renders what the other selected programs have to change.
- *
- * The section only appears when a comparison was requested, so a normal single-program analysis
- * is not cluttered with an empty panel.
- */
-function renderPeers(report) {
-  renderPeerPanel(report, 'ov');
-  renderPeerPanel(report, 'rv');
-}
 
 /**
  * Draws the cross-program section into one page. The overview and the review screen show the
@@ -1174,6 +1174,92 @@ function renderNavCounts() {
 
 /* ----------------------------------------------------------------- overview */
 
+/* One merged overview card: which programs are reached, then the first six impacts. */
+function renderOvImpactSummary(report, counts, s) {
+  var host = $('ov-impact-summary');
+  if (!host) return;
+  if (!report) { host.innerHTML = ''; return; }
+  var peers = report.peers || [];
+  var parts = [];
+  if (peers.length) {
+    if (counts.total) {
+      parts.push(counts.pending
+        ? pill(counts.pending + ' 项待复核', 'warning', true)
+        : pill('全部已复核', 'success', true));
+    } else {
+      parts.push(pill('暂无影响', 'success', true));
+    }
+    parts.push(pill((s.impactedSymbols || 0) + ' 处影响', 'neutral', true));
+    if (s.highRisk) parts.push(pill(s.highRisk + ' 项高风险', 'danger', true));
+  } else {
+    parts.push(pill('未选择其他程序', 'neutral', true));
+  }
+  parts.push('<button class="btn btn-sm" data-nav="review">查看全部' + icon('i-chevron-right') + '</button>');
+  host.innerHTML = parts.join('');
+}
+
+/** One compact pill per compared program; contract evidence stays on the review page. */
+function renderOvPeerStrip(report) {
+  var host = $('ov-peer-strip');
+  if (!host) return;
+  var peers = (report && report.peers) || [];
+  if (!peers.length) { host.innerHTML = ''; return; }
+  host.innerHTML = '<div class="ov-peer-strip">' + peers.map(function (p) {
+    var contracts = (p.matches || []).length;
+    var tone = p.note ? 'warning' : (p.highRisk ? 'danger' : (p.impactedSymbols ? 'brand' : 'neutral'));
+    var label = (p.peerSourceName || '其他程序') +
+      (p.note ? ' · 未比较' : ' · ' + contracts + ' 契约 · ' + (p.impactedSymbols || 0) + ' 处');
+    return pill(label, tone, true);
+  }).join('') + '</div>';
+}
+
+/** The risk-ordered impact list that used to be two separate cards. */
+function renderOvImpactList(report, decisions) {
+  var host = $('ov-attention');
+  var foot = $('ov-impact-foot');
+  if (!host) return;
+  if (!report) {
+    host.innerHTML = emptyBlockForSource();
+    if (foot) foot.innerHTML = '';
+    return;
+  }
+  if (!(report.peers || []).length) {
+    host.innerHTML = '<div class="callout warning">' + icon('i-alert-circle') + '<div>' +
+      esc(report.peersNote || '本次没有选择其他程序，未执行跨程序扫描。') + '</div></div>';
+    if (foot) foot.innerHTML = '';
+    return;
+  }
+  var ordered = sortedImpacts();
+  var shown = ordered.slice(0, 6);
+  if (!shown.length) {
+    host.innerHTML = emptyBlock('未发现对其他程序的影响', '本次变更没有命中其他程序的可观察契约。');
+    if (foot) foot.innerHTML = '';
+    return;
+  }
+  host.innerHTML = shown.map(function (i) {
+    var d = decisions[String(i.id)];
+    var status = !d ? { text: '待复核', tone: 'warning' }
+      : d.decision === 'confirmed' ? { text: '已确认', tone: 'success' }
+      : { text: '已忽略', tone: 'neutral' };
+    return '<div class="list-row" data-impact-id="' + i.id + '">' +
+      '<div class="row-icon ' + (RISK_TONE[i.riskLevel] || 'neutral') + '">' + icon('i-alert') + '</div>' +
+      '<div class="row-main">' +
+        '<div class="row-title">' + esc(shortSymbol(i.targetSymbol)) +
+          pill(RISK_LABEL[i.riskLevel] || i.riskLevel, RISK_TONE[i.riskLevel], true) + '</div>' +
+        '<div class="row-desc">' + esc(i.reason) + '</div>' +
+        '<div class="row-meta">' + chip(impactProgram(i)) + chip(TYPE_LABEL[i.impactType] || i.impactType) +
+          chip('置信度 ' + i.confidence) + pill(status.text, status.tone, true) + '</div>' +
+      '</div>' +
+      '<div class="row-right"><div class="row-arrow">' + icon('i-chevron-right') + '</div></div>' +
+      '</div>';
+  }).join('');
+  if (foot) {
+    foot.innerHTML = ordered.length > shown.length
+      ? '<div class="ov-impact-foot">还有 ' + (ordered.length - shown.length) + ' 条影响，点「查看全部」进入审核。</div>'
+      : '';
+  }
+}
+
 function renderOverview() {
   var report = state.report;
   var s = (report && report.summary) || {};
@@ -1209,38 +1295,13 @@ function renderOverview() {
 
   var counts = reviewCounts();
   var decisions = decisionsFor(state.analysisId);
-  var dismissedSet = {};
-  var confirmedSet = {};
-  for (var id in decisions) {
-    if (decisions[id].decision === 'confirmed') confirmedSet[id] = true; else dismissedSet[id] = true;
-  }
-  // sortedImpacts() 已经是风险分降序，这里只需从头挑 4 条未复核的，不必再排一次全量。
-  var ordered = sortedImpacts();
-  var attention = [];
-  for (var ai = 0; ai < ordered.length && attention.length < 4; ai++) {
-    var cand = ordered[ai];
-    if (!dismissedSet[String(cand.id)] && !confirmedSet[String(cand.id)]) attention.push(cand);
-  }
 
-  var attnHost = $('ov-attention');
-  if (attnHost) {
-    attnHost.innerHTML = attention.length ? attention.map(function (i) {
-      return '<div class="list-row" data-impact-id="' + i.id + '">' +
-        '<div class="row-icon ' + (RISK_TONE[i.riskLevel] || 'neutral') + '">' + icon('i-alert') + '</div>' +
-        '<div class="row-main">' +
-          '<div class="row-title">' + esc(shortSymbol(i.targetSymbol)) +
-            pill(RISK_LABEL[i.riskLevel] || i.riskLevel, RISK_TONE[i.riskLevel], true) + '</div>' +
-          '<div class="row-desc">' + esc(i.reason) + '</div>' +
-          '<div class="row-meta">' + chip(impactProgram(i)) + chip(TYPE_LABEL[i.impactType] || i.impactType) +
-            chip('置信度 ' + i.confidence) + '</div>' +
-        '</div>' +
-        '<div class="row-right"><div class="row-arrow">' + icon('i-chevron-right') + '</div></div>' +
-        '</div>';
-    }).join('') : (state.report
-      ? emptyBlock('没有待处理的影响', '当前分析中其他程序的所有影响项都已复核。')
-      : emptyBlockForSource());
-  }
-  setText('ov-attn-count', counts.pending + ' 项');
+  // One card now answers both old questions: which other programs are reached, and which
+  // impacts need attention first. Contract-level evidence stays on 影响审核; this page only
+  // needs the shape and the next click.
+  renderOvImpactSummary(report, counts, s);
+  renderOvPeerStrip(report);
+  renderOvImpactList(report, decisions);
 
   var ringHost = $('ov-ring');
   if (ringHost) {
@@ -1273,8 +1334,6 @@ function renderOverview() {
         '</div>';
     }).join('');
   }
-
-  renderPeers(report);
 
   var tl = $('ov-timeline');
   if (tl) {
@@ -2269,7 +2328,11 @@ function renderAnalysisAi(report) {
   // second and then changing the card's meaning under the reader.
   if (!ai.loaded && !ai.error) {
     ensureAiLoaded().then(function () {
-      if (state.report) renderAnalysisAi(state.report);
+      // ensureAiLoaded() resolves immediately while another caller's fetch is still in flight,
+      // so redrawing unconditionally would re-enter this function and spin forever in
+      // microtasks (the in-flight fetch could never be serviced). Only redraw when it settled.
+      if (!state.report || (!ai.loaded && !ai.error)) return;
+      renderAnalysisAi(state.report);
     });
   }
 
@@ -2887,6 +2950,7 @@ async function renderSettings() {
   // Version info loads once per page load, not on every renderAll() tick.
   ensureUpdateLoaded();
   renderAiSettings();
+  renderGitLabSettings();
 }
 
 /**
@@ -3154,6 +3218,180 @@ function setAiButtonsBusy(busy, which) {
     test.disabled = busy;
     test.innerHTML = busy && which === 'test'
       ? '<span class="spinner"></span>测试中…' : icon('i-zap') + '测试连接';
+  }
+}
+
+/* ------------------------------------------------------------ gitlab settings */
+
+/**
+ * Loads GET /api/gitlab once per page load.
+ *
+ * Same shape as ensureAiLoaded(): a server that predates the endpoint answers 404, which is
+ * recorded once and rendered as a plain statement instead of thrown, because the rest of the
+ * settings page still has work to do.
+ */
+async function ensureGitLabLoaded() {
+  var gl = state.gitlab;
+  if (gl.loaded || gl.loading) return gl.data;
+  gl.loading = true;
+  try {
+    gl.data = await api('/gitlab');
+    gl.error = null;
+    gl.loaded = true;
+  } catch (e) {
+    gl.error = e && e.message ? e.message : String(e);
+  } finally {
+    gl.loading = false;
+  }
+  return gl.data;
+}
+
+/**
+ * Keeps the GitLab card in sync without rewriting its input on every poll tick.
+ *
+ * renderSettings() runs on every renderAll() tick (a live analysis polls every 900 ms), so the
+ * form is written only on the first successful load or after an explicit save - the exact rule
+ * fillAiForm() follows. A poll that overwrote a half-typed token would look like the page eating
+ * a paste.
+ */
+async function renderGitLabSettings() {
+  var gl = state.gitlab;
+  await ensureGitLabLoaded();
+  renderGitLabStatus();
+  if (gl.data && !gl.formFilled) fillGitLabForm(gl.data);
+}
+
+/** Where the active token came from, in the words the backend uses ("file" / "application.yml"). */
+function gitlabConfiguredByLabel(value) {
+  if (value === 'file') return '设置页快照';
+  if (!value) return '—';
+  return value;
+}
+
+function renderGitLabStatus() {
+  var gl = state.gitlab;
+  var pillHost = $('gl-status');
+  var noteHost = $('gl-status-note');
+  if (!pillHost || !noteHost) return;
+  if (gl.error) {
+    pillHost.className = 'pill warning';
+    pillHost.textContent = '接口不可用';
+    noteHost.textContent = '当前服务端没有 /api/gitlab（' + gl.error + '），可用 application.yml 或 GITLAB_TOKEN 配置。';
+    return;
+  }
+  var d = gl.data;
+  if (!d) {
+    pillHost.className = 'pill neutral';
+    pillHost.textContent = '读取中';
+    noteHost.textContent = '正在读取本机配置…';
+    return;
+  }
+  if (d.tokenSet) {
+    pillHost.className = 'pill success';
+    pillHost.textContent = '已设置';
+    noteHost.textContent = '已保存 ' + (d.tokenMasked || '') + ' · 来源 ' + gitlabConfiguredByLabel(d.configuredBy) +
+      ' · 仅对未指定凭据环境变量的 GitLab 来源生效。';
+  } else {
+    pillHost.className = 'pill neutral';
+    pillHost.textContent = '未设置';
+    noteHost.textContent = '私有 GitLab 仓库需要 read_repository 权限的个人令牌；也可用 application.yml 或 GITLAB_TOKEN。';
+  }
+  var fileHost = $('gl-settings-file');
+  if (fileHost) fileHost.textContent = d.settingsFile || '—';
+}
+
+/** One write of the whole form; only called on first load and after a successful save/clear. */
+function fillGitLabForm(d) {
+  var gl = state.gitlab;
+  if ($('gl-token')) {
+    // Never a value, only a statement about the stored one: the browser must not hold the token.
+    $('gl-token').value = '';
+    $('gl-token').placeholder = d.tokenSet
+      ? '已保存 ' + (d.tokenMasked || '') + ' · 留空保持不变'
+      : '未设置（glpat-…）';
+  }
+  var fileHost = $('gl-settings-file');
+  if (fileHost) fileHost.textContent = d.settingsFile || '—';
+  gl.formFilled = true;
+}
+
+async function saveGitLabSettings() {
+  var gl = state.gitlab;
+  if (gl.saving || gl.error) return;
+  var token = $('gl-token') ? $('gl-token').value.trim() : '';
+  if (!token) {
+    // Blank means "keep the stored token", never "erase it"; clearing has its own button.
+    toast(gl.data && gl.data.tokenSet ? '输入框为空，已保存的令牌保持不变' : '请粘贴 GitLab 个人访问令牌');
+    return;
+  }
+  gl.saving = true;
+  setGitLabButtonsBusy(true, 'save');
+  try {
+    var data = await api('/gitlab', { method: 'PUT', body: JSON.stringify({ token: token }) });
+    if (data) gl.data = data;
+    gl.loaded = true;
+    gl.formFilled = false;
+    state.health = null; // the health rows are refetched on the renderSettings() below
+    toast('已保存 GitLab 令牌', 'success');
+    renderGitLabStatus();
+    if (gl.data) fillGitLabForm(gl.data);
+    renderSettings();
+  } catch (e) {
+    toast(e && e.message ? e.message : String(e), 'error');
+  } finally {
+    gl.saving = false;
+    setGitLabButtonsBusy(false, 'save');
+  }
+}
+
+/**
+ * Clears the stored token after a confirmation.
+ *
+ * Clearing is a save in itself, not an unsaved form edit: the card must not claim the token is
+ * gone while the server still holds it. The project has no generic confirm modal (deleting a
+ * source uses its own typed-name dialog), so a native confirm is the smallest honest gate.
+ */
+async function clearGitLabToken() {
+  var gl = state.gitlab;
+  if (gl.saving || gl.error) return;
+  if (!gl.data || !gl.data.tokenSet) {
+    toast('尚未保存 GitLab 令牌');
+    return;
+  }
+  var ok = window.confirm('清除已保存的 GitLab 令牌？之后私有 GitLab 代码源只能用凭据环境变量认证。');
+  if (!ok) return;
+  gl.saving = true;
+  setGitLabButtonsBusy(true, 'clear');
+  try {
+    var data = await api('/gitlab', { method: 'PUT', body: JSON.stringify({ clearToken: true }) });
+    if (data) gl.data = data;
+    gl.loaded = true;
+    gl.formFilled = false;
+    state.health = null;
+    toast('已清除 GitLab 令牌', 'success');
+    renderGitLabStatus();
+    if (gl.data) fillGitLabForm(gl.data);
+    renderSettings();
+  } catch (e) {
+    toast(e && e.message ? e.message : String(e), 'error');
+  } finally {
+    gl.saving = false;
+    setGitLabButtonsBusy(false, 'clear');
+  }
+}
+
+function setGitLabButtonsBusy(busy, which) {
+  var save = $('gl-save');
+  var clear = $('gl-clear');
+  if (save) {
+    save.disabled = busy;
+    save.innerHTML = busy && which === 'save'
+      ? '<span class="spinner"></span>保存中…' : icon('i-check') + '保存';
+  }
+  if (clear) {
+    clear.disabled = busy;
+    clear.innerHTML = busy && which === 'clear'
+      ? '<span class="spinner"></span>清除中…' : '清除';
   }
 }
 
@@ -5964,7 +6202,7 @@ function openDecision(kind, impactId) {
 
 function bindEvents() {
   document.addEventListener('click', function (ev) {
-    var el = ev.target.closest('[data-nav],[data-impact-id],[data-analysis-id],[data-source-id],[data-module],[data-change-id],[data-confirm-impact],[data-dismiss-impact],[data-open-impact],[data-close],[data-open-run],[data-tab],[data-filter],[data-pick-dir],[data-pk-dir],[data-pk-root],[data-delete-source],[data-background-analysis],[data-update-check],[data-update-notes],[data-update-download],[data-update-apply],[data-update-rollback],[data-update-banner-view],[data-update-banner-skip],[data-update-banner-close],[data-update-history],[data-update-history-retry],[data-update-setting],[data-update-restart-retry],[data-edit-source],[data-tag-add],[data-tag-remove],[data-tag-group-toggle],[data-tag-filter],[data-tag-filter-clear],[data-export],[data-import-file],[data-review-page],[data-ai-save],[data-ai-test],[data-ai-clear-key],[data-ai-preset],[data-ai-generate]');
+    var el = ev.target.closest('[data-nav],[data-impact-id],[data-analysis-id],[data-source-id],[data-module],[data-change-id],[data-confirm-impact],[data-dismiss-impact],[data-open-impact],[data-close],[data-open-run],[data-tab],[data-filter],[data-pick-dir],[data-pk-dir],[data-pk-root],[data-delete-source],[data-background-analysis],[data-update-check],[data-update-notes],[data-update-download],[data-update-apply],[data-update-rollback],[data-update-banner-view],[data-update-banner-skip],[data-update-banner-close],[data-update-history],[data-update-history-retry],[data-update-setting],[data-update-restart-retry],[data-edit-source],[data-tag-add],[data-tag-remove],[data-tag-group-toggle],[data-tag-filter],[data-tag-filter-clear],[data-export],[data-import-file],[data-review-page],[data-ai-save],[data-ai-test],[data-ai-clear-key],[data-ai-preset],[data-ai-generate],[data-gitlab-save],[data-gitlab-clear]');
     if (!el) return;
 
     // AI actions. Each one owns its own busy state and re-renders only its own region, so a save
@@ -5974,6 +6212,10 @@ function bindEvents() {
     if (el.hasAttribute('data-ai-clear-key')) { clearAiKey(); return; }
     if (el.hasAttribute('data-ai-preset')) { applyAiPreset(el.getAttribute('data-ai-preset')); return; }
     if (el.hasAttribute('data-ai-generate')) { generateAiReview(); return; }
+
+    // GitLab token actions own only the GitLab card: save refills the mask, clear asks first.
+    if (el.hasAttribute('data-gitlab-save')) { saveGitLabSettings(); return; }
+    if (el.hasAttribute('data-gitlab-clear')) { clearGitLabToken(); return; }
 
     // Version & update actions live on the settings card; each one is a single async call
     // that re-renders the card itself, so no other page needs to be refreshed here.
@@ -6264,12 +6506,12 @@ function bindEvents() {
     });
   }
 
-  var addBtns = ['nav-add-source', 'nav-add-source-2', 'src-add', 'src-refresh', 'src-reset', 'ov-refresh', 'hi-refresh', 'rv-reset'];
+  var addBtns = ['nav-add-source', 'src-add', 'src-refresh', 'src-reset', 'ov-refresh', 'hi-refresh', 'rv-reset'];
   addBtns.forEach(function (id) {
     var btn = $(id);
     if (!btn) return;
     btn.addEventListener('click', async function () {
-      if (id === 'nav-add-source' || id === 'nav-add-source-2' || id === 'src-add') openSourceModal();
+      if (id === 'nav-add-source' || id === 'src-add') openSourceModal();
       if (id === 'src-refresh' || id === 'ov-refresh' || id === 'hi-refresh') {
         await refreshAll(true);
         toast('已刷新', 'success');

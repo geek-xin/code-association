@@ -105,6 +105,8 @@ impact:
 ```
 
 `PEER_DIR` 需要提前把被比较的程序检出到流水线工作区（或指向已有代码源）。
+私有 GitLab 项目还要令牌：在项目或组的 CI/CD Variables 里加 `GITLAB_TOKEN`（Masked），
+流水线里它就是 yml 基线读取的那个环境变量；也可用 `--token-env` 指定别的变量名。
 
 ## GitHub Actions
 
@@ -118,10 +120,40 @@ impact:
 
 ## 私有仓库凭据
 
+凭据来源有两种：**环境变量**（`--token-env` 只写变量名）或本机设置页保存的令牌；都不落库、不写入报告。GitHub：
+
 ```bash
 export GITHUB_TOKEN=ghp_xxx
 java -jar code-association.jar analyze --location https://github.com/org/private.git \
      --type GITHUB --token-env GITHUB_TOKEN --peer /path/to/consumer
 ```
 
-Token 从**环境变量**读取，不落库、不写入报告。
+GitLab 的三种写法：
+
+```bash
+# 1) 默认变量名：application.yml 的 code-association.gitlab.token 读 ${GITLAB_TOKEN:}
+export GITLAB_TOKEN=glpat-xxxxxxxx
+java -jar code-association.jar analyze --location https://gitlab.com/group/private.git \
+     --type GITLAB --peer /path/to/consumer --out report.json --fail-on HIGH
+
+# 2) 变量名不叫 GITLAB_TOKEN 时，用 --token-env 指定
+java -jar code-association.jar analyze --location https://gitlab.example.com/group/private.git \
+     --type GITLAB --token-env MY_GITLAB_PAT --peer /path/to/consumer
+
+# 3) 同机已在设置页保存过令牌：不必再导出环境变量，直接跑
+java -jar code-association.jar analyze --location https://gitlab.com/group/private.git \
+     --type GITLAB --peer /path/to/consumer
+```
+
+| 方式 | 何时生效 |
+|---|---|
+| `GITLAB_TOKEN` 环境变量 | yml 基线的默认来源，不写 `--token-env` 也能用 |
+| `--token-env <变量名>` | 用别的变量名；该变量有值即优先于设置页令牌 |
+| 设置页「GitLab 私有仓库」 | 同一 `data-dir` 上的 CLI 直接复用保存的令牌 |
+
+优先级：`--token-env` / 代码源「凭据环境变量」指向的变量有值 → 用它；否则 `GITLAB` 类型
+使用设置页快照（没有快照时用 yml 基线）。`GITHUB` / `GIT` 类型不会附加 GitLab 令牌。
+部署令牌（deploy token）需要用户名配对，不适用，请用个人访问令牌。
+
+设置页的令牌存在 `{data-dir}/gitlab-settings.json`（POSIX 权限 600），删掉该文件重启即退回
+`application.yml` / `GITLAB_TOKEN`。

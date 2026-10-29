@@ -48,6 +48,9 @@ public class AppProperties {
     /** Self-update from the project's GitHub releases. */
     private Update update = new Update();
 
+    /** Private GitLab repositories: the personal access token shown in the settings page. */
+    private GitLab gitlab = new GitLab();
+
 
     public String getDataDir() {
         return dataDir;
@@ -120,6 +123,14 @@ public class AppProperties {
 
     public void setUpdate(Update update) {
         this.update = update;
+    }
+
+    public GitLab getGitlab() {
+        return gitlab;
+    }
+
+    public void setGitlab(GitLab gitlab) {
+        this.gitlab = gitlab;
     }
 
     public Path dataPath() {
@@ -452,6 +463,33 @@ public class AppProperties {
 
         public void setCheckOnStartup(boolean checkOnStartup) {
             this.checkOnStartup = checkOnStartup;
+        }
+    }
+
+    /**
+     * Private GitLab access.
+     *
+     * The token is the baseline: a snapshot saved in the settings page is written to
+     * {@code {dataDir}/gitlab-settings.json} and overrides this value on the next startup, the same
+     * way the AI settings card overrides {@link Ai}. It is only ever attached to sources whose type
+     * is {@code GITLAB} (see {@code RepositoryPreparer}); a source that names a credential
+     * environment variable still wins, so an installation can keep per-repository credentials.
+     */
+    public static class GitLab {
+        /**
+         * Personal access token used to read private GitLab repositories.
+         *
+         * Read from {@code GITLAB_TOKEN} by application.yml so a headless install needs no file,
+         * but never logged and never returned by the API in plain text.
+         */
+        private String token = "";
+
+        public String getToken() {
+            return token;
+        }
+
+        public void setToken(String token) {
+            this.token = token;
         }
     }
 

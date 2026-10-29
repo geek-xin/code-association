@@ -42,7 +42,7 @@ class UiContractTest {
     private static final List<String> COMPONENT_CLASSES = List.of(
             "card", "stat", "pill", "btn", "btn-primary", "btn-ghost", "btn-danger", "btn-sm",
             "tabs", "tab", "modal", "drawer", "toast", "empty", "callout", "stepper", "pager",
-            "tag-chip", "rail", "sidenav", "workspace", "page-head", "page-title", "title-badge",
+            "tag-chip", "sidebar", "workspace", "page-head", "page-title", "title-badge",
             "tr", "path", "timeline", "flow", "progress", "chip",
             // 规范 7.23：AI 审核必须与证据视觉分区，标注与正文各自有独立类名。
             "ai-text", "ai-foot", "ai-verified-note", "ai-status-row", "ai-presets");
@@ -51,7 +51,7 @@ class UiContractTest {
     private static final List<String> LIGHT_ROOT_TOKENS = List.of(
             "--primary", "--surface", "--surface-2", "--surface-3", "--text", "--text-2", "--text-3",
             "--border", "--border-strong", "--r-card", "--r-tile", "--r-control", "--r-pill",
-            "--shadow-card", "--shadow-pop", "--ease", "--t-fast", "--t-base", "--rail-w", "--nav-w",
+            "--shadow-card", "--shadow-pop", "--ease", "--t-fast", "--t-base", "--sidebar-w", "--sidebar-w-collapsed",
             "--risk-critical", "--risk-high", "--risk-medium", "--risk-low", "--risk-info");
 
     /** 规范 2.1：深色块覆盖颜色类核心令牌。 */
@@ -62,7 +62,7 @@ class UiContractTest {
     /** 规范 2.1 的纪律：深色块不重定义几何 / 动效 / 布局 / 字体令牌。 */
     private static final List<String> DARK_MUST_NOT_OVERRIDE = List.of(
             "--r-card", "--r-tile", "--r-control", "--r-pill", "--ease", "--t-fast", "--t-base",
-            "--rail-w", "--nav-w", "--font", "--mono");
+            "--sidebar-w", "--sidebar-w-collapsed", "--font", "--mono");
 
     /** 规范 4.2 的字号阶梯（px）。 */
     private static final List<String> FONT_LADDER = List.of(
@@ -181,7 +181,7 @@ class UiContractTest {
             expected.put(".head-metric .value", "20");
             expected.put(".ring-label .pct", "20");
             expected.put(".modal-title", "18");
-            expected.put(".sidenav-head h2", "16");
+            expected.put(".sidebar-context h2", "16");
             expected.put(".card-title", "15");
             expected.put(".flow-value", "15");
             expected.put("body", "13");
@@ -278,12 +278,12 @@ class UiContractTest {
     class Layout {
 
         @Test
-        @DisplayName("外壳三列网格由 --rail-w / --nav-w 驱动")
-        void shellGridIsDrivenByRailAndNavTokens() {
+        @DisplayName("外壳两列网格由 --sidebar-w 驱动")
+        void shellGridIsDrivenBySidebarToken() {
             String app = firstBody(".app");
-            assertTrue(app.contains("grid-template-columns: var(--rail-w) var(--nav-w) minmax(0, 1fr)"),
+            assertTrue(app.contains("grid-template-columns: var(--sidebar-w) minmax(0, 1fr)"),
                     () -> "布局契约（规范 5.1）：.app 必须是 "
-                            + "grid-template-columns: var(--rail-w) var(--nav-w) minmax(0, 1fr)，实际规则体为："
+                            + "grid-template-columns: var(--sidebar-w) minmax(0, 1fr)，实际规则体为："
                             + app.trim());
             assertTrue(app.contains("height: calc(100vh - 28px)"),
                     () -> "布局契约（规范 5.1）：.app 高度应为 calc(100vh - 28px)，实际规则体为：" + app.trim());
@@ -295,15 +295,24 @@ class UiContractTest {
         }
 
         @Test
-        @DisplayName("收起菜单：中间轨道归零，并且移出 Tab 序列")
-        void collapsingTheMenuZeroesTheMiddleTrackAndHidesItFromTabOrder() {
+        @DisplayName("侧栏默认收起，展开是记忆化选择")
+        void sidebarStartsCollapsedUnlessTheBrowserSaysOtherwise() {
+            assertTrue(html.contains("<div class=\"app nav-collapsed\">"),
+                    () -> "布局契约（规范 7.3）：第一帧必须是收起态，index.html 的 .app 应带 nav-collapsed。");
+            assertTrue(js.contains("saved ? saved === 'collapsed' : true"),
+                    () -> "布局契约（规范 7.3）：没有保存值时 initNav 必须默认收起。");
+        }
+
+        @Test
+        @DisplayName("收起侧栏：轨道换成图标宽度，文字标签移出布局")
+        void collapsingTheSidebarUsesTheIconTrackAndHidesLabels() {
             String collapsed = firstBody(".app.nav-collapsed");
-            assertTrue(collapsed.contains("grid-template-columns: var(--rail-w) 0 minmax(0, 1fr)"),
-                    () -> "布局契约（规范 5.1 / 7.3）：收起态应把中间轨道改成 0，实际规则体为：" + collapsed.trim());
-            String hidden = firstBody(".app.nav-collapsed .sidenav");
-            assertTrue(hidden.contains("visibility: hidden"),
-                    () -> "无障碍契约（规范 7.3）：只归零宽度会让 Tab 停在看不见的控件上，"
-                            + "收起态必须 visibility: hidden，实际规则体为：" + hidden.trim());
+            assertTrue(collapsed.contains("grid-template-columns: var(--sidebar-w-collapsed) minmax(0, 1fr)"),
+                    () -> "布局契约（规范 5.1 / 7.3）：收起态应换成 --sidebar-w-collapsed 轨道，实际规则体为："
+                            + collapsed.trim());
+            String hidden = firstBody(".app.nav-collapsed .side-label");
+            assertTrue(hidden.contains("display: none"),
+                    () -> "无障碍契约（规范 7.3）：收起态的文字标签必须移出布局，实际规则体为：" + hidden.trim());
         }
 
         @Test
@@ -362,8 +371,8 @@ class UiContractTest {
                             + bodyIn(at1400, ".grid-2").trim());
 
             String app1180 = bodyIn(at1180, ".app");
-            assertTrue(app1180.contains("--nav-w: 220px"),
-                    () -> "响应式契约（规范 5.4）：≤1180px 菜单宽应 268→220，实际为：" + app1180.trim());
+            assertTrue(app1180.contains("--sidebar-w: 248px"),
+                    () -> "响应式契约（规范 5.4）：≤1180px 侧栏宽应 288→248，实际为：" + app1180.trim());
             assertTrue(app1180.contains("min-width: 0"),
                     () -> "响应式契约（规范 5.4）：≤1180px .app 必须补 min-width: 0，"
                             + "否则 1180px 下限把右列裁掉且没有滚动条；实际为：" + app1180.trim());
@@ -379,8 +388,8 @@ class UiContractTest {
             assertTrue(bodyIn(at860, ".stats").contains("minmax(0, 1fr)"),
                     () -> "响应式契约（规范 5.4）：≤860px 统计块应单列，实际为："
                             + bodyIn(at860, ".stats").trim());
-            assertTrue(bodyIn(at860, ".app").contains("--nav-w: 216px"),
-                    () -> "响应式契约（规范 5.3）：≤860px 菜单宽应 216px，实际为："
+            assertTrue(bodyIn(at860, ".app").contains("--sidebar-w: 236px"),
+                    () -> "响应式契约（规范 5.3）：≤860px 侧栏宽应 236px，实际为："
                             + bodyIn(at860, ".app").trim());
             assertTrue(bodyIn(at860, ".tr .cell.optional").contains("display: none"),
                     () -> "响应式契约（规范 5.4）：≤860px 应隐藏 .tr .cell.optional，实际为："
@@ -492,10 +501,10 @@ class UiContractTest {
         }
 
         @Test
-        @DisplayName("图标栏是带 aria-label 的主导航")
-        void railIsALabelledNavigation() {
-            assertTrue(Pattern.compile("<nav[^>]*class=\"rail\"[^>]*aria-label=\"主导航\"").matcher(html).find(),
-                    () -> "ARIA 契约（规范 10.3）：<nav class=\"rail\"> 必须带 aria-label=\"主导航\"，"
+        @DisplayName("侧栏是带 aria-label 的主导航")
+        void sidebarIsALabelledNavigation() {
+            assertTrue(Pattern.compile("<nav[^>]*class=\"sidebar\"[^>]*aria-label=\"主导航\"").matcher(html).find(),
+                    () -> "ARIA 契约（规范 10.3）：<nav class=\"sidebar\"> 必须带 aria-label=\"主导航\"，"
                             + "index.html 里没有找到这样的标签。");
         }
 
@@ -648,8 +657,8 @@ class UiContractTest {
         void specDocumentExists() {
             String spec = read(WIKI_DIR.resolve("界面规范.md"));
             List<String> missing = new ArrayList<>();
-            for (String needle : List.of("--primary", "--rail-w", "--nav-w", "--ease",
-                    ".btn", ".card", ".rail", ".sidenav", ".workspace")) {
+            for (String needle : List.of("--primary", "--sidebar-w", "--sidebar-w-collapsed", "--ease",
+                    ".btn", ".card", ".sidebar", ".workspace")) {
                 if (!spec.contains(needle)) {
                     missing.add(needle);
                 }

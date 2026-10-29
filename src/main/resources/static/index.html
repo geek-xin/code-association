@@ -73,47 +73,45 @@
   <symbol id="i-corner-down" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M6 4v10a3 3 0 0 0 3 3h9"/><path d="m14 13 4 4-4 4"/></symbol>
 </defs></svg>
 
-<div class="app">
+<div class="app nav-collapsed">
+  <script>
+    /* First paint: the sidebar starts folded unless this browser explicitly expanded it. This
+       runs before the nav is parsed, so an expanded session never flashes closed. */
+    (function () {
+      var stored = null;
+      try { stored = localStorage.getItem('ca.nav'); } catch (e) { /* private mode */ }
+      if (stored === 'expanded') document.currentScript.parentElement.classList.remove('nav-collapsed');
+    })();
+  </script>
 
-  <!-- ============================ icon rail ============================ -->
-  <nav class="rail" aria-label="主导航">
-    <div class="rail-logo" title="Code Association">CA</div>
-    <div class="rail-group">
-      <button class="rail-btn active" data-nav="overview" title="总览"><svg><use href="#i-home"/></svg></button>
-      <button class="rail-btn" data-nav="sources" title="代码源"><svg><use href="#i-database"/></svg></button>
-      <button class="rail-btn" data-nav="review" title="影响审核"><svg><use href="#i-shield"/></svg></button>
-      <button class="rail-btn" data-nav="analysis" title="分析详情"><svg><use href="#i-file"/></svg></button>
-      <button class="rail-btn" data-nav="map" title="跨程序契约地图"><svg><use href="#i-network"/></svg></button>
-      <button class="rail-btn" data-nav="triage" title="复核队列"><svg><use href="#i-gauge"/></svg><span class="dot" id="rail-alert-dot"></span></button>
-    </div>
-    <div class="rail-spacer"></div>
-    <div class="rail-group">
-      <button class="rail-btn" data-nav="history" title="分析历史"><svg><use href="#i-clock"/></svg></button>
-      <button class="rail-btn" data-nav="settings" title="设置"><svg><use href="#i-settings"/></svg><span class="dot update hidden" id="rail-update-dot" aria-hidden="true"></span></button>
-      <button class="rail-btn" id="theme-toggle" data-theme-toggle type="button"
-              title="切换深浅色" aria-label="切换深浅色" aria-pressed="false"><svg><use href="#i-theme-moon"/></svg></button>
-      <!-- Only visible while the text menu is collapsed: the expand affordance cannot live inside
-           the thing it reveals, or it would disappear together with it. -->
-      <button class="rail-btn" id="nav-expand" data-nav-expand type="button"
-              title="展开菜单栏（Ctrl/⌘ + B）" aria-label="展开菜单栏" aria-expanded="false"
-              aria-controls="sidenav"><svg><use href="#i-chevron-right"/></svg></button>
-      <div class="rail-avatar" title="本地工作区">本地</div>
-    </div>
-  </nav>
-
-  <!-- =========================== text sidenav ========================== -->
-  <aside class="sidenav" id="sidenav">
-    <div class="sidenav-head">
-      <div>
-        <div class="eyebrow">工作区</div>
-        <h2 id="nav-title">代码源</h2>
+  <!-- ==================== unified, collapsible sidebar ==================== -->
+  <!-- One column: the old icon rail and text menu are now the same surface. Expanded it is a
+       full menu; collapsed it keeps the icons and drops the words. Both states are a single
+       grid track driven by --sidebar-w / --sidebar-w-collapsed, so the fold is one variable. -->
+  <nav class="sidebar" id="sidenav" aria-label="主导航">
+    <div class="sidebar-top">
+      <div class="sidebar-brand">
+        <div class="sidebar-logo" title="Code Association">CA</div>
+        <div class="sidebar-brand-text">
+          <span class="sidebar-brand-name">Code Association</span>
+          <span class="sidebar-brand-sub">跨程序影响扫描</span>
+        </div>
       </div>
-      <div class="sidenav-head-actions">
+      <button class="icon-btn sidebar-toggle" id="nav-collapse" type="button"
+              title="收起侧栏（Ctrl/⌘ + B）" aria-label="收起侧栏" aria-expanded="false" aria-controls="sidenav">
+        <svg><use href="#i-chevron-left"/></svg>
+      </button>
+      <button class="icon-btn sidebar-toggle" id="nav-expand" data-nav-expand type="button"
+              title="展开侧栏（Ctrl/⌘ + B）" aria-label="展开侧栏" aria-expanded="true" aria-controls="sidenav">
+        <svg><use href="#i-chevron-right"/></svg>
+      </button>
+    </div>
+
+    <div class="sidebar-context">
+      <div class="eyebrow">工作区</div>
+      <div class="sidebar-context-row">
+        <h2 id="nav-title">代码源</h2>
         <button class="icon-btn" id="nav-add-source" title="添加代码源" aria-label="添加代码源"><svg><use href="#i-plus"/></svg></button>
-        <button class="icon-btn" id="nav-collapse" type="button"
-                title="收起菜单栏（Ctrl/⌘ + B）" aria-label="收起菜单栏" aria-expanded="true" aria-controls="sidenav">
-          <svg><use href="#i-chevron-left"/></svg>
-        </button>
       </div>
     </div>
 
@@ -124,41 +122,44 @@
     </div>
 
     <div class="nav-scroll">
-      <div class="nav-group">
-        <button class="nav-item active" data-nav="overview"><svg><use href="#i-home"/></svg>总览<span class="count" id="nav-count-sources">0</span></button>
-        <button class="nav-item" data-nav="sources"><svg><use href="#i-database"/></svg>代码源<span class="count" id="nav-count-sources2">0</span></button>
-        <button class="nav-item" data-nav="review"><svg><use href="#i-shield"/></svg>影响审核<span class="count alert" id="nav-count-review">0</span></button>
+      <div class="nav-group nav-primary">
+        <button class="nav-item active" data-nav="overview" title="总览" aria-label="总览"><svg><use href="#i-home"/></svg><span class="side-label">总览</span><span class="count" id="nav-count-sources">0</span></button>
+        <button class="nav-item" data-nav="sources" title="代码源" aria-label="代码源"><svg><use href="#i-database"/></svg><span class="side-label">代码源</span><span class="count" id="nav-count-sources2">0</span></button>
+        <button class="nav-item" data-nav="review" title="影响审核" aria-label="影响审核"><svg><use href="#i-shield"/></svg><span class="side-label">影响审核</span><span class="count alert" id="nav-count-review">0</span></button>
+        <button class="nav-item" data-nav="analysis" title="分析详情" aria-label="分析详情"><svg><use href="#i-file"/></svg><span class="side-label">分析详情</span></button>
+        <button class="nav-item" data-nav="map" title="跨程序契约地图" aria-label="跨程序契约地图"><svg><use href="#i-network"/></svg><span class="side-label">契约地图</span></button>
+        <button class="nav-item" data-nav="triage" title="复核队列" aria-label="复核队列"><svg><use href="#i-gauge"/></svg><span class="side-label">复核队列</span><span class="count alert" id="nav-count-triage">0</span><span class="dot" id="rail-alert-dot"></span></button>
       </div>
 
-      <div class="nav-group">
-        <div class="nav-group-title"><span>代码源</span><button class="icon-btn" style="width:22px;height:22px;border-radius:6px" id="nav-add-source-2" title="添加"><svg><use href="#i-plus"/></svg></button></div>
+      <div class="nav-group nav-context-group">
+        <div class="nav-group-title"><span>代码源</span></div>
         <div id="nav-sources"><p class="muted" style="font-size:11.5px;padding:4px 8px">加载中…</p></div>
       </div>
 
-      <div class="nav-group">
+      <div class="nav-group nav-context-group">
         <div class="nav-group-title"><span>状态</span></div>
-        <button class="nav-item" data-filter="status:DONE"><svg><use href="#i-check-circle"/></svg>已就绪<span class="count" id="nav-status-done">0</span></button>
-        <button class="nav-item" data-filter="status:RUNNING"><svg><use href="#i-activity"/></svg>分析中<span class="count" id="nav-status-running">0</span></button>
-        <button class="nav-item" data-filter="status:FAILED"><svg><use href="#i-alert-circle"/></svg>失败<span class="count" id="nav-status-failed">0</span></button>
+        <button class="nav-item" data-filter="status:DONE"><svg><use href="#i-check-circle"/></svg><span class="side-label">已就绪</span><span class="count" id="nav-status-done">0</span></button>
+        <button class="nav-item" data-filter="status:RUNNING"><svg><use href="#i-activity"/></svg><span class="side-label">分析中</span><span class="count" id="nav-status-running">0</span></button>
+        <button class="nav-item" data-filter="status:FAILED"><svg><use href="#i-alert-circle"/></svg><span class="side-label">失败</span><span class="count" id="nav-status-failed">0</span></button>
       </div>
 
-      <div class="nav-group">
+      <div class="nav-group nav-context-group">
         <div class="nav-group-title"><span>最近分析</span></div>
         <div id="nav-history"><p class="muted" style="font-size:11.5px;padding:4px 8px">暂无记录</p></div>
       </div>
+    </div>
 
-      <div class="nav-group">
-        <div class="nav-group-title"><span>其他</span></div>
-        <button class="nav-item" data-nav="history"><svg><use href="#i-clock"/></svg>分析历史<span class="count" id="nav-count-history">0</span></button>
-        <button class="nav-item" data-nav="settings"><svg><use href="#i-settings"/></svg>设置</button>
+    <div class="sidebar-foot">
+      <button class="nav-item" data-nav="history" title="分析历史" aria-label="分析历史"><svg><use href="#i-clock"/></svg><span class="side-label">分析历史</span><span class="count" id="nav-count-history">0</span></button>
+      <button class="nav-item" data-nav="settings" title="设置" aria-label="设置"><svg><use href="#i-settings"/></svg><span class="side-label">设置</span><span class="dot update hidden" id="rail-update-dot" aria-hidden="true"></span></button>
+      <button class="nav-item" data-nav="review" title="已忽略的发现" aria-label="已忽略的发现"><svg><use href="#i-archive"/></svg><span class="side-label">已忽略的发现</span><span class="count" id="nav-count-dismissed">0</span></button>
+      <div class="sidebar-tools">
+        <button class="sidebar-tool" id="theme-toggle" data-theme-toggle type="button"
+                title="切换深浅色" aria-label="切换深浅色" aria-pressed="false"><svg><use href="#i-theme-moon"/></svg></button>
+        <div class="sidebar-avatar" title="本地工作区"><span>本地</span></div>
       </div>
     </div>
-
-    <div class="sidenav-foot">
-      <button class="nav-item" data-nav="triage"><svg><use href="#i-gauge"/></svg>复核队列<span class="count alert" id="nav-count-triage">0</span></button>
-      <button class="nav-item" data-nav="review"><svg><use href="#i-archive"/></svg>已忽略的发现<span class="count" id="nav-count-dismissed">0</span></button>
-    </div>
-  </aside>
+  </nav>
 
   <!-- ============================ workspace ============================ -->
   <main class="workspace" id="workspace">
@@ -219,15 +220,14 @@
         <div class="card">
           <div class="card-head">
             <div>
-              <div class="card-title">其他程序的待处理影响</div>
+              <div class="card-title">对其他程序的影响</div>
               <div class="card-sub">按风险排序，点击进入审核与证据</div>
             </div>
-            <div class="card-head-actions">
-              <span class="pill danger" id="ov-attn-count">0 项</span>
-              <button class="btn btn-sm" data-nav="review">查看全部<svg><use href="#i-chevron-right"/></svg></button>
-            </div>
+            <div class="card-head-actions" id="ov-impact-summary"></div>
           </div>
+          <div id="ov-peer-strip"></div>
           <div class="list" id="ov-attention"></div>
+          <div id="ov-impact-foot"></div>
         </div>
 
         <div class="stack">
@@ -256,17 +256,6 @@
             <div id="ov-risk-bars" style="display:flex;flex-direction:column;gap:11px"></div>
           </div>
         </div>
-      </div>
-
-      <div class="card" id="ov-peer-card" style="margin-bottom:16px;display:none">
-        <div class="card-head">
-          <div>
-            <div class="card-title">对其他程序的影响</div>
-            <div class="card-sub">本程序的变更通过接口、数据表、配置与 Maven 依赖传导到其他程序</div>
-          </div>
-          <div class="card-head-actions" id="ov-peer-summary"></div>
-        </div>
-        <div id="ov-peers"></div>
       </div>
 
       <div class="card" style="margin-bottom:16px">
@@ -303,7 +292,7 @@
             <h1 class="page-title">添加代码源</h1>
             <span class="pill brand">导入</span>
           </div>
-          <div class="page-sub">本地目录、本地 Git 仓库或远程仓库。添加后即可扫描它对其他程序的影响。</div>
+          <div class="page-sub">本地目录、本地 Git 仓库或远程仓库。添加后即可扫描它对其他程序的影响；私有仓库可用设置页保存的 GitLab 个人令牌，或为代码源指定凭据环境变量。</div>
         </div>
         <div class="head-right">
           <div class="head-actions">
@@ -344,7 +333,7 @@
                 <input id="src-location" placeholder="/path/to/project 或 https://github.com/org/repo.git"/>
                 <button class="btn btn-sm" type="button" data-pick-dir="src-location" title="选择文件夹"><svg><use href="#i-folder"/></svg>浏览…</button>
               </div>
-              <div class="hint">本地目录可直接点「浏览…」从文件夹树选择；远程仓库会克隆到本地数据目录，私有仓库通过环境变量读取 token，不写入数据库。</div>
+              <div class="hint">本地目录可直接点「浏览…」从文件夹树选择；远程仓库会克隆到本地数据目录。私有仓库用凭据环境变量或设置页的 GitLab 令牌认证，token 不写入数据库。</div>
             </div>
             <div class="field-row">
               <div class="field">
@@ -356,7 +345,8 @@
               </div>
               <div class="field">
                 <label for="src-token">凭据环境变量</label>
-                <input id="src-token" placeholder="GITHUB_TOKEN（可留空）"/>
+                <input id="src-token" placeholder="GITLAB_TOKEN（可留空）"/>
+                <div class="hint">留空时 GitLab 来源使用设置页保存的个人令牌。</div>
               </div>
             </div>
             <div class="field">
@@ -1048,6 +1038,48 @@
 
           <div id="ai-test-result" style="margin-top:12px"></div>
         </div>
+        <div class="card" id="card-gitlab" style="grid-column:1/-1">
+          <div class="card-head">
+            <div>
+              <div class="card-title">GitLab 私有仓库</div>
+              <div class="card-sub">来自 /api/gitlab · 仅对来源类型为 GitLab 的代码源生效，凭据环境变量优先</div>
+            </div>
+            <div class="card-head-actions">
+              <button class="btn btn-sm btn-primary" id="gl-save" data-gitlab-save type="button"
+                      title="保存并立即生效，无需重启" aria-label="保存 GitLab 个人访问令牌">
+                <svg><use href="#i-check"/></svg>保存
+              </button>
+            </div>
+          </div>
+
+          <!-- Same status-row recipe as the AI card (规范 7.23); the inputs below are filled by
+               fillGitLabForm() only on first load and after a save, so a poll tick cannot wipe them. -->
+          <div class="ai-status-row">
+            <span class="pill neutral" id="gl-status">读取中</span>
+            <span class="ai-status-note" id="gl-status-note">—</span>
+          </div>
+
+          <div class="stack" style="gap:14px;margin-top:14px">
+            <div class="field">
+              <label for="gl-token">个人访问令牌</label>
+              <div class="path-field">
+                <input id="gl-token" type="password" placeholder="未设置（glpat-…）" autocomplete="new-password" spellcheck="false"/>
+                <button class="btn btn-sm" type="button" id="gl-clear" data-gitlab-clear
+                        title="清除已保存的令牌" aria-label="清除已保存的 GitLab 令牌">清除</button>
+              </div>
+              <div class="hint">scope 需要 <span class="mono">read_repository</span>；只保存在本机数据目录，不写入浏览器，也不写入代码源。</div>
+            </div>
+
+            <div class="callout">
+              <svg><use href="#i-shield"/></svg>
+              <div>只有来源类型为 <span class="mono">GITLAB</span> 且未指定凭据环境变量的代码源会使用它，代码源自己的凭据环境变量优先。
+                也支持 <span class="mono">application.yml</span> 的 <span class="mono">code-association.gitlab.token</span>
+                或环境变量 <span class="mono">GITLAB_TOKEN</span>；此处保存的快照优先。</div>
+            </div>
+
+            <div class="ai-foot">配置保存在 <span class="mono" id="gl-settings-file">—</span></div>
+          </div>
+        </div>
         <div class="card" id="card-transfer" style="grid-column:1/-1">
           <div class="card-head">
             <div>
@@ -1145,7 +1177,8 @@
         </div>
         <div class="field">
           <label for="m-token">凭据环境变量</label>
-          <input id="m-token" placeholder="GITHUB_TOKEN（可留空）"/>
+          <input id="m-token" placeholder="GITLAB_TOKEN（可留空）"/>
+          <div class="hint">留空时 GitLab 来源使用设置页保存的个人令牌。</div>
         </div>
       </div>
             <div class="field">

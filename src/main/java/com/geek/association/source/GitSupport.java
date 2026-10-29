@@ -24,6 +24,8 @@ import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /** Thin wrapper around JGit: clone, fetch, resolve refs, merge-base. */
 public final class GitSupport {
@@ -61,8 +63,10 @@ public final class GitSupport {
         try {
             Files.createDirectories(targetDir);
             log.info("cloning {} into {}", target, targetDir);
+            String cloneUri = token == null || token.isBlank() ? uri : withoutCredentials(uri);
             Git git = Git.cloneRepository()
-                    .setURI(withCredentials(uri, token))
+                    .setURI(cloneUri)
+                    .setCredentialsProvider(credentials(token))
                     .setDirectory(dir)
                     .setCloneAllBranches(true)
                     .setCloneSubmodules(false)
@@ -78,22 +82,53 @@ public final class GitSupport {
         }
     }
 
+    /** {@code http(s)://rest-of-url}; the rest may already carry {@code user:secret@}. */
+    private static final Pattern HTTP_URL = Pattern.compile("^(https?)://(.+)$");
+
+    static String withoutCredentials(String uri) {
+        if (uri == null) {
+            return null;
+        }
+        Matcher matcher = HTTP_URL.matcher(uri);
+        if (!matcher.matches()) {
+            return uri;
+        }
+        String rest = matcher.group(2);
+        int at = rest.indexOf('@');
+        if (at >= 0) {
+            rest = rest.substring(at + 1);
+        }
+        return matcher.group(1) + "://" + rest;
+    }
+
+    /**
+     * Adds the token to an HTTP(S) URL as the {@code oauth2} user, which both GitHub and GitLab
+     * accept for a personal access token.
+     *
+     * <p>Both schemes are handled. A self-hosted GitLab is sometimes served over plain HTTP, and
+     * stripping only {@code https://} turned such an address into
+     * {@code https://oauth2:<token>@http://host/repo.git} - a malformed URL that failed with a
+     * message nobody could act on. A non-HTTP address (SSH) is returned untouched: this JGit build
+     * has no SSH transport, and rewriting the scheme silently would hide that.
+     */
     public static String withCredentials(String uri, String token) {
         if (token == null || token.isBlank() || uri == null) {
             return uri;
         }
-        if (!uri.startsWith("http")) {
+        Matcher matcher = HTTP_URL.matcher(uri);
+        if (!matcher.matches()) {
             return uri;
         }
-        String clean = uri.replaceFirst("^https://", "");
-        int at = clean.indexOf('@');
+        String scheme = matcher.group(1);
+        String rest = matcher.group(2);
+        int at = rest.indexOf('@');
         if (at >= 0) {
-            clean = clean.substring(at + 1);
+            rest = rest.substring(at + 1);
         }
-        if (clean.startsWith("oauth2:") || clean.contains("x-access-token")) {
-            return "https://" + clean;
+        if (rest.startsWith("oauth2:") || rest.contains("x-access-token")) {
+            return scheme + "://" + rest;
         }
-        return "https://oauth2:" + token + "@" + clean;
+        return scheme + "://oauth2:" + token + "@" + rest;
     }
 
     public static void fetchAll(Repository repo, String token) throws IOException {

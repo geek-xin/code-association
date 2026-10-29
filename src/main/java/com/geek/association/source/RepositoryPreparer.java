@@ -8,6 +8,7 @@ import org.eclipse.jgit.lib.ObjectId;
 import org.eclipse.jgit.lib.Repository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 import java.io.IOException;
@@ -22,6 +23,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Function;
 
 /**
  * Resolves a configured source into a base/head pair of snapshots.
@@ -36,8 +38,23 @@ public class RepositoryPreparer {
 
     private final AppProperties properties;
 
+    /**
+     * Environment lookup, a seam rather than a direct {@code System.getenv}.
+     *
+     * The credential precedence ("the source's variable wins, otherwise a GitLab source uses the
+     * configured personal token") is the part worth testing, and a test cannot set an environment
+     * variable of the running JVM. One extra constructor keeps the production path unchanged.
+     */
+    private final Function<String, String> env;
+
+    @Autowired
     public RepositoryPreparer(AppProperties properties) {
+        this(properties, System::getenv);
+    }
+
+    RepositoryPreparer(AppProperties properties, Function<String, String> env) {
         this.properties = properties;
+        this.env = env == null ? System::getenv : env;
     }
 
     public static final class Request {
@@ -806,10 +823,42 @@ public class RepositoryPreparer {
     }
 
     private String tokenOf(RepoSource source) {
-        if (Texts.isBlank(source.credentialEnv)) {
+        return source == null ? null : tokenFor(source.type, source.credentialEnv);
+    }
+
+    /**
+     * The credential for one source or one not-yet-saved form entry.
+     *
+     * <p>An explicitly named credential environment variable wins: a repository that needs its own
+     * token (a different account, a deploy token) must keep working even when a personal token is
+     * configured for everything else. When that variable is absent or empty, a source typed as
+     * GitLab falls back to the personal access token from the settings page /
+     * {@code application.yml}. Other types never receive it - the token belongs to GitLab and must
+     * not be offered to an unrelated host.
+     *
+     * <p>Package-visible for the precedence tests; the production callers go through
+     * {@link #tokenOf(RepoSource)} and {@link #refsForLocation}.
+     */
+    String tokenFor(String type, String credentialEnv) {
+        if (!Texts.isBlank(credentialEnv)) {
+            String fromEnv = env.apply(credentialEnv);
+            if (!Texts.isBlank(fromEnv)) {
+                return fromEnv.strip();
+            }
+            if (isGitLab(type)) {
+                log.debug("credential env {} is not set; falling back to the configured GitLab token",
+                        credentialEnv);
+            }
+        }
+        if (!isGitLab(type)) {
             return null;
         }
-        return System.getenv(source.credentialEnv);
+        String configured = properties.getGitlab().getToken();
+        return Texts.isBlank(configured) ? null : configured.strip();
+    }
+
+    private static boolean isGitLab(String type) {
+        return type != null && "GITLAB".equalsIgnoreCase(type.strip());
     }
 
     private static String sanitize(String ref) {
@@ -878,9 +927,10 @@ public class RepositoryPreparer {
             long started = System.nanoTime();
             String masked = GitSupport.maskCredentials(location);
             try {
-                String token = Texts.isBlank(credentialEnv) ? null : System.getenv(credentialEnv);
-                log.debug("refs lookup for {} (credential env: {})",
-                        masked, Texts.isBlank(credentialEnv) ? "none" : credentialEnv);
+                String token = tokenFor(normalizedType, credentialEnv);
+                log.debug("refs lookup for {} (credential env: {}, token: {})",
+                        masked, Texts.isBlank(credentialEnv) ? "none" : credentialEnv,
+                        token == null ? "none" : "configured");
                 java.util.Collection<org.eclipse.jgit.lib.Ref> refs =
                         GitSupport.lsRemote(GitSupport.withCredentials(location, token), token);
                 List<String> branches = new java.util.ArrayList<>();

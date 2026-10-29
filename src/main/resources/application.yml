@@ -31,6 +31,11 @@ code-association:
   # the report instead of failing the run. Set to 0 to read every file regardless of size.
   max-file-mb: 20
   max-depth: 8
+  # 私有 GitLab 仓库的个人访问令牌。设置页「GitLab 私有仓库」保存的快照写到数据目录的
+  # gitlab-settings.json 并覆盖这里；无界面部署（CLI / 容器）直接给 GITLAB_TOKEN 环境变量即可。
+  # 只用于来源类型为 GITLAB 的代码源；代码源自己填了凭据环境变量且该变量有值时，以环境变量为准。
+  gitlab:
+    token: ${GITLAB_TOKEN:}
   # Daily proactive scan: analyse programs that received new commits, without anyone pressing a
   # button. Only programs whose HEAD moved since their last finished analysis are run, and each
   # run compares that program against every other program.

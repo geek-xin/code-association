@@ -28,8 +28,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * anything from configuration files that may have been edited since.
  *
  * Deliberately prints no secrets: no {@code code-association.update.token}, no AI API key, no
- * proxy URL. Only switches ("on"/"off"), paths and JVM facts, which is what makes the line safe to
- * paste into a bug report.
+ * GitLab personal access token, no proxy URL. Only switches ("on"/"off"), "set"/"none" and paths,
+ * which is what makes the line safe to paste into a bug report.
  */
 @Component
 public class StartupLog {
@@ -75,6 +75,11 @@ public class StartupLog {
                 // endpoints use, so the banner cannot claim AI works when the settings card says it
                 // does not.
                 "ai", properties.getAi().ready() ? "ready" : "not-ready",
+                // Presence only. The value is a credential and must never reach a log file; this
+                // field answers "did this process see a GitLab token" without answering "which".
+                "gitlabToken", properties.getGitlab() != null
+                        && properties.getGitlab().getToken() != null
+                        && !properties.getGitlab().getToken().isBlank() ? "set" : "none",
                 "pid", ProcessHandle.current().pid()));
     }
 

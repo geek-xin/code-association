@@ -3,9 +3,9 @@
 # release.sh — 构建、打包并发布 code-association 到 GitHub Release
 #
 # 用法:
-#   ./release.sh                  # 发布默认版本 0.8.0
-#   ./release.sh 0.8.0            # 发布指定版本
-#   VERSION=0.8.0 ./release.sh    # 同上（环境变量方式）
+#   ./release.sh                  # 发布默认版本 0.9.0
+#   ./release.sh 0.9.0            # 发布指定版本
+#   VERSION=0.9.0 ./release.sh    # 同上（环境变量方式）
 #
 # 产物:
 #   build/release/code-association-<version>/            # 干净的发布目录
@@ -40,7 +40,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 APP="code-association"
-VERSION="${1:-${VERSION:-0.8.0}}"
+VERSION="${1:-${VERSION:-0.9.0}}"
 TAG="v${VERSION}"
 RELEASE_ROOT="build/release"
 STAGE="${RELEASE_ROOT}/${APP}-${VERSION}"
@@ -358,38 +358,33 @@ cat > "$NOTES" <<'NOTES_TEMPLATE'
 跨程序变更影响扫描工具（Java / Maven 多模块仓库）：分析一次提交改动了哪些类、方法、
 SQL、MQ 消息结构，并推导出对其他模块 / 服务的连带影响与风险等级。
 
-这一版新增两个能力并修掉一类数据库误报。接口向后兼容，AI 相关新增配置项默认开启。
+这一版新增 GitLab 私有仓库令牌设置，并重做左侧导航与总览影响卡；接口向后兼容。
 
-### 新增：AI 逐条评审意见（行号由本机算）
+### 新增：设置页配置 GitLab 个人访问令牌
 
-AI 审核在整段摘要之外新增逐条意见：每条带严重级、类别、标题、正文、建议、代码引用与
-`文件:行`。模型只逐字引用代码，行号由三层定位在本机算出——hunk 文本匹配 → 整文件扫描
-→ 模型重定位；三层都失败就丢弃并计数，不猜位置。
+私有 GitLab 仓库不再必须先导出 `GITLAB_TOKEN` 再重启。设置页新增「GitLab 私有仓库」卡片：
+粘贴个人访问令牌（PAT，scope 至少 `read_repository`）保存即生效，克隆、fetch、列分支都使用它；
+只对来源类型 `GITLAB` 生效，`GITHUB` / `GIT` / `LOCAL_*` 不会附加。
 
-误报由两层过滤控制：确定性过滤（送审文件、证据编号、行号范围、白名单、相似评论合并、
-上限截断）之后，可选的反思模型只删除与代码事实矛盾的评论；反思失败或解析失败时保留全部。
-每一步都有 token 预算：最多 20 个文件、单文件约 4000 tokens、单 chunk 约 8000 tokens、
-每 chunk 最多 10 条评论、反思输入约 12000 tokens。
+令牌存 `{data-dir}/gitlab-settings.json`（原子写、POSIX 600），`GET/PUT /api/gitlab` 只回显掩码；
+代码源「凭据环境变量」有值时优先，否则回退到设置页令牌或 yml 的 `code-association.gitlab.token`
+（默认读 `GITLAB_TOKEN`）。自建 GitLab 的 `http://` 与 `https://` 地址都支持。
 
-设置页新增「生成逐条评审意见」「每条分析最多评论」「用反思模型过滤误报」三项；
-报告新增 `ai.comments` / `ai.reviewStats` / `ai.reviewError`，分析页与 Markdown 导出同步展示。
+### 改进：单侧栏，默认收起
 
-### 新增：提交范围改为勾选要分析的提交
+原来 68px 图标栏 + 268px 文字菜单合成一条 288px 紫色侧栏：展开显示图标 + 标签 + 搜索 +
+代码源/状态/最近分析，收起只剩 72px 图标列。**默认收起**；展开后写入 `localStorage` 的
+`ca.nav`，下次保持。折叠/展开按钮都在侧栏顶部，状态与 `aria-expanded` 同步。
 
-「提交范围」不再要求先填一对起止提交：选择分支，可用 `since` / `until` 日期缩小范围，
-从最新的 100 个提交里勾选本次要分析的那些。接口 `GET /api/sources/{id}/commits` 新增
-`since` / `until` 可选参数，响应带 `more`；换分支或改日期后，不在新列表里的勾选会自动取消。
+### 改进：总览影响卡合并
 
-### 修复：删除写语句不再被当成「删除数据库字段」
+「其他程序的待处理影响」与「对其他程序的影响」合并为一张卡：先给每个对比程序一枚
+契约数 / 影响处数汇总 pill，再按风险列出前 6 条影响并标注待复核 / 已确认 / 已忽略；
+完整的契约命中、使用点与逐跳传播仍在「影响审核」页。
 
-删掉一条 mapper 写语句（或从 `SET` / `INSERT` 列清单里去掉某列）时，本程序只是停止写入
-该列，列本身仍在数据库里，对方的 `SELECT` 不会失败。此前它被当成列删除，命中了所有读该列
-的对方程序（例如 `AuthMapper.getRightLogList` 读 `igm_card_right_log.error_reason`），
-是明确误报。现在停止写入某列只计入「对对方不可观察的变更」，不生成跨程序影响。
+### 改进：只保留一个添加入口
 
-字段删除只认迁移脚本里显式的 `ALTER TABLE ... DROP COLUMN`（或列重命名的旧列名）；
-只是 `CREATE TABLE` 快照里不再列出该列（改列清单、删建表脚本）不再按删除传播，只计数。
-真正的列删除仍会命中对方读方、写方与映射方。
+去掉「代码源」分组标题里重复的加号，只保留侧栏顶部页面标题旁的添加按钮。
 
 ### 下载
 
@@ -431,9 +426,9 @@ stop.bat
 **0.6.0 起换完 jar 会自己重启**（`auto-restart` 默认开），失败自动回滚到备份 jar；
 更早的版本换完只会提示你自己执行 `stop.sh` / `start.sh`。
 
-本版 AI 相关新增 `comments` / `max-comments` / `reflection` 三个配置项，默认开启；
-关闭「生成逐条评审意见」即回到只发送分析摘要的模式。历史报告不会重写——请重新分析一次，
-逐条评审意见与新的数据库字段删除判定才会出现在报告里。
+本版新增 `code-association.gitlab.token` 配置（默认读 `GITLAB_TOKEN`），已有配置不受影响；
+设置页令牌保存在数据目录的 `gitlab-settings.json`，删除该文件重启即可回退到 yml / 环境变量。
+历史报告不会重写——请重新分析一次，新的侧栏、总览与 GitLab 令牌才会生效。
 NOTES_TEMPLATE
 render "$NOTES"
 
