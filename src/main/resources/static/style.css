@@ -437,7 +437,13 @@ svg:not([width]) { width: 1em; height: 1em; flex: none; }
   color: var(--on-primary);
   box-shadow: var(--brand-shadow-strong);
 }
-.sidebar .nav-item.active svg { color: var(--on-primary); }
+.sidebar .nav-item.active > svg { color: var(--on-primary); }
+/* 代码源条目的 22px 品牌磁贴是条目里的"第二个图标"，不跟着 active 行变白：白字形落在
+   --primary-50 的浅底上等于消失（深色主题下 on-primary 反过来是深色，落在深色磁贴上一样看不见）。
+   字形固定用 --primary-700 对 --primary-50 —— 规范 3.4 实测 6.44:1 / 8.58:1，与卡片里
+   .row-icon.brand 的配色同一套；失败代码源保留 danger 语义。 */
+.sidebar .nav-item .row-icon svg { color: var(--primary-700); }
+.sidebar .nav-item .row-icon.danger svg { color: var(--danger-strong); }
 .sidebar .nav-item .count { background: var(--sidebar-count-bg); color: var(--text-2); }
 .sidebar .nav-item.active .count { background: var(--sidebar-count-active-bg); color: var(--on-primary); }
 .sidebar .nav-item .count.alert { background: var(--danger-bg); color: var(--danger-strong); }
@@ -687,6 +693,10 @@ svg:not([width]) { width: 1em; height: 1em; flex: none; }
 
 .grid { display: grid; gap: 16px; }
 .grid-2 { grid-template-columns: minmax(0, 1.5fr) minmax(0, 1fr); }
+/* findings list + evidence: the review page's only two-column area. It is its own class
+   (not .grid-2) because the list column is wider than the standard 1.5fr layout. */
+.rv-layout { grid-template-columns: minmax(0, 1fr) minmax(0, 1.05fr); align-items: start; }
+.rv-evidence-card { position: sticky; top: 0; }
 .grid-2-even { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .grid-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .stack { display: flex; flex-direction: column; gap: 16px; }
@@ -992,9 +1002,11 @@ svg:not([width]) { width: 1em; height: 1em; flex: none; }
 .list-row.selected { background: var(--primary-50); border-color: var(--primary-100); border-radius: 12px; }
 .list-row.selected + .list-row { border-top-color: transparent; }
 
-/* overview: one merged impact card (peer pills + risk-ordered rows) */
-.ov-peer-strip { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 10px; }
-.ov-peer-strip .pill { max-width: 100%; }
+/* cross-program summary pills: overview merged card + review findings head */
+.peer-strip { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 10px; }
+.peer-strip .pill { max-width: 100%; }
+/* inside a card head the title/sub already sit above it, so only add the gap below the sub */
+.card-head .peer-strip { margin: 8px 0 0; }
 .ov-impact-foot {
   margin-top: 8px;
   padding-top: 10px;
@@ -1429,6 +1441,29 @@ input[type="date"]::-webkit-calendar-picker-indicator { cursor: pointer; }
 .ev-type { font-family: var(--mono); font-size: 10px; letter-spacing: 0.05em; color: var(--primary); text-transform: uppercase; }
 .ev-main { color: var(--text); margin-top: 3px; word-break: break-word; }
 .ev-meta { color: var(--text-3); margin-top: 2px; font-family: var(--mono); font-size: 10.5px; word-break: break-word; }
+
+/* 证据行内联的源码窗口：引用行上下各 3 行，引用行高亮；横向滚动只发生在片段内部。 */
+.code-snippet-host:not(:empty) { margin-top: 7px; }
+.code-snippet {
+  margin: 0;
+  padding: 5px 0;
+  background: var(--inset-bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow-x: auto;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  line-height: 1.7;
+}
+.code-line { display: flex; gap: 9px; padding: 0 8px; white-space: pre; }
+.code-line.hl { background: var(--primary-50); box-shadow: inset 2px 0 0 var(--primary); }
+.code-n { flex: none; min-width: 3ch; text-align: right; color: var(--text-3); user-select: none; }
+.code-t { color: var(--text-2); }
+.code-line.hl .code-t { color: var(--text); }
+.code-snippet-note { margin-top: 4px; font-size: 10.5px; color: var(--text-3); }
+
+/* review: contract hits occupy the evidence card until a finding is selected */
+.peer-review + .peer-review { margin-top: 14px; }
 
 .test-list { margin: 0; padding-left: 16px; font-family: var(--mono); font-size: 11.5px; color: var(--text-2); line-height: 1.8; }
 
@@ -2050,6 +2085,10 @@ body.compact .list-row { padding: 10px 11px; }
   }
   .workspace { padding: 20px 20px 40px; }
   .grid-2, .grid-2-even, .grid-3 { grid-template-columns: minmax(0, 1fr); }
+  /* the review page is the one grid that was declared inline; it must fold here too,
+     otherwise the findings list and the evidence card each end up half a screen wide */
+  .rv-layout { grid-template-columns: minmax(0, 1fr); }
+  .rv-evidence-card { position: static; }
   .flow { grid-template-columns: minmax(0, 1fr); }
   .page-title { font-size: 22px; }
   /* Fixed columns shrink before the flexible one does: at this width the shell

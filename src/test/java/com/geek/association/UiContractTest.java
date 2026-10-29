@@ -44,6 +44,10 @@ class UiContractTest {
             "tabs", "tab", "modal", "drawer", "toast", "empty", "callout", "stepper", "pager",
             "tag-chip", "sidebar", "workspace", "page-head", "page-title", "title-badge",
             "tr", "path", "timeline", "flow", "progress", "chip",
+            // 规范 7.10：影响审核与总览共用同一排对比程序汇总 pill。
+            "peer-strip",
+            // 规范 7.22：证据行下方内联的引用行源码窗口。
+            "code-snippet",
             // 规范 7.23：AI 审核必须与证据视觉分区，标注与正文各自有独立类名。
             "ai-text", "ai-foot", "ai-verified-note", "ai-status-row", "ai-presets");
 

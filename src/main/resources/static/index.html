@@ -449,23 +449,13 @@
 
       <div class="stats" id="rv-stats"></div>
 
-      <div class="card" id="rv-peer-card" style="margin-bottom:16px;display:none">
-        <div class="card-head">
-          <div>
-            <div class="card-title">对其他程序的影响</div>
-            <div class="card-sub">审核时同样需要确认：本次改动是否要通知或改动这些程序</div>
-          </div>
-          <div class="card-head-actions" id="rv-peer-summary"></div>
-        </div>
-        <div id="rv-peers"></div>
-      </div>
-
-      <div class="grid" style="grid-template-columns:minmax(0,1fr) minmax(0,1.05fr);align-items:start">
+      <div class="grid rv-layout">
         <div class="card" style="padding:14px">
           <div class="card-head" style="padding:4px 4px 0">
-            <div>
+            <div style="min-width:0">
               <div class="card-title">发现列表</div>
               <div class="card-sub" id="rv-findings-sub">全部发现</div>
+              <div class="peer-strip" id="rv-peer-strip"></div>
             </div>
             <div class="card-head-actions">
               <div class="tabs" id="rv-tabs">
@@ -479,11 +469,11 @@
           <div class="list" id="rv-findings" style="margin-top:8px"></div>
         </div>
 
-        <div class="card" style="padding:14px;position:sticky;top:0">
+        <div class="card rv-evidence-card" style="padding:14px">
           <div class="card-head" style="padding:4px 4px 0">
             <div style="min-width:0">
-              <div class="card-title" id="rv-ev-title">证据</div>
-              <div class="card-sub" id="rv-ev-sub">选择左侧任一条影响查看证据链</div>
+              <div class="card-title" id="rv-ev-title">契约命中</div>
+              <div class="card-sub" id="rv-ev-sub">选择左侧任一条发现查看证据链</div>
             </div>
             <div class="card-head-actions" id="rv-ev-actions"></div>
           </div>

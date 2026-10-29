@@ -103,27 +103,51 @@ public final class AiReviewPipeline {
     }
 
     /**
-     * Reviews the changed hunks stored in {@code report.diffs}.
-     *
-     * Never throws: a model or parse failure is recorded in {@link Result#error} and in the stats,
-     * because the AI section is an optional extra and one bad chunk must not hide the others.
+     * Reviews the changed hunks stored in {@code report.diffs}, with no section budget and no
+     * progress: the form for callers that only want the comments out.
      */
     public Result review(ImpactReport report, FileContent files, int maxImpacts,
                          int maxComments, boolean reflection) {
+        return review(report, files, maxImpacts, maxComments, reflection,
+                AiBudget.unbounded(), AiProgress.none());
+    }
+
+    /**
+     * Reviews the changed hunks stored in {@code report.diffs} within one wall-clock budget.
+     *
+     * <p>Never throws: a model or parse failure is recorded in {@link Result#error} and in the stats,
+     * because the AI section is an optional extra and one bad chunk must not hide the others.
+     *
+     * <p>An exhausted budget ends the section at the next call boundary instead of failing it:
+     * whatever was generated is still placed and filtered, and the stats say how far it got. Nothing
+     * is ever deleted for lack of time - an unjudged comment is kept, not dropped.
+     *
+     * @param budget   wall-clock limit of this whole section; {@code null} means unlimited
+     * @param progress one line per model call; {@code null} means there is nowhere to report to
+     */
+    public Result review(ImpactReport report, FileContent files, int maxImpacts,
+                         int maxComments, boolean reflection, AiBudget budget, AiProgress progress) {
+        AiBudget sectionBudget = budget == null ? AiBudget.unbounded() : budget;
+        AiProgress sectionProgress = progress == null ? AiProgress.none() : progress;
         Result result = new Result();
         initStats(result);
         FileContent head = files == null ? FileContent.NONE : files;
         try {
-            run(report, head, maxImpacts, maxComments, reflection, result);
+            run(report, head, maxImpacts, maxComments, reflection, sectionBudget,
+                    sectionProgress, result);
         } catch (RuntimeException e) {
             record(result, "评审流水线异常", e);
         }
+        result.stats.put("budgetSeconds", sectionBudget.seconds());
+        // budgetExpired is raised where a call is actually skipped (markBudgetCut), not derived from
+        // "is the budget spent by now": a budget that runs out just as the last call returns cut
+        // nothing short, and the report shows this flag as "the comment list is incomplete".
         result.stats.put("commentsKept", result.comments.size());
         return result;
     }
 
-    private void run(ImpactReport report, FileContent files, int maxImpacts,
-                     int maxComments, boolean reflection, Result result) {
+    private void run(ImpactReport report, FileContent files, int maxImpacts, int maxComments,
+                     boolean reflection, AiBudget budget, AiProgress progress, Result result) {
         if (report == null || report.diffs == null || report.diffs.isEmpty()) {
             note(result, "没有可评审的变更片段");
             return;
@@ -136,6 +160,12 @@ public final class AiReviewPipeline {
             reviewed += chunk.size();
         }
         result.stats.put("filesReviewed", reviewed);
+        // The denominator has to be known before the first line is shown, so the reflection call is
+        // counted up front whenever it is enabled; reflect() gives it back when there turns out to
+        // be nothing to reflect on. A total that can only shrink keeps the fraction monotonic, and a
+        // progress bar that moves backwards reads as a bug.
+        Steps steps = new Steps(progress,
+                chunks.size() + MAX_RELOCATION_CALLS + (reflection ? 1 : 0));
 
         // One pass of model calls, then deterministic placement. Keeping generation and placement in
         // separate phases makes the failure budget obvious: a chunk either produced comments or it
@@ -143,6 +173,13 @@ public final class AiReviewPipeline {
         List<ReviewComment> generated = new ArrayList<>();
         ReviewPromptBuilder.FactCatalog facts = null;
         for (int i = 0; i < chunks.size(); i++) {
+            if (budget.expired()) {
+                // One note for the whole section rather than one per skipped chunk: the user needs
+                // to know the review was cut short, not how the loop happened to end.
+                markBudgetCut(result);
+                record(result, "AI 评审超出时间预算，剩余 " + (chunks.size() - i) + " 个分块未评审", null);
+                break;
+            }
             List<Candidate> chunk = chunks.get(i);
             List<ParsedDiff> chunkDiffs = new ArrayList<>();
             for (Candidate candidate : chunk) {
@@ -156,10 +193,14 @@ public final class AiReviewPipeline {
                 chunkFacts = new ReviewPromptBuilder.FactCatalog("", Map.of());
             }
             facts = chunkFacts;
+            steps.begin("AI 评审：分块 " + (i + 1) + "/" + chunks.size());
             try {
                 String prompt = prompts.commentsPrompt(chunkFacts, chunkDiffs);
                 addEstimate(result, prompt);
-                String answer = client.complete(SYSTEM_PROMPT, prompt, REVIEW_MAX_TOKENS);
+                // The remaining budget goes with the call so the transport can shorten its own
+                // timeout; the pipeline itself stops at the next loop head.
+                String answer = client.complete(SYSTEM_PROMPT, prompt, REVIEW_MAX_TOKENS,
+                        budget.remainingMillis());
                 if (answer == null || answer.isBlank()) {
                     record(result, "第 " + (i + 1) + " 个分块模型返回空内容", null);
                     continue;
@@ -173,6 +214,8 @@ public final class AiReviewPipeline {
                 // Continue with the next chunk: partial comments are strictly better than none, and
                 // the first failure is enough to tell the user something was degraded.
                 record(result, "第 " + (i + 1) + " 个分块评审失败", e);
+            } finally {
+                steps.finish();
             }
         }
         // Each chunk's parser numbers its own comments from c1, so two chunks can both return c1.
@@ -203,7 +246,7 @@ public final class AiReviewPipeline {
             }
         }
 
-        int droppedUnlocated = relocateAll(unlocated, located, diffs, files, result);
+        int droppedUnlocated = relocateAll(unlocated, located, diffs, files, budget, steps, result);
         result.stats.put("commentsDroppedUnlocated", droppedUnlocated);
 
         List<ReviewComment> kept;
@@ -220,7 +263,7 @@ public final class AiReviewPipeline {
             kept = new ArrayList<>(located);
         }
 
-        kept = reflect(kept, diffs, reflection, result);
+        kept = reflect(kept, diffs, reflection, budget, steps, result);
         kept.sort(commentOrder());
         int cap = maxComments <= 0 ? 10 : maxComments;
         if (kept.size() > cap) {
@@ -360,11 +403,15 @@ public final class AiReviewPipeline {
      * @return how many comments remain unplaced and must be discarded
      */
     private int relocateAll(List<ReviewComment> unlocated, List<ReviewComment> located,
-                            Map<String, ParsedDiff> diffs, FileContent files, Result result) {
-        int calls = 0;
+                            Map<String, ParsedDiff> diffs, FileContent files,
+                            AiBudget budget, Steps steps, Result result) {
+        // The paid calls are decided before the first one is made, so the progress line can say
+        // "i/n" without guessing and a comment whose file is absent never consumes one.
+        List<ReviewComment> queue = new ArrayList<>();
+        List<ParsedDiff> targets = new ArrayList<>();
         int dropped = 0;
         for (ReviewComment comment : unlocated) {
-            if (calls >= MAX_RELOCATION_CALLS) {
+            if (queue.size() >= MAX_RELOCATION_CALLS) {
                 dropped++;
                 continue;
             }
@@ -373,11 +420,29 @@ public final class AiReviewPipeline {
                 dropped++;
                 continue;
             }
+            queue.add(comment);
+            targets.add(diff);
+        }
+
+        int calls = 0;
+        for (int i = 0; i < queue.size(); i++) {
+            if (budget.expired()) {
+                // Re-location is the one phase that can be skipped whole: these comments are
+                // already unplaceable, so dropping them loses nothing that could have been posted.
+                markBudgetCut(result);
+                note(result, "AI 评审超出时间预算，" + (queue.size() - i) + " 条意见未重定位");
+                dropped += queue.size() - i;
+                break;
+            }
+            ReviewComment comment = queue.get(i);
+            ParsedDiff diff = targets.get(i);
             calls++;
+            steps.begin("AI 评审：重定位意见 " + (i + 1) + "/" + queue.size());
             try {
                 String prompt = prompts.relocationPrompt(comment, diff);
                 addEstimate(result, prompt);
-                String answer = client.complete(SYSTEM_PROMPT, prompt, RELOCATION_MAX_TOKENS);
+                String answer = client.complete(SYSTEM_PROMPT, prompt, RELOCATION_MAX_TOKENS,
+                        budget.remainingMillis());
                 String snippet = ReviewPromptBuilder.extractFencedCode(answer);
                 if (snippet == null || snippet.isBlank()) {
                     dropped++;
@@ -399,6 +464,8 @@ public final class AiReviewPipeline {
             } catch (Exception e) {
                 record(result, "评论重定位失败", e);
                 dropped++;
+            } finally {
+                steps.finish();
             }
         }
         result.stats.put("relocationCalls", calls);
@@ -413,10 +480,25 @@ public final class AiReviewPipeline {
      * that a comment is wrong.
      */
     private List<ReviewComment> reflect(List<ReviewComment> kept, Map<String, ParsedDiff> diffs,
-                                        boolean reflection, Result result) {
-        if (!reflection || kept.isEmpty()) {
+                                        boolean reflection, AiBudget budget, Steps steps,
+                                        Result result) {
+        if (!reflection) {
             return kept;
         }
+        if (kept.isEmpty()) {
+            // The denominator counted this pass up front; nothing survived to reflect on, so the
+            // call is given back. Handing work back only ever grows the fraction.
+            steps.dropPlannedCall();
+            return kept;
+        }
+        if (budget.expired()) {
+            // Reflection can only remove comments, so skipping it costs precision and never a
+            // finding - the opposite of what a timeout should do.
+            markBudgetCut(result);
+            note(result, "AI 评审超出时间预算，跳过反思，保留全部评论");
+            return kept;
+        }
+        steps.begin("AI 评审：反思意见");
         try {
             // Severity first, then fit the prompt to the budget. Partial reflection is safe (an
             // unreflected comment stays); an over-long prompt is not (the provider truncates it,
@@ -432,7 +514,8 @@ public final class AiReviewPipeline {
                 note(result, "反思输入超 token 预算，仅复核前 " + toReflect.size() + " 条");
             }
             addEstimate(result, prompt);
-            String answer = client.complete(SYSTEM_PROMPT, prompt, REFLECTION_MAX_TOKENS);
+            String answer = client.complete(SYSTEM_PROMPT, prompt, REFLECTION_MAX_TOKENS,
+                    budget.remainingMillis());
             if (answer == null || answer.isBlank()) {
                 record(result, "反思模型返回空内容，保留全部评论", null);
                 return kept;
@@ -460,6 +543,8 @@ public final class AiReviewPipeline {
             // silently lost findings.
             record(result, "反思步骤失败，保留全部评论", e);
             return kept;
+        } finally {
+            steps.finish();
         }
     }
 
@@ -626,12 +711,26 @@ public final class AiReviewPipeline {
         result.stats.put("relocationCalls", 0);
         result.stats.put("reflectionRan", false);
         result.stats.put("estimatedTokens", 0);
+        // Both budget keys are always present so the JSON shape of a report does not depend on
+        // whether the section happened to run out of time; budgetSeconds is filled in by review().
+        result.stats.put("budgetSeconds", 0);
+        result.stats.put("budgetExpired", false);
         result.stats.put("notes", new ArrayList<String>());
     }
 
     @SuppressWarnings("unchecked")
     private static void note(Result result, String message) {
         ((List<String>) result.stats.get("notes")).add(message);
+    }
+
+    /**
+     * Marks the comment pass as cut short by the section budget.
+     *
+     * Called at the three points where a model call is actually skipped, so the flag means "the
+     * list is shorter than the run asked for" rather than "the clock ran out at some point".
+     */
+    private static void markBudgetCut(Result result) {
+        result.stats.put("budgetExpired", true);
     }
 
     private static void record(Result result, String context, Throwable error) {
@@ -660,5 +759,51 @@ public final class AiReviewPipeline {
             total += value;
         }
         return total;
+    }
+
+    /**
+     * Turns "how many model calls are done" into one progress line per call.
+     *
+     * <p>The fraction is of this section's own calls, not of the analysis: only the caller knows
+     * that the AI review is the last few percent of a run, and keeping the mapping there is what
+     * lets both sides change independently.
+     *
+     * <p>The denominator is fixed before the first line and may only shrink afterwards. A fraction
+     * shown while more work is discovered would jump backwards, and someone watching a bar that
+     * retreats concludes the run restarted.
+     */
+    private static final class Steps {
+
+        private final AiProgress progress;
+        private int planned;
+        private int done;
+        private double last;
+
+        Steps(AiProgress progress, int planned) {
+            this.progress = progress;
+            this.planned = planned;
+        }
+
+        /** Gives back a call that was counted but will not happen. */
+        void dropPlannedCall() {
+            planned = Math.max(1, planned - 1);
+        }
+
+        /** Announces the call that is about to be made, so a slow call still moves the line. */
+        void begin(String detail) {
+            double fraction = planned <= 0 ? 0d : Math.min(1d, (double) done / planned);
+            fraction = Math.max(last, fraction);
+            last = fraction;
+            try {
+                progress.update(detail, fraction);
+            } catch (RuntimeException e) {
+                // A broken listener is not a reason to lose the review it was watching.
+            }
+        }
+
+        /** Counts the call that just returned, whatever its outcome. */
+        void finish() {
+            done++;
+        }
     }
 }

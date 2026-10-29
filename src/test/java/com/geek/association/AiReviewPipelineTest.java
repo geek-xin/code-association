@@ -1,6 +1,8 @@
 package com.geek.association;
 
 import com.geek.association.report.ImpactReport;
+import com.geek.association.review.AiBudget;
+import com.geek.association.review.AiProgress;
 import com.geek.association.review.AiReviewPipeline;
 import com.geek.association.review.FileContent;
 import com.geek.association.review.ModelClient;
@@ -184,13 +186,14 @@ class AiReviewPipelineTest {
         assertEquals(Set.of("filesReviewed", "filesSkipped", "commentsGenerated", "commentsKept",
                         "commentsDroppedUnlocated", "commentsDroppedFiltered",
                         "commentsDroppedReflection", "commentsMerged", "relocationCalls",
-                        "reflectionRan", "estimatedTokens", "notes"),
+                        "reflectionRan", "estimatedTokens", "notes",
+                        "budgetSeconds", "budgetExpired"),
                 result.stats.keySet());
         for (Map.Entry<String, Object> entry : result.stats.entrySet()) {
             String key = entry.getKey();
             if ("notes".equals(key)) {
                 assertTrue(entry.getValue() instanceof List<?>, key);
-            } else if ("reflectionRan".equals(key)) {
+            } else if ("reflectionRan".equals(key) || "budgetExpired".equals(key)) {
                 assertTrue(entry.getValue() instanceof Boolean, key);
             } else {
                 assertTrue(entry.getValue() instanceof Integer, key + " must be an int");
@@ -212,6 +215,85 @@ class AiReviewPipelineTest {
         assertEquals(2, result.comments.size());
         assertEquals("c2", result.comments.get(0).id);
         assertEquals("c3", result.comments.get(1).id);
+    }
+
+    @Test
+    void expiredBudgetSkipsRemainingCalls() throws Exception {
+        FakeClient client = new FakeClient(comments());
+        AiBudget budget = AiBudget.ofSeconds(1);
+        Thread.sleep(1100);
+
+        AiReviewPipeline.Result result = new AiReviewPipeline(client)
+                .review(report(Map.of("a.java", diff("a.java", "int x = 1;"))),
+                        FileContent.NONE, 15, 10, false, budget, AiProgress.none());
+
+        assertTrue(client.prompts.isEmpty(), "a spent budget must not start a model call");
+        assertTrue(result.comments.isEmpty());
+        assertNotNull(result.error);
+        assertTrue(result.error.contains("时间预算"), result.error);
+        assertEquals(true, result.stats.get("budgetExpired"));
+    }
+
+    @Test
+    void progressIsMonotonicAndReportsChunks() {
+        LinkedHashMap<String, String> diffs = new LinkedHashMap<>();
+        for (int i = 1; i <= 7; i++) {
+            diffs.put("f" + i + ".java", diff("f" + i + ".java", "int value" + i + " = " + i + ";"));
+        }
+        FakeClient client = new FakeClient(comments(), comments());
+        List<String> details = new ArrayList<>();
+        List<Double> fractions = new ArrayList<>();
+        AiProgress progress = (detail, fraction) -> {
+            details.add(detail);
+            fractions.add(fraction);
+        };
+
+        new AiReviewPipeline(client).review(report(diffs), FileContent.NONE, 15, 10, false,
+                AiBudget.ofSeconds(30), progress);
+
+        assertTrue(details.contains("AI 评审：分块 1/2"), details.toString());
+        assertTrue(details.contains("AI 评审：分块 2/2"), details.toString());
+        assertEquals(2, client.prompts.size());
+        assertFalse(fractions.isEmpty());
+        double previous = -1;
+        for (double fraction : fractions) {
+            assertTrue(fraction >= 0d && fraction <= 1d, "fraction out of range: " + fraction);
+            assertTrue(fraction >= previous, "the bar went backwards: " + fractions);
+            previous = fraction;
+        }
+    }
+
+    @Test
+    void remainingBudgetIsPassedToTheClient() {
+        FakeClient client = new FakeClient(comments());
+        int budgetSeconds = 30;
+
+        new AiReviewPipeline(client).review(report(Map.of("a.java", diff("a.java", "int x = 1;"))),
+                FileContent.NONE, 15, 10, false, AiBudget.ofSeconds(budgetSeconds), AiProgress.none());
+
+        assertFalse(client.timeouts.isEmpty(), "every model call must be told its deadline");
+        for (long timeout : client.timeouts) {
+            assertTrue(timeout > 0, "a started call still needs a positive timeout: " + timeout);
+            assertTrue(timeout <= budgetSeconds * 1000L,
+                    "the timeout must not outlive the section budget: " + timeout);
+        }
+    }
+
+    @Test
+    void budgetSpentAfterTheLastCallIsNotATruncation() throws Exception {
+        // The only call returns after the deadline: nothing was skipped, so the report must not tell
+        // the reviewer the comment list is incomplete. The flag means "short", not "late".
+        ModelClient slow = (systemPrompt, prompt, maxTokens) -> {
+            Thread.sleep(1200);
+            return comments(comment("c1", "MAJOR", "a.java", "int x = 1;"));
+        };
+
+        AiReviewPipeline.Result result = new AiReviewPipeline(slow)
+                .review(report(Map.of("a.java", diff("a.java", "int x = 1;"))),
+                        FileContent.NONE, 15, 10, false, AiBudget.ofSeconds(1), AiProgress.none());
+
+        assertEquals(1, result.comments.size(), "a call that finished late still produced its comment");
+        assertEquals(false, result.stats.get("budgetExpired"), "no call was skipped, so the list is complete");
     }
 
     // ------------------------------------------------------------------ fixtures
@@ -296,6 +378,8 @@ class AiReviewPipelineTest {
     private static final class FakeClient implements ModelClient {
         private final Deque<Object> responses = new ArrayDeque<>();
         final List<String> prompts = new ArrayList<>();
+        /** The deadline each call was given: the pipeline must never spend more than its budget. */
+        final List<Long> timeouts = new ArrayList<>();
 
         FakeClient(Object... responses) {
             for (Object response : responses) {
@@ -305,7 +389,14 @@ class AiReviewPipelineTest {
 
         @Override
         public String complete(String systemPrompt, String prompt, Integer maxTokens) throws Exception {
+            return complete(systemPrompt, prompt, maxTokens, Long.MAX_VALUE);
+        }
+
+        @Override
+        public String complete(String systemPrompt, String prompt, Integer maxTokens, long timeoutMillis)
+                throws Exception {
             prompts.add(prompt);
+            timeouts.add(timeoutMillis);
             Object response = responses.poll();
             if (response == null) {
                 throw new IllegalStateException("unexpected model call " + prompts.size());

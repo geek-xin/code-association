@@ -5,8 +5,11 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.geek.association.config.AppProperties;
 import com.geek.association.model.ImpactResult;
+import com.geek.association.review.AiBudget;
+import com.geek.association.review.AiProgress;
 import com.geek.association.review.AiReviewPipeline;
 import com.geek.association.review.FileContent;
+import com.geek.association.review.ModelClient;
 import com.geek.association.review.ReviewComment;
 import com.geek.association.util.Json;
 import com.geek.association.util.LogEvents;
@@ -26,6 +29,10 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 /**
  * Optional, evidence-constrained explanation layer.
@@ -57,19 +64,17 @@ public class AiExplainer {
     private static final int TEST_MAX_TOKENS = 8;
 
     private final AppProperties properties;
+
     /**
-     * The comment pipeline is created once and reads the live settings on every call, so a settings
-     * save takes effect without rebuilding any bean.
+     * One client for the whole process: a report makes up to fourteen calls, and every
+     * {@code HttpClient.newBuilder().build()} leaves a selector thread and an executor behind for
+     * the lifetime of the JVM. Reusing it also keeps the connection warm between the calls of one
+     * analysis.
      */
-    private final AiReviewPipeline reviewPipeline;
+    private volatile HttpClient httpClient;
 
     public AiExplainer(AppProperties properties) {
         this.properties = properties;
-        this.reviewPipeline = new AiReviewPipeline((systemPrompt, prompt, maxTokens) -> {
-            AppProperties.Ai current = properties.getAi();
-            return call(prompt, current.getTimeoutSeconds(), systemPrompt,
-                    current.getBaseUrl(), current.getModel(), current.getApiKey(), maxTokens);
-        });
     }
 
     /**
@@ -108,7 +113,7 @@ public class AiExplainer {
      * @param maxImpacts how many impact rows may be sent; the prompt is the cost of the call
      */
     public Map<String, Object> explain(ImpactReport report, int maxImpacts) {
-        return explain(report, maxImpacts, FileContent.NONE);
+        return explain(report, maxImpacts, FileContent.NONE, AiProgress.none());
     }
 
     /**
@@ -120,13 +125,29 @@ public class AiExplainer {
      * full-file layer rather than pretending it ran.
      */
     public Map<String, Object> explain(ImpactReport report, int maxImpacts, FileContent files) {
+        return explain(report, maxImpacts, files, AiProgress.none());
+    }
+
+    /**
+     * The same call, reporting how much of the AI section is done.
+     *
+     * <p>One budget covers the summary and every comment call. A per-request timeout bounds one
+     * exchange, not the section: fourteen sequential timeouts used to leave the progress bar on one
+     * number for a quarter of an hour, which reads as a hung run. The budget is also the only
+     * reliable stop for a stalled body (see {@link AiBudget}).
+     */
+    public Map<String, Object> explain(ImpactReport report, int maxImpacts, FileContent files,
+                                       AiProgress progress) {
         if (!ready()) {
             return null;
         }
         AppProperties.Ai ai = properties.getAi();
+        AiProgress callback = progress == null ? AiProgress.none() : progress;
+        AiBudget budget = AiBudget.ofSeconds(ai.resolvedTotalBudgetSeconds());
         try {
+            callback.update("AI 评审：生成评审要点", 0.02);
             String prompt = buildPrompt(report, maxImpacts);
-            String answer = call(prompt, ai.getTimeoutSeconds(), SYSTEM_PROMPT);
+            String answer = call(prompt, ai.getTimeoutSeconds(), SYSTEM_PROMPT, budget, null);
             if (Texts.isBlank(answer)) {
                 return failure("模型返回了空内容");
             }
@@ -139,11 +160,27 @@ public class AiExplainer {
             // a补生成 hours later must not inherit the analysis time.
             out.put("generatedAt", Instant.now().toString());
             out.put("maxImpacts", maxImpacts);
-            appendComments(out, report, files, maxImpacts);
+            appendComments(out, report, files, maxImpacts, budget, callback);
+            // Outside appendComments on purpose: with the comment layer off that method returns
+            // before its own closing line, and the panel would then sit on "生成评审要点" (96%)
+            // until the report is stored - the very picture this change is meant to remove.
+            callback.update("AI 评审：整理意见", 1.0);
             return out;
         } catch (Exception e) {
-            log.warn("AI review failed: {}", describeFailure(e, ai.getTimeoutSeconds(), ai));
-            return failure(describeFailure(e, ai.getTimeoutSeconds(), ai));
+            // "Out of budget" is the more precise explanation whenever the section stopped because
+            // the clock ran out, even if the last exception was a timeout or a broken pipe.
+            String message = budget.expired()
+                    ? budget.expiryReason()
+                    : describeFailure(e, ai.getTimeoutSeconds(), ai);
+            if (budget.expired()) {
+                log.warn(LogEvents.of("ai.review",
+                        "budgetSeconds", budget.seconds(),
+                        "expired", true,
+                        "reason", budget.expiryReason()));
+            } else {
+                log.warn("AI review failed: {}", message);
+            }
+            return failure(message);
         }
     }
 
@@ -155,23 +192,56 @@ public class AiExplainer {
      * leave the report with a usable AI section instead of turning it into a failure.
      */
     private void appendComments(Map<String, Object> out, ImpactReport report, FileContent files,
-                                int maxImpacts) {
+                                int maxImpacts, AiBudget budget, AiProgress progress) {
         AppProperties.Ai ai = properties.getAi();
         if (!ai.isComments()) {
             return;
         }
+        progress.update("AI 评审：逐条评审意见", 0.15);
         long started = System.currentTimeMillis();
         try {
-            AiReviewPipeline.Result result = reviewPipeline.review(report, files, maxImpacts,
-                    ai.getMaxComments(), ai.isReflection());
+            ModelClient client = new ModelClient() {
+                @Override
+                public String complete(String systemPrompt, String prompt, Integer maxTokens)
+                        throws Exception {
+                    return complete(systemPrompt, prompt, maxTokens, Long.MAX_VALUE);
+                }
+
+                @Override
+                public String complete(String systemPrompt, String prompt, Integer maxTokens,
+                                       long timeoutMillis) throws Exception {
+                    AppProperties.Ai current = properties.getAi();
+                    // Two independent cuts: the configured per-call limit, and what the section
+                    // budget has left. The pipeline passes its own remaining slice so a nearly
+                    // spent budget cannot buy a full-timeout request.
+                    long byConfig = budget.callTimeoutSeconds(current.getTimeoutSeconds()) * 1000L;
+                    return call(prompt, systemPrompt, current.getBaseUrl(), current.getModel(),
+                            current.getApiKey(), maxTokens, Math.min(byConfig, timeoutMillis), budget);
+                }
+            };
+            // Built per review rather than once in the constructor: the client now closes over this
+            // run's budget, and a settings save is read on every call anyway.
+            AiReviewPipeline.Result result = new AiReviewPipeline(client).review(report, files,
+                    maxImpacts, ai.getMaxComments(), ai.isReflection(), budget,
+                    // The first 15% of the section belongs to the summary, so the pipeline's own
+                    // 0..1 fills the rest without either side hard-coding the other's weights.
+                    (detail, fraction) -> progress.update(detail, 0.15 + 0.85 * clamp01(fraction)));
             List<Map<String, Object>> comments = new ArrayList<>();
             for (ReviewComment comment : result.comments) {
                 comments.add(comment.view());
             }
             out.put("comments", comments);
             out.put("reviewStats", result.stats);
-            if (result.error != null) {
-                out.put("reviewError", Texts.truncate(result.error, 300));
+            // Both halves matter: the first concrete failure is what the user can act on ("the model
+            // timed out"), and the budget sentence is why the rest never ran. Reporting only the
+            // first one made an end-to-end test produce "5 秒超时" for a section that had in fact
+            // been cut short by its budget.
+            String failure = commentFailureText(result.error,
+                    budgetTruncated(Boolean.TRUE.equals(result.stats.get("budgetExpired")),
+                            budget.expired(), result.error),
+                    budget);
+            if (!failure.isBlank()) {
+                out.put("reviewError", Texts.truncate(failure, 300));
             }
             log.info(LogEvents.of("ai.review",
                     "comments", comments.size(),
@@ -180,7 +250,17 @@ public class AiExplainer {
                     "filtered", result.stats.get("commentsDroppedFiltered"),
                     "reflected", result.stats.get("commentsDroppedReflection"),
                     "durationMs", LogEvents.msSince(started),
+                    "budgetSeconds", budget.seconds(),
+                    "expired", budget.expired(),
                     "error", result.error));
+            if (budget.expired()) {
+                log.warn(LogEvents.of("ai.review",
+                        "budgetSeconds", budget.seconds(),
+                        "expired", true,
+                        "reason", budget.expiryReason(),
+                        "comments", comments.size(),
+                        "durationMs", LogEvents.msSince(started)));
+            }
         } catch (RuntimeException e) {
             // Comments are the new layer; their bug must not take the summary down with them.
             out.put("comments", List.of());
@@ -189,6 +269,48 @@ public class AiExplainer {
             out.put("reviewStats", stats);
             log.warn("AI review comments failed: {}", e.toString());
         }
+    }
+
+    /**
+     * Whether the comment list is short because of the section budget.
+     *
+     * <p>Two shapes, and the pipeline can only see the first: a call that was skipped for lack of
+     * time ({@code budgetExpired}), and a last call whose own timeout had been shortened by the
+     * budget and then failed. The second skips nothing - there is no further chunk to skip - yet the
+     * budget is exactly why its comments never arrived. An end-to-end run produced precisely that:
+     * a report blaming a five-second timeout for a section whose real limit was the eight-second
+     * budget.
+     */
+    static boolean budgetTruncated(boolean skippedForTime, boolean sectionOutOfTime, String firstError) {
+        return skippedForTime
+                || (sectionOutOfTime && firstError != null && !firstError.isBlank());
+    }
+
+    /**
+     * The one line the card shows for a comment pass that did not run to completion.
+     *
+     * The first concrete failure and the budget cut are two different facts; a pass that timed out
+     * on chunk 1 and was then stopped by the budget has to say both, or the reader concludes the
+     * endpoint was just slow. The first message is truncated first, so the budget sentence - the one
+     * that explains the missing comments - always survives the 300-character limit.
+     *
+     * @return "" when nothing went wrong
+     */
+    static String commentFailureText(String firstError, boolean budgetCut, AiBudget budget) {
+        boolean hasFirst = firstError != null && !firstError.isBlank();
+        if (!budgetCut) {
+            return hasFirst ? firstError : "";
+        }
+        String budgetText = budget.expiryReason();
+        return hasFirst ? Texts.truncate(firstError, 200) + "；" + budgetText : budgetText;
+    }
+
+    /** Keeps a misbehaving pipeline callback from pushing the mapped fraction outside 0..1. */
+    private static double clamp01(double fraction) {
+        if (fraction < 0) {
+            return 0;
+        }
+        return Math.min(fraction, 1);
     }
 
     /**
@@ -233,7 +355,7 @@ public class AiExplainer {
         long started = System.currentTimeMillis();
         try {
             String answer = call(TEST_USER_PROMPT, timeoutSeconds, TEST_SYSTEM_PROMPT,
-                    url, usedModel, key, TEST_MAX_TOKENS);
+                    url, usedModel, key, TEST_MAX_TOKENS, AiBudget.unbounded());
             out.put("latencyMs", (int) (System.currentTimeMillis() - started));
             out.put("sample", Texts.truncate(Texts.oneLine(answer), 80));
             out.put("ok", true);
@@ -306,7 +428,12 @@ public class AiExplainer {
                                    String attemptedBaseUrl) {
         String message;
         if (e instanceof HttpTimeoutException) {
-            message = "连接超时（" + timeoutSeconds + " 秒），请检查接口地址与网络";
+            // The watchdog names the limit it actually applied; the budget can shorten it, so the
+            // configured number would be wrong. A JDK connect timeout carries no such sentence.
+            String detail = e.getMessage();
+            message = detail != null && detail.startsWith("模型调用超时")
+                    ? detail
+                    : "连接超时（" + timeoutSeconds + " 秒），请检查接口地址与网络";
         } else if (e instanceof java.net.ConnectException) {
             // The JDK's message for a refused connection is usually null, so the address that was
             // tried is the only useful thing to report: "connection refused" without a host leaves
@@ -408,10 +535,11 @@ public class AiExplainer {
     }
 
     /** The configured call: the path every real explanation takes. */
-    private String call(String prompt, int timeoutSeconds, String systemPrompt) throws Exception {
+    private String call(String prompt, int timeoutSeconds, String systemPrompt, AiBudget budget,
+                        Integer maxTokens) throws Exception {
         AppProperties.Ai ai = properties.getAi();
         return call(prompt, timeoutSeconds, systemPrompt,
-                ai.getBaseUrl(), ai.getModel(), ai.getApiKey(), null);
+                ai.getBaseUrl(), ai.getModel(), ai.getApiKey(), maxTokens, budget);
     }
 
     /**
@@ -422,7 +550,15 @@ public class AiExplainer {
      * green test cannot be followed by a red generation for a reason the test never exercised.
      */
     private String call(String prompt, int timeoutSeconds, String systemPrompt,
-                        String baseUrl, String model, String apiKey, Integer maxTokens) throws Exception {
+                        String baseUrl, String model, String apiKey, Integer maxTokens, AiBudget budget)
+            throws Exception {
+        return call(prompt, systemPrompt, baseUrl, model, apiKey, maxTokens,
+                budget.callTimeoutSeconds(timeoutSeconds) * 1000L, budget);
+    }
+
+    private String call(String prompt, String systemPrompt, String baseUrl, String model,
+                        String apiKey, Integer maxTokens, long timeoutMillis, AiBudget budget)
+            throws Exception {
         ObjectNode body = Json.mapper().createObjectNode();
         body.put("model", model);
         body.put("temperature", 0.2);
@@ -437,18 +573,54 @@ public class AiExplainer {
         user.put("role", "user");
         user.put("content", prompt);
 
-        int timeout = timeoutSeconds <= 0 ? 60 : timeoutSeconds;
+        // A zero/negative slice means "no time left"; one second is the smallest honest attempt,
+        // matching AiBudget.callTimeoutSeconds so a call started at the very end still fails as a
+        // timeout instead of being refused client-side.
+        long timeout = timeoutMillis <= 0 ? 1_000L : timeoutMillis;
+        long timeoutSeconds = Math.max(1, (timeout + 999) / 1000);
         HttpRequest.Builder builder = HttpRequest.newBuilder(URI.create(chatEndpoint(baseUrl)))
-                .timeout(Duration.ofSeconds(timeout))
+                // One second later than the watchdog on purpose: the watchdog is what must fire, so
+                // the message can name the section budget. This request-level limit is only the
+                // backstop for a cancellation that did not take effect.
+                .timeout(Duration.ofMillis(timeout + 1_000L))
                 .header("Content-Type", "application/json")
                 .POST(HttpRequest.BodyPublishers.ofString(Json.write(body)));
         if (!Texts.isBlank(apiKey)) {
             builder.header("Authorization", "Bearer " + apiKey);
         }
-        HttpClient client = HttpClient.newBuilder()
-                .connectTimeout(Duration.ofSeconds(Math.min(timeout, 15)))
-                .build();
-        HttpResponse<String> response = client.send(builder.build(), HttpResponse.BodyHandlers.ofString());
+        // HttpRequest.timeout covers the response headers, not the body: a server that sends the
+        // headers and then stops writing keeps send() blocked past it (measured on JDK 21). The
+        // wait below therefore bounds the whole exchange, which is what the section budget needs.
+        //
+        // Decided before sending: the budget is the binding limit when the slice handed to this
+        // request is (almost) all that is left. That is what tells a budget-cut call apart from a
+        // slow provider by the time the watchdog fires.
+        boolean budgetBound = !budget.unlimited()
+                && budget.remainingMillis() <= timeout + 1_000L;
+        CompletableFuture<HttpResponse<String>> future =
+                httpClient().sendAsync(builder.build(), HttpResponse.BodyHandlers.ofString());
+        HttpResponse<String> response;
+        try {
+            response = future.get(timeout, TimeUnit.MILLISECONDS);
+        } catch (TimeoutException e) {
+            future.cancel(true);
+            throw new HttpTimeoutException(timeoutMessage(timeoutSeconds, budgetBound || budget.expired()));
+        } catch (InterruptedException e) {
+            future.cancel(true);
+            Thread.currentThread().interrupt();
+            throw e;
+        } catch (ExecutionException e) {
+            // Unwrap so the failure text keeps saying ConnectException / IOException / HTTP xxx
+            // instead of "ExecutionException", which tells the user nothing actionable.
+            Throwable cause = e.getCause();
+            if (cause instanceof Exception exception) {
+                throw exception;
+            }
+            if (cause instanceof Error error) {
+                throw error;
+            }
+            throw new java.io.IOException(cause == null ? e.toString() : cause.toString(), cause);
+        }
         if (response.statusCode() >= 300) {
             throw new IllegalStateException("HTTP " + response.statusCode() + ": "
                     + Texts.oneLine(Texts.truncate(response.body(), 300)));
@@ -464,6 +636,40 @@ public class AiExplainer {
             throw new ModelResponseException(Texts.oneLine(Texts.truncate(response.body(), 200)));
         }
         return choices.get(0).path("message").path("content").asText(null);
+    }
+
+    /**
+     * Lazily built and then reused: building one client per call is the documented way to leak
+     * selector and executor threads, and one analysis makes up to fourteen calls.
+     */
+    private HttpClient httpClient() {
+        HttpClient client = httpClient;
+        if (client == null) {
+            synchronized (this) {
+                client = httpClient;
+                if (client == null) {
+                    client = HttpClient.newBuilder()
+                            .connectTimeout(Duration.ofSeconds(15))
+                            .build();
+                    httpClient = client;
+                }
+            }
+        }
+        return client;
+    }
+
+    /**
+     * The sentence for a watchdog timeout.
+     *
+     * Naming the budget when the budget is what bound the call makes the comment pipeline's error
+     * line say why the review is short, instead of leaving the user to guess between a slow
+     * provider and a section that ran out of time.
+     */
+    private static String timeoutMessage(long timeoutSeconds, boolean budgetBound) {
+        if (budgetBound) {
+            return "模型调用超时（" + timeoutSeconds + " 秒，AI 评审时间预算已用尽），请检查接口地址、网络或模型响应速度";
+        }
+        return "模型调用超时（" + timeoutSeconds + " 秒），请检查接口地址、网络或模型响应速度";
     }
 
     /**

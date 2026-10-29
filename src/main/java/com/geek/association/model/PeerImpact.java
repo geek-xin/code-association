@@ -16,6 +16,14 @@ public class PeerImpact {
     public String peerSourceName;
     public String peerType;
     public String peerLocation;
+    /**
+     * Commit this program was indexed at, so the review screen can show the exact source lines
+     * behind a contract hit instead of whatever the working tree contains today.
+     *
+     * <p>Empty for a plain directory, which has no revision: those reads come from the directory
+     * itself, exactly like the index did.</p>
+     */
+    public String peerCommit;
     /** Set when the peer could not be indexed; the reason is shown instead of results. */
     public String note;
     public List<ContractMatch> matches = new ArrayList<>();

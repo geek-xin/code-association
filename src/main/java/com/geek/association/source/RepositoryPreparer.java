@@ -866,6 +866,33 @@ public class RepositoryPreparer {
     }
 
     /**
+     * The directory a source is read from: the configured local path, or the clone cache for a
+     * remote repository.
+     *
+     * <p>The evidence excerpt endpoint must not invent its own root. The clone directory name is
+     * derived here (id + name + URL hash); duplicating that rule elsewhere would let the two drift
+     * and turn a readable file into "not found".</p>
+     */
+    public Path sourceDirectory(RepoSource source) throws IOException {
+        String type = source.type == null ? "LOCAL_DIR" : source.type.toUpperCase();
+        if (isRemote(type)) {
+            Path cache = properties.dataPath().resolve("repos").resolve(slug(source));
+            if (!Files.isDirectory(cache)) {
+                throw new IOException("这个程序的仓库还没有克隆到本地，先运行一次分析");
+            }
+            return cache.toAbsolutePath().normalize();
+        }
+        if (source.location == null || source.location.isBlank()) {
+            throw new IOException("这个代码源没有配置位置");
+        }
+        Path root = Path.of(source.location).toAbsolutePath().normalize();
+        if (!Files.isDirectory(root)) {
+            throw new IOException("代码源目录不存在：" + root);
+        }
+        return root;
+    }
+
+    /**
      * Stable, collision free cache directory per remote repository.
      *
      * The id alone is not enough (a CLI run has no id yet) and the name alone is not enough

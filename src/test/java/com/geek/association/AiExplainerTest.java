@@ -3,6 +3,8 @@ package com.geek.association;
 import com.geek.association.config.AppProperties;
 import com.geek.association.report.AiExplainer;
 import com.geek.association.report.ImpactReport;
+import com.geek.association.review.AiProgress;
+import com.geek.association.review.FileContent;
 import com.geek.association.util.Json;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
@@ -11,6 +13,7 @@ import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
@@ -122,6 +125,64 @@ class AiExplainerTest {
         spot.reason = "动态调用无法静态解析";
         report.blindSpots.add(spot);
         return report;
+    }
+
+    /** Same report plus a reviewable hunk, so the comment phase actually reaches the model. */
+    private static ImpactReport reportWithDiff() {
+        ImpactReport report = sampleReport();
+        report.changes.get(0).file = "src/main/java/com/example/order/OrderController.java";
+        report.diffs.put(report.changes.get(0).file, """
+                --- a/src/main/java/com/example/order/OrderController.java
+                +++ b/src/main/java/com/example/order/OrderController.java
+                @@ -1,3 +1,4 @@
+                 class OrderController {
+                -    public int get(int id) {
+                +    public long get(int id) {
+                     return 1;
+                 }
+                """);
+        return report;
+    }
+
+    /** Properties for the new cases; timeoutSeconds is generous because the budget is the subject. */
+    private static AppProperties properties(String baseUrl, boolean comments) {
+        AppProperties properties = new AppProperties();
+        properties.getAi().setEnabled(true);
+        properties.getAi().setBaseUrl(baseUrl);
+        properties.getAi().setModel("m");
+        properties.getAi().setTimeoutSeconds(30);
+        properties.getAi().setComments(comments);
+        return properties;
+    }
+
+    private String endpoint() {
+        return "http://127.0.0.1:" + server.getAddress().getPort() + "/v1";
+    }
+
+    /**
+     * Sends response headers and a few body bytes, then keeps the exchange open without ever
+     * finishing the JSON. This is the shape that made analyses stick at 96%: the JDK request
+     * timeout covers the response headers, not the body, so the client waits forever.
+     *
+     * <p>The repeated writes double as a cancellation probe: once the client gives up the socket is
+     * closed and the next write throws, so the handler does not outlive the test by its sleep.
+     */
+    private static void stallRequestBody(HttpExchange exchange, String prefix) throws IOException {
+        exchange.getResponseHeaders().add("Content-Type", "application/json");
+        exchange.sendResponseHeaders(200, 0);
+        try (OutputStream body = exchange.getResponseBody()) {
+            body.write(prefix.getBytes(StandardCharsets.UTF_8));
+            body.flush();
+            for (int i = 0; i < 80; i++) {
+                Thread.sleep(100);
+                body.write(' ');
+                body.flush();
+            }
+        } catch (InterruptedException ignored) {
+            Thread.currentThread().interrupt();
+        } catch (IOException expected) {
+            // The client cancelled the exchange; that is the behaviour under test.
+        }
     }
 
     @Test
@@ -411,5 +472,115 @@ class AiExplainerTest {
 
         String testJson = Json.write(explainer.testConnection(baseUrl, "m", "sk-super-secret-000111"));
         assertFalse(testJson.contains("sk-super-secret-000111"), "the key leaked into the test result: " + testJson);
+    }
+
+    @Test
+    void stalledResponseBodyIsCutOffByTheSectionBudget() throws Exception {
+        // Regression for "分析卡在 96%": the server sends response headers and then stops writing the
+        // body. HttpRequest.timeout alone does not cover that on JDK 21, so before the section
+        // watchdog this call blocked until the process was killed.
+        server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/v1/chat/completions",
+                exchange -> stallRequestBody(exchange, "{\"choices\":["));
+        server.start();
+
+        AppProperties properties = properties(endpoint(), false);
+        properties.getAi().setTotalBudgetSeconds(2);
+
+        long started = System.nanoTime();
+        Map<String, Object> ai = new AiExplainer(properties)
+                .explain(sampleReport(), 12, FileContent.NONE, AiProgress.none());
+        long elapsedMs = (System.nanoTime() - started) / 1_000_000;
+
+        assertNotNull(ai);
+        assertEquals(false, ai.get("generated"));
+        assertTrue(ai.get("error").toString().contains("预算"),
+                "the section budget must be the stated reason: " + ai.get("error"));
+        assertTrue(elapsedMs < 10_000,
+                "a stalled body must be cut in seconds, took " + elapsedMs + "ms");
+    }
+
+    @Test
+    void budgetCutsCommentPhaseButKeepsSummary() throws Exception {
+        // The summary is the existing promise; the comment layer is the expensive extra. When the
+        // section budget runs out inside the comment calls the summary must survive, and the
+        // shortfall must be visible as reviewError rather than as a failed generation.
+        AtomicInteger calls = new AtomicInteger();
+        server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/v1/chat/completions", exchange -> {
+            if (calls.incrementAndGet() == 1) {
+                byte[] bytes = "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"1) 摘要\"}}]}"
+                        .getBytes(StandardCharsets.UTF_8);
+                exchange.getResponseHeaders().add("Content-Type", "application/json");
+                exchange.sendResponseHeaders(200, bytes.length);
+                try (OutputStream body = exchange.getResponseBody()) {
+                    body.write(bytes);
+                }
+                return;
+            }
+            stallRequestBody(exchange, "{\"choices\":[");
+        });
+        server.start();
+
+        AppProperties properties = properties(endpoint(), true);
+        properties.getAi().setTotalBudgetSeconds(3);
+
+        long started = System.nanoTime();
+        Map<String, Object> ai = new AiExplainer(properties)
+                .explain(reportWithDiff(), 12, FileContent.NONE, AiProgress.none());
+        long elapsedMs = (System.nanoTime() - started) / 1_000_000;
+
+        assertNotNull(ai);
+        assertEquals(true, ai.get("generated"), "the summary must survive: " + ai);
+        assertEquals("1) 摘要", ai.get("text"));
+        assertNotNull(ai.get("reviewError"), "the cut comment phase must say why: " + ai);
+        assertTrue(ai.get("reviewError").toString().contains("预算"),
+                "the budget must be named: " + ai.get("reviewError"));
+        assertTrue(elapsedMs < 6_000,
+                "the section must not spend a full per-call timeout, took " + elapsedMs + "ms");
+    }
+
+    @Test
+    void progressReportsSummaryAndCommentPhases() throws Exception {
+        // The AI section used to report nothing between "开始" and "完成". This pins the contract the
+        // analysis service maps to 96%..99%: at least two updates, 0..1 fractions, monotonic, and
+        // one shared prefix so the panel line reads as a single stage.
+        String baseUrl = startEndpoint(200,
+                "{\"choices\":[{\"message\":{\"content\":\"要点\"}}]}", null);
+        AppProperties properties = properties(baseUrl, true);
+        properties.getAi().setTimeoutSeconds(5);
+
+        List<String> details = new ArrayList<>();
+        List<Double> fractions = new ArrayList<>();
+        AiProgress recorder = (detail, fraction) -> {
+            details.add(detail);
+            fractions.add(fraction);
+        };
+
+        Map<String, Object> ai = new AiExplainer(properties)
+                .explain(sampleReport(), 12, FileContent.NONE, recorder);
+
+        assertNotNull(ai);
+        assertEquals(true, ai.get("generated"));
+        assertTrue(details.size() >= 2, "summary and comment phases must both report: " + details);
+        assertTrue(details.contains("AI 评审：生成评审要点"), "got: " + details);
+        assertTrue(details.contains("AI 评审：逐条评审意见"), "got: " + details);
+        assertEquals("AI 评审：整理意见", details.get(details.size() - 1),
+                "the section must end with the wrap-up line: " + details);
+        double previous = -1;
+        for (int i = 0; i < details.size(); i++) {
+            String detail = details.get(i);
+            double fraction = fractions.get(i);
+            assertTrue(detail.startsWith("AI 评审："), "the panel shows one prefix: " + detail);
+            assertTrue(fraction >= 0 && fraction <= 1, "fraction out of range: " + fraction);
+            assertTrue(fraction >= previous, "fractions must not go backwards: " + fractions);
+            previous = fraction;
+        }
+
+        // The three-argument form still works and is what the analysis service called before the
+        // progress-aware overload existed; the two-argument form is covered throughout this class.
+        Map<String, Object> threeArgs = new AiExplainer(properties)
+                .explain(sampleReport(), 12, FileContent.NONE);
+        assertEquals(true, threeArgs.get("generated"));
     }
 }

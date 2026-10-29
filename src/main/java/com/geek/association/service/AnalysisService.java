@@ -221,19 +221,25 @@ public class AnalysisService {
                 if (aiExplainer.ready()) {
                     progress.update("REPORT", 96, "生成报告", "正在生成 AI 评审说明");
                     // The AI section must never be able to fail the run: the facts are already
-                    // computed and stored by the time this is called, and explain() returns a
-                    // generated:false object rather than throwing. The catch is for the
-                    // belt-and-braces case (an OOM in prompt building) so a broken extra cannot
-                    // turn a good analysis into a FAILED row.
+                    // computed by the time this is called, and explain() returns a generated:false
+                    // object rather than throwing. The catch is for the belt-and-braces case (an
+                    // OOM in prompt building) so a broken extra cannot turn a good analysis into a
+                    // FAILED row. The section is bounded by its own wall-clock budget, because a
+                    // dead endpoint must delay this run by minutes, not until the process is killed.
                     long aiStart = System.currentTimeMillis();
                     try {
                         // The head snapshot is the only place the full new file exists; passing it
                         // enables the locator's second layer for this live run.
                         FileContent head = revisions.head == null ? FileContent.NONE : revisions.head::read;
-                        report.ai = aiExplainer.explain(report, properties.getAi().getMaxImpacts(), head);
+                        // The sink keeps the last three percent moving while the model works: the
+                        // AI section makes up to a dozen calls, and a single unchanging 96% for all
+                        // of them is indistinguishable from a hung run.
+                        report.ai = aiExplainer.explain(report, properties.getAi().getMaxImpacts(), head,
+                                (detail, fraction) -> progress.ai(detail, fraction));
                         log.info(LogEvents.of("analysis.ai",
                                 "analysisId", analysis.id,
                                 "generated", generatedOf(report.ai),
+                                "budgetSeconds", properties.getAi().resolvedTotalBudgetSeconds(),
                                 "durationMs", LogEvents.msSince(aiStart)));
                     } catch (RuntimeException e) {
                         log.warn(LogEvents.of("analysis.ai",
@@ -399,6 +405,36 @@ public class AnalysisService {
             update(next, percent, label, detail);
         }
 
+        /**
+         * Moves the AI stage along inside its last four percent.
+         *
+         * The AI section makes up to a dozen model calls and used to be one write of 96% followed by
+         * silence; that is the same picture as a hung run, and it is what users reported. Unlike the
+         * file-scanning stages this fires a handful of times per run, so the 150 ms throttle is
+         * deliberately bypassed - the detail line is the entire point, and dropping it would put the
+         * frozen text back on screen.
+         */
+        void ai(String detail, double fraction) {
+            // 96 is where the stage starts and 100 belongs to finishAnalysis alone, so the band is
+            // 96..99; a run that hits its AI budget still jumps straight to 100 when the report is
+            // stored.
+            int percent = aiPercent(fraction);
+            lastWriteAt = System.currentTimeMillis();
+            lastPercent = percent;
+            try {
+                store.updateProgress(analysisId, "REPORT", percent, "生成报告", detail, completed, skipped);
+            } catch (RuntimeException e) {
+                // The comment pipeline treats a throwing progress sink as "no progress", so without
+                // this line a failed write would show up only as a panel that stopped moving. The
+                // review itself must still continue: these are cosmetics next to the report.
+                log.warn(LogEvents.of("analysis.progress",
+                        "analysisId", analysisId,
+                        "stage", "REPORT",
+                        "percent", percent,
+                        "error", e.toString()));
+            }
+        }
+
         void update(String stage, int percent, String label, String detail) {
             long now = System.currentTimeMillis();
             // File callbacks can be thousands per second. Persist at most every 150 ms unless this
@@ -451,6 +487,9 @@ public class AnalysisService {
                 peerRequest.source = peerSource;
                 peerRequest.mode = "WORKTREE";
                 RevisionPair peerRevisions = preparer.prepare(peerRequest);
+                // Kept on the peer entry so later evidence requests read the same revision that was
+                // indexed, not a clone that has been fetched again since.
+                peerInfo.peerCommit = peerRevisions.headCommit;
                 CodeIndex peerIndex = new CodeIndexer(properties.getMaxFiles())
                         .index(peerRevisions.head, peerRevisions.head.label(), peerRevisions.headCommit);
                 peerInfo.skippedFiles = peerRevisions.head.skippedFiles();
@@ -507,6 +546,23 @@ public class AnalysisService {
             return "本次没有检测到变更，无需比较其他程序";
         }
         return null;
+    }
+
+    /**
+     * The percentage shown while the AI section runs: 96..99, never 100.
+     *
+     * Separated from the write so the band is testable without a live model call. 100 stays reserved
+     * for {@code finishAnalysis}, which is the only place that knows the report was actually stored -
+     * a progress bar that reaches 100 before the report exists is the "stuck at the end" picture in
+     * reverse.
+     */
+    static int aiPercent(double fraction) {
+        // NaN would survive Math.min/Math.max untouched; the stage start is the only sane answer.
+        if (Double.isNaN(fraction)) {
+            return 96;
+        }
+        double clamped = Math.max(0, Math.min(1, fraction));
+        return Math.max(96, Math.min(99, 96 + (int) Math.round(3 * clamped)));
     }
 
     /** Short SHA for log lines: 8 characters is what git and the UI already show. */

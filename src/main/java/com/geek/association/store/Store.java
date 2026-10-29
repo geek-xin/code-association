@@ -3,6 +3,7 @@ package com.geek.association.store;
 import com.geek.association.config.AppProperties;
 import com.geek.association.model.Analysis;
 import com.geek.association.model.RepoSource;
+import com.geek.association.source.SourceNames;
 import com.geek.association.util.Json;
 import com.geek.association.util.LogEvents;
 import org.slf4j.Logger;
@@ -147,6 +148,52 @@ public class Store {
             st.executeUpdate("CREATE INDEX IF NOT EXISTS idx_analysis_source_id ON analysis(source_id, id)");
             log.info(LogEvents.of("store.init",
                     "migration", "create index idx_analysis_source_id"));
+        }
+
+        // Remote sources are named after the program now instead of owner/repo. Only rows that
+        // still equal the old derivation are rewritten, so this can run on every start and never
+        // touches a name the user set on purpose.
+        simplifyLegacyRemoteNames(st);
+    }
+
+    /**
+     * One-time data fixup for the 0.9.1 naming change, safe to repeat.
+     *
+     * The old value is recomputed from the row's own location rather than guessed from a slash in
+     * the name: a hand-picked name that happens to contain a slash ("team-a/fork") is not the old
+     * derivation, and must survive the migration. Rewritten rows get a {@code store.init} line, so
+     * the next "why did my source change name" question has an answer in the log.
+     */
+    private void simplifyLegacyRemoteNames(Statement st) throws SQLException {
+        List<RepoSource> remote = new ArrayList<>();
+        try (ResultSet rs = st.executeQuery("SELECT id, name, type, location FROM repo_source")) {
+            while (rs.next()) {
+                RepoSource row = new RepoSource();
+                row.id = rs.getLong("id");
+                row.name = rs.getString("name");
+                row.type = rs.getString("type");
+                row.location = rs.getString("location");
+                remote.add(row);
+            }
+        }
+        for (RepoSource row : remote) {
+            String legacy = SourceNames.legacyRemoteName(row);
+            String stored = row.name == null ? "" : row.name.strip();
+            if (legacy == null || !legacy.equals(stored)) {
+                continue;
+            }
+            String simplified = SourceNames.deriveFrom(row.type, row.location);
+            if (simplified.isEmpty() || simplified.equals(stored)) {
+                continue;
+            }
+            try (PreparedStatement ps = st.getConnection()
+                    .prepareStatement("UPDATE repo_source SET name=? WHERE id=?")) {
+                ps.setString(1, simplified);
+                ps.setLong(2, row.id);
+                ps.executeUpdate();
+            }
+            log.info(LogEvents.of("store.init",
+                    "migration", "source.name " + row.id + ": " + legacy + " -> " + simplified));
         }
     }
 

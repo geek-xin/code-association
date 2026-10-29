@@ -10,6 +10,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 
 /** The source name is derived from the location, so the UI never asks for it. */
 class SourceNamesTest {
@@ -34,16 +35,18 @@ class SourceNamesTest {
     }
 
     @Test
-    void gitRemoteUsesOwnerAndRepo() {
-        assertEquals("org/repo", SourceNames.derive(source("GITHUB", "https://github.com/org/repo.git")));
-        assertEquals("group/sub/repo",
-                SourceNames.derive(source("GITLAB", "https://gitlab.com/group/sub/repo")));
+    void remoteUsesTheProgramNameOnly() {
+        // owner/repo reads as a location and dragged two long coordinates into the source list;
+        // the label names the program, the same thing a local folder name does.
+        assertEquals("repo", SourceNames.derive(source("GITHUB", "https://github.com/org/repo.git")));
+        assertEquals("repo", SourceNames.derive(source("GITLAB", "https://gitlab.com/group/sub/repo")));
+        assertEquals("repo", SourceNames.derive(source("GIT", "https://gitlab.example.com/team/repo")));
     }
 
     @Test
     void scpLikeRemoteIsHandled() {
         String url = "git" + "@" + "github.com:org/repo.git";
-        assertEquals("org/repo", SourceNames.derive(source("GIT", url)));
+        assertEquals("repo", SourceNames.derive(source("GIT", url)));
     }
 
     @Test
@@ -70,7 +73,23 @@ class SourceNamesTest {
 
     @Test
     void queryAndFragmentAreStrippedFromRemotes() {
-        assertEquals("org/repo",
+        assertEquals("repo",
                 SourceNames.derive(source("GITHUB", "https://github.com/org/repo.git?ref=main#readme")));
+    }
+
+    @Test
+    void deriveFromIgnoresAStoredName() {
+        RepoSource s = source("GITLAB", "https://gitlab.com/group/repo.git");
+        s.name = "picked-by-hand";
+        assertEquals("picked-by-hand", SourceNames.derive(s));
+        assertEquals("repo", SourceNames.deriveFrom(s.type, s.location));
+    }
+
+    @Test
+    void legacyRemoteNameIsTheOldOwnerRepoForm() {
+        assertEquals("org/repo",
+                SourceNames.legacyRemoteName(source("GITHUB", "https://github.com/org/repo.git")));
+        assertNull(SourceNames.legacyRemoteName(source("LOCAL_DIR", "/tmp/orders")));
+        assertNull(SourceNames.legacyRemoteName(null));
     }
 }

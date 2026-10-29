@@ -3,12 +3,15 @@ package com.geek.association.web;
 import com.geek.association.config.AiSettings;
 import com.geek.association.config.AppProperties;
 import com.geek.association.model.Analysis;
+import com.geek.association.model.PeerImpact;
 import com.geek.association.model.RepoSource;
 import com.geek.association.report.AiExplainer;
 import com.geek.association.report.ImpactReport;
 import com.geek.association.schedule.ScheduledScanService;
 import com.geek.association.service.AnalysisService;
+import com.geek.association.source.CodeExcerpts;
 import com.geek.association.source.GitSupport;
+import com.geek.association.source.GitTreeSource;
 import com.geek.association.source.PathBrowser;
 import com.geek.association.source.RepositoryPreparer;
 import com.geek.association.source.SourceNames;
@@ -19,6 +22,8 @@ import com.geek.association.update.UpdateService;
 import com.geek.association.util.Json;
 import com.geek.association.util.LogEvents;
 import com.geek.association.util.Texts;
+import org.eclipse.jgit.lib.ObjectId;
+import org.eclipse.jgit.lib.Repository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
@@ -33,10 +38,16 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 @RestController
 @RequestMapping("/api")
@@ -53,6 +64,25 @@ public class ApiController {
     private final UpdateService updateService;
     private final AiSettings aiSettings;
     private final AiExplainer aiExplainer;
+
+    /**
+     * Parsed reports for the evidence excerpt endpoint, keyed by analysis id.
+     *
+     * <p>One review screen asks for an excerpt per visible evidence line. Without this cache each
+     * request would read the report blob from SQLite and parse it again. The fields the excerpts
+     * use - head commit, peer commits, cited files - do not change after a run; AI review replaces
+     * the JSON but leaves them intact, and a re-run gets a new id.</p>
+     */
+    private final Map<Long, CodeContext> codeContexts = Collections.synchronizedMap(
+            new LinkedHashMap<>(8, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<Long, CodeContext> eldest) {
+                    return size() > 4;
+                }
+            });
+
+    private record CodeContext(long sourceId, ImpactReport report) {
+    }
 
     /**
      * The last two parameters were added with the AI settings endpoints.
@@ -702,5 +732,233 @@ public class ApiController {
             return ResponseEntity.status(HttpStatus.ACCEPTED).build();
         }
         return ResponseEntity.ok(report);
+    }
+
+    /**
+     * A few source lines around one evidence position, so the review screen can show the code
+     * instead of only a file:line the reader has to open by hand.
+     *
+     * <p>The revision is the one the analysis actually read: the recorded head commit for this
+     * program, the peer's recorded commit for a compared program. A plain directory has no
+     * revision, and a clone may have lost an old commit to garbage collection; both fall back to
+     * the working tree with a note, rather than pretending the lines are the analysed snapshot.</p>
+     */
+    @GetMapping("/analyses/{id}/code")
+    public Map<String, Object> code(@PathVariable long id,
+                                    @RequestParam("path") String path,
+                                    @RequestParam(value = "line", defaultValue = "1") int line,
+                                    @RequestParam(value = "context", defaultValue = "3") int context,
+                                    @RequestParam(value = "peerId", required = false) Long peerId) {
+        CodeContext analysisContext = codeContext(id);
+        ImpactReport report = analysisContext.report();
+        String rel = CodeExcerpts.normalizeRelativePath(path);
+        // The endpoint reads files, so it reads only files this report already points at. A local
+        // service must not become a general file browser for whoever can reach the port.
+        if (!citedFiles(report).contains(rel)) {
+            throw new IllegalArgumentException("这个文件没有被本次报告引用，无法读取源码");
+        }
+        RepoSource source;
+        String commit;
+        boolean worktree;
+        if (peerId == null) {
+            source = store.source(analysisContext.sourceId());
+            if (source == null) {
+                throw new IllegalArgumentException("代码源已删除，无法读取源码");
+            }
+            commit = report.headCommit;
+            worktree = isWorktreeMode(report.mode);
+        } else {
+            PeerImpact peer = report.peers.stream()
+                    .filter(p -> p.peerSourceId == peerId)
+                    .findFirst()
+                    .orElseThrow(() -> new IllegalArgumentException("这次分析里没有该对比程序"));
+            source = store.source(peerId);
+            if (source == null) {
+                // The report keeps enough identity to reach the clone; a removed source row should
+                // not take the evidence lines with it.
+                source = new RepoSource();
+                source.id = peer.peerSourceId;
+                source.name = peer.peerSourceName;
+                source.type = peer.peerType;
+                source.location = peer.peerLocation;
+            }
+            commit = peer.peerCommit;
+            worktree = isPlainDirectory(source.type);
+        }
+
+        Path root;
+        try {
+            root = preparer.sourceDirectory(source);
+        } catch (IOException e) {
+            return unavailable(rel, line, e.getMessage());
+        }
+        Path file = root.resolve(rel).normalize();
+        if (!file.startsWith(root)) {
+            throw new IllegalArgumentException("路径越出了代码源目录");
+        }
+        String fallbackNote = null;
+        if (Files.isDirectory(root.resolve(".git")) && !worktree
+                && (commit == null || commit.isBlank())) {
+            // Old reports predate the recorded revision; saying so beats showing today's branch
+            // as if it were what the analysis read.
+            fallbackNote = "报告没有记录分析版本，以下为当前工作区";
+        }
+        if (Files.isDirectory(root.resolve(".git")) && !worktree && commit != null && !commit.isBlank()) {
+            try (Repository repo = GitSupport.open(root)) {
+                GitTreeSource tree = new GitTreeSource(repo, ObjectId.fromString(commit),
+                        source.name, properties.getMaxFiles(), properties.maxFileBytes());
+                if (!tree.exists(rel)) {
+                    return unavailable(rel, line,
+                            "分析版本（" + shortCommit(commit) + "）里没有这个文件，可能是本次删除的");
+                }
+                String text = tree.read(rel);
+                if (text != null) {
+                    return excerpt(CodeExcerpts.fromText(rel, text, line, context, shortCommit(commit)));
+                }
+                fallbackNote = "分析版本里无法读取该文件，以下为当前工作区";
+            } catch (IllegalArgumentException | IOException e) {
+                fallbackNote = "分析版本不在本地仓库中，以下为当前工作区";
+            }
+        }
+        if (!Files.isRegularFile(file)) {
+            return unavailable(rel, line,
+                    fallbackNote != null ? fallbackNote : "当前工作区里没有这个文件");
+        }
+        try {
+            Path real = file.toRealPath();
+            if (!real.startsWith(root.toRealPath())) {
+                throw new IllegalArgumentException("路径越出了代码源目录");
+            }
+            CodeExcerpts.Excerpt ex = CodeExcerpts.fromFile(real, rel, line, context);
+            if (fallbackNote != null) {
+                ex = new CodeExcerpts.Excerpt(ex.path(), ex.line(), ex.startLine(), ex.endLine(),
+                        ex.lines(), "worktree", joinNote(fallbackNote, ex.note()));
+            }
+            return excerpt(ex);
+        } catch (IOException e) {
+            return unavailable(rel, line, "读取源码失败：" + e.getMessage());
+        }
+    }
+
+    /** Loads and caches the two things an excerpt needs from the analysis row. */
+    private CodeContext codeContext(long id) {
+        CodeContext cached = codeContexts.get(id);
+        if (cached != null) {
+            return cached;
+        }
+        Analysis a = store.analysisWithReport(id);
+        if (a == null) {
+            throw new IllegalArgumentException("分析 #" + id + " 不存在");
+        }
+        if (a.reportJson == null) {
+            throw new IllegalArgumentException("这次分析还没有报告，无法定位源码");
+        }
+        CodeContext context = new CodeContext(a.sourceId, Json.read(a.reportJson, ImpactReport.class));
+        codeContexts.put(id, context);
+        return context;
+    }
+
+    /** Every file path this report cites; the excerpt endpoint reads nothing else. */
+    private static Set<String> citedFiles(ImpactReport report) {
+        Set<String> out = new HashSet<>();
+        if (report == null) {
+            return out;
+        }
+        for (ImpactReport.ChangeView change : report.changes) {
+            addCited(out, change.file);
+        }
+        for (ImpactReport.ImpactView impact : report.impacts) {
+            addImpactFiles(out, impact);
+        }
+        for (PeerImpact peer : report.peers) {
+            for (PeerImpact.ContractMatch match : peer.matches) {
+                addCited(out, match.peerFile);
+            }
+            for (var impact : peer.impacts) {
+                addCited(out, impact.targetFile);
+                for (var step : impact.path) {
+                    addCited(out, step.file);
+                }
+                for (var evidence : impact.evidence) {
+                    addCited(out, evidence.filePath);
+                }
+            }
+        }
+        return out;
+    }
+
+    private static void addImpactFiles(Set<String> out, ImpactReport.ImpactView impact) {
+        addCited(out, impact.changedFile);
+        addCited(out, impact.targetFile);
+        for (var step : impact.path) {
+            addCited(out, step.file);
+        }
+        for (var evidence : impact.evidence) {
+            addCited(out, evidence.filePath);
+        }
+    }
+
+    private static void addCited(Set<String> out, String path) {
+        if (path == null || path.isBlank()) {
+            return;
+        }
+        try {
+            out.add(CodeExcerpts.normalizeRelativePath(path));
+        } catch (IllegalArgumentException ignored) {
+            // A malformed path in an old report is not readable either; leave it out.
+        }
+    }
+
+    private static boolean isWorktreeMode(String mode) {
+        return "WORKTREE".equalsIgnoreCase(mode) || "WORKTREE_DIFF".equalsIgnoreCase(mode);
+    }
+
+    /** A plain directory is read from disk, because that is what the analysis indexed. */
+    private static boolean isPlainDirectory(String type) {
+        String t = type == null ? "LOCAL_DIR" : type.toUpperCase();
+        return "LOCAL_DIR".equals(t) || "DIRECTORY".equals(t) || "FOLDER".equals(t);
+    }
+
+    private static String shortCommit(String commit) {
+        return commit == null || commit.length() < 8 ? String.valueOf(commit) : commit.substring(0, 8);
+    }
+
+    private static String joinNote(String first, String second) {
+        if (second == null || second.isBlank()) {
+            return first;
+        }
+        return first + "；" + second;
+    }
+
+    private static Map<String, Object> unavailable(String path, int line, String note) {
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("path", path);
+        out.put("line", Math.max(1, line));
+        out.put("startLine", 0);
+        out.put("endLine", 0);
+        out.put("lines", List.of());
+        out.put("revision", null);
+        out.put("note", note == null || note.isBlank() ? "没有可展示的源码行" : note);
+        return out;
+    }
+
+    private static Map<String, Object> excerpt(CodeExcerpts.Excerpt ex) {
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("path", ex.path());
+        out.put("line", ex.line());
+        out.put("startLine", ex.startLine());
+        out.put("endLine", ex.endLine());
+        List<Map<String, Object>> lines = new ArrayList<>();
+        for (CodeExcerpts.Line l : ex.lines()) {
+            Map<String, Object> row = new LinkedHashMap<>();
+            row.put("number", l.number());
+            row.put("text", l.text());
+            row.put("truncated", l.truncated());
+            lines.add(row);
+        }
+        out.put("lines", lines);
+        out.put("revision", ex.revision());
+        out.put("note", ex.note());
+        return out;
     }
 }

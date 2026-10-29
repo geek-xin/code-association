@@ -131,6 +131,12 @@ code-association:
     # Wall-clock limit of one model request (5..300). The analysis is already finished by the time
     # this runs, so a dead endpoint must not hold the run open.
     timeout-seconds: 60
+    # Wall-clock limit of the whole AI section (summary + up to a dozen comment calls), in seconds.
+    # Omitted means "three times timeout-seconds, clamped to 90..900", which is what almost every
+    # install wants; set it only to force a shorter cap. It is a deployment knob, not a settings-page
+    # field: {data-dir}/ai-settings.json does not carry it, so a save from the settings page cannot
+    # overwrite this value.
+    # total-budget-seconds: 180
     # Default state of the "generate AI review" checkbox in the run dialog. Each run can still say
     # no, and this has no effect while enabled is false.
     default-for-runs: true

@@ -84,7 +84,8 @@ code-association:
     api-key: ${AI_API_KEY:}                   # 从环境变量读，不要写进仓库；缺省为空
     model: deepseek-chat
     max-impacts: 12                           # 1..50
-    timeout-seconds: 60                       # 5..300
+    timeout-seconds: 60                       # 单次请求，5..300
+    # total-budget-seconds: 180               # 整段 AI 的总预算；不写按 timeout-seconds × 3 推导（90..900）
     comments: true                            # 逐条评审意见（发送变更片段）
     max-comments: 12                          # 1..50
     reflection: true                          # 反思模型过滤事实错误
@@ -155,7 +156,22 @@ API Key 不算在内——本地 Ollama 一类的端点本来就没有 key。未
 `POST /api/analyses` 的 `aiReview` 字段缺失时按「默认值 && 就绪」决定；显式 `false` 表示这次不生成。
 未就绪时勾了也不会让分析失败——跳过并记一条日志。AI 是可选项，不该有能力拖垮必选项。
 
-生成阶段沿用报告阶段：`REPORT` / 96% / "正在生成 AI 评审说明"。
+AI 段从 96% 起，按阶段把百分比推到 99%，detail 行依次是：
+
+| 阶段 | detail |
+|---|---|
+| 摘要 | `AI 评审：生成评审要点` |
+| 逐条意见开始 | `AI 评审：逐条评审意见` |
+| 每个评审分块 | `AI 评审：分块 i/n` |
+| 每次评论重定位 | `AI 评审：重定位意见 i/n` |
+| 反思 | `AI 评审：反思意见` |
+| 收尾 | `AI 评审：整理意见` |
+
+百分比由「那一段工作自己」的完成比例换算：96 + round(3 × fraction)，夹在 96..99。AI 段最多有十几次串行调用，
+过去整段只写一次 96%，与卡死无法区分。100% 仍然由 `finishAnalysis` 独占写入——报告落库之前不宣布完成。
+
+「逐条评审意见」「分块」「重定位」「反思」这四行只在「生成逐条评审意见」打开时出现（反思还要求确有评论）；
+关闭时摘要之后直接进入「整理意见」。
 
 ### 分析页的四种状态
 
@@ -190,7 +206,8 @@ curl -X POST http://127.0.0.1:9996/api/analyses/42/ai-review
   "reviewStats": { "filesReviewed": 3, "filesSkipped": 1, "commentsGenerated": 4,
     "commentsKept": 1, "commentsDroppedUnlocated": 1, "commentsDroppedFiltered": 2,
     "commentsDroppedReflection": 0, "commentsMerged": 0, "relocationCalls": 1,
-    "reflectionRan": true, "estimatedTokens": 5120, "notes": [] } }
+    "reflectionRan": true, "estimatedTokens": 5120, "budgetSeconds": 180,
+    "budgetExpired": false, "notes": [] } }
 ```
 
 | 情况 | 响应 |
@@ -242,6 +259,64 @@ JSON 报告写入 `ai` 字段，Markdown 报告多一个独立小节：
 
 未配置时打印一行提示，**退出码不变**。让一个可选项的不可用导致流水线变红，
 等于把门禁的判定权交给外部服务。
+
+## 时间预算
+
+整段 AI（摘要 + 最多十几次评论调用）共享一个墙钟预算 `code-association.ai.total-budget-seconds`。
+它只能写在 `application.yml`：这是部署形态的参数（什么端点、有多慢），不是每次运行的实验，
+所以设置页与 `{data-dir}/ai-settings.json` 都不带它——快照若带上，第一次保存就会悄悄覆盖部署值。
+
+```yaml
+code-association:
+  ai:
+    timeout-seconds: 60          # 单次请求，5..300
+    total-budget-seconds: 180    # 整段 AI；不写则按下面的规则推导
+```
+
+不写时按 `timeout-seconds × 3` 推导，并夹在 90..900 秒之间：默认 `timeout-seconds: 60` 得到 180 秒。
+推导而不是必填，是为了让已经在设置页调大的单次超时同步抬高整段预算；上下限则保证慢的本地模型仍有
+几次调用的余地，而死端点不会把一次分析占住一刻钟。
+
+预算是硬上限。每次评论调用前检查剩余时间，单次请求的超时也收缩到剩余预算之内；预算耗尽后不再发起剩余调用，
+已生成的部分照常保留。预算截断这一段有两种形态：
+
+- pipeline 真的跳过了一次调用：`reviewStats.budgetExpired=true`。
+- 预算把最后一次调用的单次超时缩短了，而那次调用失败：没有任何调用被跳过（`budgetExpired=false`），
+  但评论缺失的原因仍是预算。
+
+出现任一形态时，`reviewError` 由「第一条具体错误 + `；` + `AI 评审超出时间预算（N 秒），已保留已生成的部分`」合成；
+第一条错误超过 200 字时先截断，保证预算那句在整行 300 字上限内永远保留。没有具体错误但被截断时只有预算句；
+预算没有参与截断时原样保留第一条错误（如 `HTTP 401: …`）。
+
+端到端实测的 `reviewError`：
+
+```text
+第 1 个分块评审失败：模型调用超时（5 秒），请检查接口地址、网络或模型响应速度；AI 评审超出时间预算（8 秒），已保留已生成的部分
+```
+
+形态 (a)（真的跳过了调用）`budgetExpired=true`；形态 (b)（只有 2 个分块、预算被第 2 个分块吃完）
+`budgetExpired=false`，但 `reviewError` 是同样的合成形态。
+
+逐段明细在 `reviewStats.notes`：分块被截断记 `AI 评审超出时间预算，剩余 N 个分块未评审`，
+重定位被截断记 `AI 评审超出时间预算，剩余 N 条意见未重定位`，反思被跳过记
+`AI 评审超出时间预算，跳过反思，保留全部评论`。摘要本身失败时 `report.ai.error` 是
+`AI 评审超出时间预算（N 秒），已保留已生成的部分`。
+
+`budgetExpired` 只在真的跳过了模型调用时为 `true`；预算恰好用尽但所有调用都跑完是 `false`。
+这个字段用于区分是否还有未送审的分块，不等于评论是否完整——形态 (b) 里评论同样不全，字段却是 `false`。
+已生成的评论仍会走定位与过滤，只有没来得及重定位的会缺失；反思被跳过时不会删除任何评论。
+单次调用撞上传输层看门狗时，错误里是
+`模型调用超时（N 秒，AI 评审时间预算已用尽），请检查接口地址、网络或模型响应速度`
+（预算未耗尽时没有「AI 评审时间预算已用尽」这一句）。
+
+为什么需要这层预算，而不是只靠单次 `timeout-seconds`：
+
+- 单次 `HttpRequest.timeout` 只覆盖到响应头。服务端发出响应头后停止写 body 时，这个超时不会触发，
+  调用会一直阻塞（本机 JDK 21 实测）——分析就永远停在最后一个进度上，只能杀进程。
+- 逐条评审让一次分析最多有 14 次串行调用（1 次摘要 + ≤6 个评审分块 + ≤6 次重定位 + 1 次反思）。
+  每次 60 秒上限加起来是一刻钟，这期间界面上只有一个不动的 96%，和「卡死」无法区分。
+
+预算耗尽不是失败：静态分析结论早已算完并写入报告，AI 只是可选的最后一段。
 
 ## 逐条评审意见（行级定位）
 
@@ -326,7 +401,8 @@ JSON 报告写入 `ai` 字段，Markdown 报告多一个独立小节：
 
 `report.ai.reviewStats` 是这一轮的计数：`filesReviewed`、`filesSkipped`、`commentsGenerated`、
 `commentsKept`、`commentsDroppedUnlocated`、`commentsDroppedFiltered`、`commentsDroppedReflection`、
-`commentsMerged`、`relocationCalls`、`reflectionRan`、`estimatedTokens`、`notes`。
+`commentsMerged`、`relocationCalls`、`reflectionRan`、`estimatedTokens`、`budgetSeconds`（本次预算的秒数，
+0 表示没有上限）、`budgetExpired`（真的跳过一次调用时为 `true`，即还有分块未送审；它不表示评论是否完整——预算缩短最后一次调用的超时并导致其失败时，评论同样不全而字段是 `false`）、`notes`（失败与预算相关的明细）。
 逐条评审整体失败时另有可选的 `reviewError`；摘要照常保留——评论是加法，不能把已有的说明弄丢。
 
 ### 界面与导出

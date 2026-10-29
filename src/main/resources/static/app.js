@@ -72,6 +72,14 @@ const UNTAGGED_GROUP = '未分类';
  */
 const REVIEW_PAGE_SIZE = 50;
 
+/**
+ * 证据行内联源码时，引用行上下各取几行。
+ *
+ * 3 行足够看清一个条件或调用的上下文，又不至于让证据面板变成文件阅读器；
+ * 服务端还会把它夹在 0..10 之间。
+ */
+const SNIPPET_CONTEXT = 3;
+
 function esc(v) {
   return String(v == null ? '' : v)
     .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
@@ -191,6 +199,11 @@ var state = {
    * source 保存报告里那个数组的引用，换成别的报告时引用不同，缓存自然失效。
    */
   impactCache: { analysisId: null, source: null, sorted: null, stats: null },
+  /**
+   * 证据源码片段的渲染缓存，键为 分析 id|peerId|路径|行号。
+   * 选中/复核会反复重建证据面板，同一段代码不应该每次都再请求一次。
+   */
+  codeCache: {},
   selectedImpactId: null,
   selectedModule: null,
   search: '',
@@ -758,6 +771,8 @@ async function openAnalysis(id) {
   state.analysisId = id;
   // 换了一份报告，页码必须回到第 1 页；impactCache 由 sortedImpacts() 按数组引用自动失效。
   state.reviewPage = 1;
+  // 源码片段缓存按分析缓存，换分析后旧条目不会再被命中，直接丢掉避免无限增长。
+  state.codeCache = {};
   var owner = state.analyses.filter(function (a) { return a.id === id; })[0] || null;
   // A finished run has a report, but a pending one does not, and asking for it anyway is how a
   // failed record ended up with a null report *and* no visible reason.
@@ -912,6 +927,12 @@ function go(page) {
   }
 
   renderMapsFor(page);
+  // 证据源码片段懒加载：只有页面真正可见时才补请求，见 hydrateCodeSnippets。
+  if (page === 'review') hydrateCodeSnippets($('rv-evidence'));
+  else if (page === 'impact') {
+    hydrateCodeSnippets($('im-evidence'));
+    hydrateCodeSnippets($('im-path'));
+  }
   // Page switches do not re-fetch anything, but the notice is page-independent and cheap to
   // re-evaluate; doing it here keeps the sidebar dot in sync without a poll-time API call.
   renderUpdateNotice();
@@ -943,81 +964,63 @@ function renderMapsFor(page) {
 /* --------------------------------------------------------- cross-program */
 
 /**
- * Draws the cross-program section into one page. The overview and the review screen show the
- * same content because both answer the same question: does this change reach another program.
+ * 复核页不再单开一张「对其他程序的影响」卡：对比程序压缩成发现列表标题下的一行汇总 pill
+ * （契约数 / 影响处数），逐条影响只留在下面的列表里。总览的合并卡用同一个 .peer-strip。
  */
-function renderPeerPanel(report, prefix) {
-  var card = $(prefix + '-peer-card');
-  var host = $(prefix + '-peers');
-  var summary = $(prefix + '-peer-summary');
-  if (!card || !host) return;
+function renderReviewPeerStrip(report) {
+  var host = $('rv-peer-strip');
+  if (!host) return;
   var peers = (report && report.peers) || [];
-  card.style.display = '';
-  if (!peers.length) {
-    if (summary) summary.innerHTML = pill('未选择程序', 'neutral', true);
-    host.innerHTML = '<div class="callout warning"><svg><use href="#i-alert-circle"/></svg><div>' +
-      esc((report && report.peersNote) || '本次没有选择其他程序，未执行跨程序扫描。') +
-      '</div></div>';
-    return;
-  }
-
-  var totalImpacts = 0, totalHigh = 0, maxRisk = 0;
-  peers.forEach(function (p) {
-    totalImpacts += p.impactedSymbols || 0;
-    totalHigh += p.highRisk || 0;
-    maxRisk = Math.max(maxRisk, p.maxRisk || 0);
-  });
-  if (summary) {
-    summary.innerHTML = peers.length
-      ? pill('波及 ' + totalImpacts + ' 处', totalImpacts ? 'warning' : 'success', true) +
-        (totalHigh ? pill(totalHigh + ' 项高风险', 'danger', true) : '')
-      : '';
-  }
-
+  if (!peers.length) { host.innerHTML = ''; return; }
   host.innerHTML = peers.map(function (p) {
+    var contracts = (p.matches || []).length;
+    // 未比较的条目比「0 处影响」更值得注意，warning 比中性灰更贴近它真实的含义。
+    var tone = p.note ? 'warning' : (p.highRisk ? 'danger' : (p.impactedSymbols ? 'brand' : 'neutral'));
+    var label = (p.peerSourceName || '其他程序') +
+      (p.note ? ' · 未比较' : ' · ' + contracts + ' 契约 · ' + (p.impactedSymbols || 0) + ' 处');
+    return pill(label, tone, true);
+  }).join('');
+}
+
+/**
+ * 未选中发现时证据面板的内容：本轮命中的契约与对方使用点。
+ *
+ * 这张表原来在独立的「对其他程序的影响」卡里，和发现列表把同一批影响列了两遍。
+ * 影响列表已经合并进左侧，契约命中没有第二次出现，所以放在右侧默认态里；
+ * 选中任意一条发现后，这里再切换成它的证据链。
+ */
+function reviewContractHitsHtml(report) {
+  var peers = (report && report.peers) || [];
+  if (!peers.length) {
+    return '<div class="callout warning">' + icon('i-alert-circle') + '<div>' +
+      esc((report && report.peersNote) || '本次没有选择其他程序，未执行跨程序扫描。') + '</div></div>';
+  }
+  var blocks = peers.map(function (p) {
+    var matches = p.matches || [];
     var head = '<div class="row-title" style="margin-bottom:6px">' +
-      '<span class="row-icon brand" style="width:22px;height:22px;border-radius:6px;margin:0">' + icon('i-database') + '</span>' +
-      esc(p.peerSourceName) +
-      ' ' + pill(sourceTypeLabel(p.peerType), 'neutral') +
-      (p.note ? ' ' + pill('未比较', 'neutral') : '') +
-      (p.matches && p.matches.length ? ' ' + pill((p.matches || []).length + ' 个契约命中', 'brand', true) : '') +
-      (p.impactedSymbols ? ' ' + pill('影响 ' + p.impactedSymbols + ' 处', RISK_TONE[p.riskLevel] || 'neutral', true) : '') +
+      '<span class="sym">' + esc(p.peerSourceName || '其他程序') + '</span>' +
+      pill(sourceTypeLabel(p.peerType), 'neutral') +
+      (p.note ? pill('未比较', 'neutral') : pill(matches.length + ' 个契约命中', 'brand', true)) +
       '</div>';
-
     if (p.note) {
-      return '<div class="ev-row" style="margin-bottom:8px">' + head +
-        '<div class="ev-meta">' + esc(p.note) + '</div></div>';
+      return '<div class="peer-review">' + head + '<div class="ev-meta">' + esc(p.note) + '</div></div>';
     }
-
-    var matches = (p.matches || []).map(function (m) {
-      return '<div class="ev-row" style="margin-bottom:6px">' +
-        '<div class="ev-type">' + esc(m.kind) + '</div>' +
-        '<div class="ev-main">' + esc(m.contract) + ' → ' + esc(m.peerSymbol) + '</div>' +
-        '<div class="ev-meta">' + esc(m.usage) + (m.peerFile ? ' · ' + esc(shortFile(m.peerFile)) + ':' + (m.peerLine || 0) : '') +
-          ' · 置信度 ' + Math.round((m.confidence || 0) * 100) + '%</div></div>';
-    }).join('');
-
-    var impacts = (p.impacts || []).slice(0, 8).map(function (i) {
-      return '<div class="list-row" data-impact-id="' + i.id + '">' +
-        '<div class="row-icon ' + (RISK_TONE[i.riskLevel] || 'neutral') + '">' + icon('i-alert') + '</div>' +
-        '<div class="row-main">' +
-          '<div class="row-title"><span class="sym">' + esc(shortSymbol(i.targetQualifiedName || i.targetSymbolKey || '')) + '</span>' +
-            pill(RISK_LABEL[i.riskLevel] || i.riskLevel, RISK_TONE[i.riskLevel], true) + '</div>' +
-          '<div class="row-desc">' + esc(i.reason) + '</div>' +
-          '<div class="row-meta">' + chip(i.impactType) + chip('深度 ' + i.depth) + chip('置信度 ' + i.confidence) + '</div>' +
-        '</div></div>';
-    }).join('');
-
-    if (!p.matches || !p.matches.length) {
-      return '<div class="ev-row" style="margin-bottom:8px">' + head +
+    if (!matches.length) {
+      return '<div class="peer-review">' + head +
         '<div class="ev-meta">没有发现与本程序变更相关的契约使用点。</div></div>';
     }
-    return '<div style="margin-bottom:14px">' + head +
-      '<div class="section-label">命中的契约</div>' +
-      '<div class="evidence">' + matches + '</div>' +
-      (impacts ? '<div class="section-label">受影响的其他程序代码</div><div class="list">' + impacts + '</div>' : '') +
-      '</div>';
+    var rows = matches.map(function (m) {
+      return '<div class="ev-row">' +
+        '<div class="ev-type">' + esc(m.kind) + '</div>' +
+        '<div class="ev-main">' + esc(m.contract) + ' → ' + esc(m.peerSymbol) + '</div>' +
+        '<div class="ev-meta">' + esc(m.usage) +
+          (m.peerFile ? ' · ' + esc(shortFile(m.peerFile)) + ':' + (m.peerLine || 0) : '') +
+          ' · 置信度 ' + Math.round((m.confidence || 0) * 100) + '%</div>' +
+        codeSnippetPlaceholder(p.peerSourceId, m.peerFile, m.peerLine) + '</div>';
+    }).join('');
+    return '<div class="peer-review">' + head + '<div class="evidence">' + rows + '</div></div>';
   }).join('');
+  return blocks || '<div class="empty">本轮没有命中任何契约使用点。</div>';
 }
 
 /* --------------------------------------------------- sidebar tag groups */
@@ -1204,7 +1207,7 @@ function renderOvPeerStrip(report) {
   if (!host) return;
   var peers = (report && report.peers) || [];
   if (!peers.length) { host.innerHTML = ''; return; }
-  host.innerHTML = '<div class="ov-peer-strip">' + peers.map(function (p) {
+  host.innerHTML = '<div class="peer-strip">' + peers.map(function (p) {
     var contracts = (p.matches || []).length;
     var tone = p.note ? 'warning' : (p.highRisk ? 'danger' : (p.impactedSymbols ? 'brand' : 'neutral'));
     var label = (p.peerSourceName || '其他程序') +
@@ -1552,7 +1555,7 @@ function renderReviewCounters(counts) {
 function renderReview() {
   var report = state.report;
   var counts = reviewCounts();
-  renderPeerPanel(report, 'rv');
+  renderReviewPeerStrip(report);
   var setText = function (id, v) { var el = $(id); if (el) el.textContent = v; };
 
   var pickedSource = currentSource();
@@ -1568,7 +1571,11 @@ function renderReview() {
   var sub = $('rv-sub');
   if (sub) {
     if (report) {
+      // 对比程序已经压成列表标题下的 pill，页头不再重复一遍；只有"本轮没做跨程序扫描"
+      // 这条例外信息需要在这里说清楚，否则空列表会被读成"没有影响"。
+      var noPeers = !((report.peers || []).length);
       sub.innerHTML = esc(report.baseLabel || '') + ' → ' + esc(report.headLabel || '') +
+        (noPeers ? ' <span class="sep">·</span> 本次未选择其他程序，未执行跨程序扫描' : '') +
         ' <span class="sep">·</span> ' + counts.total + ' 项影响，' + counts.pending + ' 项待复核' +
         ' <span class="sep">·</span> 复核结果仅保存在本地浏览器';
     } else {
@@ -1733,10 +1740,18 @@ function renderReviewEvidence() {
   var sub = $('rv-ev-sub');
   var actions = $('rv-ev-actions');
   if (!impact) {
-    if (title) title.textContent = '证据';
-    if (sub) sub.textContent = '选择左侧任一条影响查看证据链';
     if (actions) actions.innerHTML = '';
-    host.innerHTML = '<div class="empty"><strong>尚未选择发现</strong>左侧列表中的每一条都带有变更点、传播路径与代码位置。</div>';
+    if (!state.report) {
+      if (title) title.textContent = '证据';
+      if (sub) sub.textContent = '选择左侧任一条影响查看证据链';
+      host.innerHTML = '<div class="empty"><strong>尚未选择发现</strong>左侧列表中的每一条都带有变更点、传播路径与代码位置。</div>';
+      return;
+    }
+    // 默认态展示契约命中：这是原「对其他程序的影响」卡里唯一没有被发现列表覆盖的内容。
+    if (title) title.textContent = '契约命中';
+    if (sub) sub.textContent = '选择左侧任一条发现查看证据链';
+    host.innerHTML = reviewContractHitsHtml(state.report);
+    hydrateCodeSnippets(host);
     return;
   }
   if (title) title.textContent = shortSymbol(impact.targetSymbol);
@@ -1744,10 +1759,13 @@ function renderReviewEvidence() {
     (impact.peerModule ? ' / ' + esc(impact.peerModule) : '') +
     ' · ' + esc(TYPE_LABEL[impact.impactType] || impact.impactType) + ' · 风险 ' + Math.round(impact.riskScore || 0);
   if (actions) {
+    // 「契约命中」是回到未选中态的唯一入口：契约表在选中一条发现时让位给它的证据链，
+    // 但不能因此变得不可回看 —— 复核完一条后，下一页的契约使用点仍然是判断依据。
     actions.innerHTML =
       '<button class="btn btn-sm" data-dismiss-impact="' + impact.id + '">' + icon('i-eye-off') + '忽略</button>' +
       '<button class="btn btn-sm btn-primary" data-confirm-impact="' + impact.id + '">' + icon('i-check') + '确认</button>' +
-      '<button class="btn btn-sm" data-open-impact="' + impact.id + '">' + icon('i-external') + '详情</button>';
+      '<button class="btn btn-sm" data-open-impact="' + impact.id + '">' + icon('i-external') + '详情</button>' +
+      '<button class="btn btn-sm" data-clear-impact>契约命中</button>';
   }
 
   var steps = [{
@@ -1763,13 +1781,17 @@ function renderReviewEvidence() {
           (step.usage && step.usage !== 'NONE' ? ' · 使用方式 <b>' + esc(step.usage) + '</b>' : '') +
           (step.file ? ' · ' + esc(shortFile(step.file)) + ':' + (step.line || 0) : '') + '</div>' +
         (step.note ? '<div class="path-rel">' + esc(step.note) + '</div>' : '') +
+        codeSnippetPlaceholder(idx === 0 ? '' : impact.peerSourceId, step.file, step.line) +
       '</div></div>';
   }).join('');
 
   var evidenceHtml = (impact.evidence || []).map(function (e) {
+    // PATH 是对方程序里的一跳，其余证据（CHANGE / EXPOSES_API）属于本次分析的程序。
+    var peerId = e.type === 'PATH' ? impact.peerSourceId : '';
     return '<div class="ev-row"><div class="ev-type">' + esc(e.type) + '</div>' +
       '<div class="ev-main">' + esc(e.source) + (e.target ? ' → ' + esc(e.target) : '') + '</div>' +
-      '<div class="ev-meta">' + esc(e.filePath || '') + (e.line ? ':' + e.line : '') + ' ' + esc(e.detail || '') + '</div></div>';
+      '<div class="ev-meta">' + esc(e.filePath || '') + (e.line ? ':' + e.line : '') + ' ' + esc(e.detail || '') + '</div>' +
+      codeSnippetPlaceholder(peerId, e.filePath, e.line) + '</div>';
   }).join('');
 
   var d = decisionOf(impact.id);
@@ -1786,6 +1808,75 @@ function renderReviewEvidence() {
     ((impact.suggestedTests || []).length
       ? '<ul class="test-list">' + impact.suggestedTests.map(function (t) { return '<li>' + esc(t) + '</li>'; }).join('') + '</ul>'
       : '<div class="empty">未发现覆盖该符号的测试用例，建议新增针对性测试。</div>');
+  hydrateCodeSnippets(host);
+}
+
+/* ------------------------------------------------------ evidence snippets */
+
+/**
+ * 证据行下方的源码窗口。
+ *
+ * 报告已经为每条证据/每一跳给出 文件:行，但读者仍要打开仓库才能判断命中是否成立——这一步正是
+ * 本工具想省掉的。片段按可见位置懒加载并缓存：切换发现会反复重建同一段证据链，不能每次重新请求。
+ */
+function codeSnippetPlaceholder(peerId, file, line) {
+  if (!file || !line || state.analysisId == null) return '';
+  return '<div class="code-snippet-host" data-code-peer="' + esc(peerId == null ? '' : String(peerId)) +
+    '" data-code-path="' + esc(file) + '" data-code-line="' + Number(line) + '"></div>';
+}
+
+/** 为容器里尚未加载的片段发起请求；渲染是同步的，片段到达后只替换自己的占位节点。 */
+function hydrateCodeSnippets(host) {
+  if (!host || state.analysisId == null) return;
+  // renderAll 会先渲染所有页面；隐藏页上的片段没人看，不该在启动时先发一串请求。
+  // 片段在切到该页时由 go() 补一次 hydration。
+  if (host.closest('.page.hidden')) return;
+  var nodes = host.querySelectorAll('.code-snippet-host[data-code-path]');
+  for (var i = 0; i < nodes.length; i++) loadCodeSnippet(nodes[i]);
+}
+
+function loadCodeSnippet(node) {
+  if (node.getAttribute('data-code-loading') === '1') return;
+  var path = node.getAttribute('data-code-path');
+  var line = Number(node.getAttribute('data-code-line')) || 0;
+  var peer = node.getAttribute('data-code-peer') || '';
+  var key = state.analysisId + '|' + peer + '|' + path + '|' + line;
+  if (Object.prototype.hasOwnProperty.call(state.codeCache, key)) {
+    node.innerHTML = state.codeCache[key];
+    return;
+  }
+  node.setAttribute('data-code-loading', '1');
+  var url = '/analyses/' + state.analysisId + '/code?path=' + encodeURIComponent(path) +
+    '&line=' + line + '&context=' + SNIPPET_CONTEXT +
+    (peer ? '&peerId=' + encodeURIComponent(peer) : '');
+  api(url).then(function (res) {
+    var html = codeSnippetHtml(res);
+    state.codeCache[key] = html;
+    if (node.isConnected) {
+      node.removeAttribute('data-code-loading');
+      node.innerHTML = html;
+    }
+  }).catch(function (e) {
+    if (!node.isConnected) return;
+    var html = '<div class="code-snippet-note">源码不可用：' +
+      esc(e && e.message ? e.message : '读取失败') + '</div>';
+    state.codeCache[key] = html;
+    node.removeAttribute('data-code-loading');
+    node.innerHTML = html;
+  });
+}
+
+function codeSnippetHtml(res) {
+  if (!res || !(res.lines || []).length) {
+    return '<div class="code-snippet-note">' + esc((res && res.note) || '没有可展示的源码行') + '</div>';
+  }
+  var rows = res.lines.map(function (l) {
+    return '<span class="code-line' + (l.number === res.line ? ' hl' : '') + '">' +
+      '<span class="code-n">' + l.number + '</span>' +
+      '<span class="code-t">' + esc(l.text) + (l.truncated ? '…' : '') + '</span></span>';
+  }).join('');
+  return '<pre class="code-snippet">' + rows + '</pre>' +
+    (res.note ? '<div class="code-snippet-note">' + esc(res.note) + '</div>' : '');
 }
 
 /** 按 id 找一条影响；id 可能来自 data 属性（字符串），所以统一转成字符串比。 */
@@ -1927,16 +2018,21 @@ function renderImpact() {
           (step.usage && step.usage !== 'NONE' ? ' · 使用方式 <b>' + esc(step.usage) + '</b>' : '') +
           (step.file ? ' · ' + esc(shortFile(step.file)) + ':' + (step.line || 0) : '') + '</div>' +
         (step.note ? '<div class="path-rel">' + esc(step.note) + '</div>' : '') +
+        codeSnippetPlaceholder(idx === 0 ? '' : impact.peerSourceId, step.file, step.line) +
       '</div></div>';
   }).join(''));
 
   var evidence = impact.evidence || [];
   setText('im-ev-count', evidence.length + ' 条');
   setHtml('im-evidence', evidence.length ? evidence.map(function (e) {
+    var peerId = e.type === 'PATH' ? impact.peerSourceId : '';
     return '<div class="ev-row"><div class="ev-type">' + esc(e.type) + '</div>' +
       '<div class="ev-main">' + esc(e.source) + (e.target ? ' → ' + esc(e.target) : '') + '</div>' +
-      '<div class="ev-meta">' + esc(e.filePath || '') + (e.line ? ':' + e.line : '') + ' ' + esc(e.detail || '') + '</div></div>';
+      '<div class="ev-meta">' + esc(e.filePath || '') + (e.line ? ':' + e.line : '') + ' ' + esc(e.detail || '') + '</div>' +
+      codeSnippetPlaceholder(peerId, e.filePath, e.line) + '</div>';
   }).join('') : emptyBlock('无证据记录', '该影响没有附带可展示的证据。'));
+  hydrateCodeSnippets($('im-evidence'));
+  hydrateCodeSnippets($('im-path'));
 
   var tests = impact.suggestedTests || [];
   setHtml('im-tests', tests.length
@@ -5316,7 +5412,9 @@ function chooseCurrentDir() {
 }
 
 /* The name is a label, so it is derived from the location instead of being typed.
-   This mirrors SourceNames on the server, which stays authoritative. */
+   This mirrors SourceNames on the server, which stays authoritative. Remote locations answer
+   with the program name (the last URL segment), not owner/repo: the label names the program,
+   and the owner is still visible in the location field right next to it. */
 function deriveSourceName(location, type) {
   var raw = String(location || '').trim();
   if (!raw) return '';
@@ -5332,7 +5430,8 @@ function deriveSourceName(location, type) {
     }
     url = url.replace(/[?#].*$/, '').replace(/\/+$/, '');
     if (/\.git$/.test(url)) url = url.slice(0, -4);
-    return url;
+    var cut = url.lastIndexOf('/');
+    return cut < 0 ? url : url.slice(cut + 1);
   }
   var clean = raw.replace(/[\/]+$/, '');
   var parts = clean.split(/[\/]/);
@@ -6202,7 +6301,7 @@ function openDecision(kind, impactId) {
 
 function bindEvents() {
   document.addEventListener('click', function (ev) {
-    var el = ev.target.closest('[data-nav],[data-impact-id],[data-analysis-id],[data-source-id],[data-module],[data-change-id],[data-confirm-impact],[data-dismiss-impact],[data-open-impact],[data-close],[data-open-run],[data-tab],[data-filter],[data-pick-dir],[data-pk-dir],[data-pk-root],[data-delete-source],[data-background-analysis],[data-update-check],[data-update-notes],[data-update-download],[data-update-apply],[data-update-rollback],[data-update-banner-view],[data-update-banner-skip],[data-update-banner-close],[data-update-history],[data-update-history-retry],[data-update-setting],[data-update-restart-retry],[data-edit-source],[data-tag-add],[data-tag-remove],[data-tag-group-toggle],[data-tag-filter],[data-tag-filter-clear],[data-export],[data-import-file],[data-review-page],[data-ai-save],[data-ai-test],[data-ai-clear-key],[data-ai-preset],[data-ai-generate],[data-gitlab-save],[data-gitlab-clear]');
+    var el = ev.target.closest('[data-nav],[data-impact-id],[data-analysis-id],[data-source-id],[data-module],[data-change-id],[data-confirm-impact],[data-dismiss-impact],[data-open-impact],[data-clear-impact],[data-close],[data-open-run],[data-tab],[data-filter],[data-pick-dir],[data-pk-dir],[data-pk-root],[data-delete-source],[data-background-analysis],[data-update-check],[data-update-notes],[data-update-download],[data-update-apply],[data-update-rollback],[data-update-banner-view],[data-update-banner-skip],[data-update-banner-close],[data-update-history],[data-update-history-retry],[data-update-setting],[data-update-restart-retry],[data-edit-source],[data-tag-add],[data-tag-remove],[data-tag-group-toggle],[data-tag-filter],[data-tag-filter-clear],[data-export],[data-import-file],[data-review-page],[data-ai-save],[data-ai-test],[data-ai-clear-key],[data-ai-preset],[data-ai-generate],[data-gitlab-save],[data-gitlab-clear]');
     if (!el) return;
 
     // AI actions. Each one owns its own busy state and re-renders only its own region, so a save
@@ -6331,6 +6430,12 @@ function bindEvents() {
       state.historyFilter = parts[1] || '';
       go('history');
       renderHistory();
+      return;
+    }
+    if (el.hasAttribute('data-clear-impact')) {
+      state.selectedImpactId = null;
+      markSelectedReviewRow(null);
+      renderReviewEvidence();
       return;
     }
     if (el.hasAttribute('data-confirm-impact')) { openDecision('confirmed', el.getAttribute('data-confirm-impact')); return; }

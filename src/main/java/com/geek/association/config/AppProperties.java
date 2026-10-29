@@ -522,6 +522,48 @@ public class AppProperties {
          */
         private int timeoutSeconds = 60;
         /**
+         * Optional explicit wall-clock limit of one AI section; empty means "derive it".
+         *
+         * <p>A deployment knob rather than a settings-page field: it belongs to the shape of the
+         * installation (which endpoint, how slow), not to a per-run experiment, so it lives in
+         * {@code application.yml} and is deliberately absent from {@code ai-settings.json} - a
+         * snapshot that carried it would silently override the deployment value after the first
+         * save from the settings page.
+         */
+        private Integer totalBudgetSeconds;
+
+        public Integer getTotalBudgetSeconds() {
+            return totalBudgetSeconds;
+        }
+
+        public void setTotalBudgetSeconds(Integer totalBudgetSeconds) {
+            this.totalBudgetSeconds = totalBudgetSeconds;
+        }
+
+        /**
+         * Wall-clock limit of one AI section: {@link #totalBudgetSeconds} when set, otherwise
+         * derived from {@link #timeoutSeconds}.
+         *
+         * <p>One request is bounded by {@code timeoutSeconds}, but a report with comments makes up
+         * to a dozen requests (summary, six review chunks, six re-locations, one reflection). The
+         * per-request limit therefore says nothing about how long the analysis sits on its last
+         * progress step, which is what the user actually experiences as "卡在 96%".
+         *
+         * <p>The derived value is three per-request timeouts, floored at 90 and capped at 900
+         * seconds: enough for a slow local model to finish several calls, few enough that a dead
+         * endpoint cannot hold the run for a quarter of an hour. Derived rather than required so
+         * raising the single-request timeout - already tunable on the settings page - raises the
+         * section budget with it instead of silently truncating the review.
+         */
+        public int resolvedTotalBudgetSeconds() {
+            if (totalBudgetSeconds != null && totalBudgetSeconds > 0) {
+                return totalBudgetSeconds;
+            }
+            int perCall = timeoutSeconds <= 0 ? 60 : timeoutSeconds;
+            return Math.max(90, Math.min(900, perCall * 3));
+        }
+
+        /**
          * Whether a new analysis generates the AI review without being asked.
          *
          * Only a default, not a policy: it decides the checkbox state in the run dialog, and each

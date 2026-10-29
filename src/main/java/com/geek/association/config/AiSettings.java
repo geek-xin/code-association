@@ -162,6 +162,11 @@ public class AiSettings {
         out.put("apiKeyMasked", mask(ai.getApiKey()));
         out.put("maxImpacts", ai.getMaxImpacts());
         out.put("timeoutSeconds", ai.getTimeoutSeconds());
+        // Read-only: the section budget is derived from timeoutSeconds unless deployment set
+        // total-budget-seconds in application.yml, so this is the number to quote when the AI card
+        // says the review stopped early. Not part of update(): the settings form must not make it
+        // look like a per-run experiment.
+        out.put("budgetSeconds", ai.resolvedTotalBudgetSeconds());
         out.put("defaultForRuns", ai.isDefaultForRuns());
         out.put("comments", ai.isComments());
         out.put("maxComments", ai.getMaxComments());
