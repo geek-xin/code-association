@@ -292,7 +292,9 @@ public class RepositoryPreparer {
      * <p>The head snapshot is the parent of the oldest selected commit with every selected commit's
      * tree applied on top, so the diff contains precisely the files those commits touched. The base
      * is that oldest commit's parent, which is the only choice that makes "these three commits" a
-     * well-defined change set: the older commits of the branch are not part of the question.</p>
+     * well-defined change set: the older commits of the branch are not part of the question. When
+     * the oldest commit is the repository's first it has no parent, so the base is the empty tree
+     * and every file it contains counts as added.</p>
      *
      * <p>Ordering is by commit topology, not by the order the user clicked: a selection is a set,
      * and applying an older commit over a newer one would resurrect files the newer commit deleted.
@@ -326,11 +328,11 @@ public class RepositoryPreparer {
 
             ObjectId oldest = ids.get(0);
             ObjectId newest = ids.get(ids.size() - 1);
+            // A root commit has no parent, but "what did this commit change" still has an answer:
+            // everything in it. The base is then the empty tree, the same treatment the GIT_DIFF
+            // path already gives a target commit that happens to be the repository's first;
+            // refusing the run made the initial import of every repository impossible to review.
             ObjectId baseId = parentOf(repo, oldest);
-            if (baseId == null) {
-                throw new IOException("选中的提交 " + shortId(oldest)
-                        + " 是仓库的第一个提交，没有可比对的父提交");
-            }
             // Every pick must lie on the line that ends at the newest one. Checking "is it a
             // descendant of the base" is not enough: two commits that both descend from the base
             // but from different branches would each pass, and the overlay would then describe a
@@ -346,7 +348,8 @@ public class RepositoryPreparer {
             int maxBytes = properties.maxFileBytes();
             // Start from the base tree and overlay each selected commit in order: the result is the
             // state the repository would be in if only those commits had been applied.
-            Map<String, String> overlay = GitTreeSource.treeEntries(repo, baseId, maxFiles);
+            Map<String, String> overlay = baseId == null ? new LinkedHashMap<>()
+                    : GitTreeSource.treeEntries(repo, baseId, maxFiles);
             for (int i = 0; i < ids.size(); i++) {
                 ObjectId id = ids.get(i);
                 ObjectId parent = parentOf(repo, id);
@@ -360,13 +363,16 @@ public class RepositoryPreparer {
             pair.repoPath = repo.getDirectory().getParent();
             pair.note = source.name;
             pair.mode = "COMMIT_RANGE";
-            pair.base = new GitTreeSource(repo, baseId, "base " + shortId(baseId), maxFiles, maxBytes);
+            pair.base = baseId == null ? new EmptySource()
+                    : new GitTreeSource(repo, baseId, "base " + shortId(baseId), maxFiles, maxBytes);
             pair.head = GitTreeSource.ofBlobs(repo, overlay,
                     ids.size() == 1 ? "selected " + shortId(ids.get(0))
                             : "selected " + ids.size() + " commits", maxFiles, maxBytes);
-            pair.baseCommit = baseId.name();
+            pair.baseCommit = baseId == null ? "" : baseId.name();
             pair.headCommit = newest.name();
-            pair.baseRef = shortId(baseId);
+            // Same encoding as the GIT_DIFF path for the same situation (a base that is the empty
+            // tree): the ref is blank and the label on the snapshot says what the base is.
+            pair.baseRef = baseId == null ? "" : shortId(baseId);
             pair.headRef = ids.size() == 1 ? shortId(newest) : ids.size() + " 个选中提交";
             pair.selectedCommits = ids.size();
             // Newest first, matching what every other mode puts in this list (and what the report
@@ -378,7 +384,8 @@ public class RepositoryPreparer {
                     pair.commits.add(GitSupport.toInfo(walk.parseCommit(ids.get(i))));
                 }
             }
-            pair.rangeNote = "只分析了选中的 " + ids.size() + " 个提交";
+            pair.rangeNote = "只分析了选中的 " + ids.size() + " 个提交"
+                    + (baseId == null ? "（最早提交没有父提交，基线为空树）" : "");
             return pair;
         }
     }
@@ -407,7 +414,11 @@ public class RepositoryPreparer {
             org.eclipse.jgit.revwalk.RevCommit commit = walk.parseCommit(commitId);
             return commit.getParentCount() == 0 ? null : commit.getParent(0).getId();
         } catch (IOException | RuntimeException e) {
-            log.debug("cannot read the parent of {}: {}", commitId.name(), GitSupport.describe(e));
+            // Callers read null as "this is a root commit". A parent that exists but cannot be
+            // read is therefore worth a warning: the run continues, but the diff it produces is
+            // then the whole tree rather than the commit's own change.
+            log.warn("cannot read the parent of {}, treating it as a root commit: {}",
+                    commitId.name(), GitSupport.describe(e));
             return null;
         }
     }

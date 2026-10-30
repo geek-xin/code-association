@@ -5,6 +5,7 @@ import com.geek.association.diff.FileDiffCollector;
 import com.geek.association.model.CommitInfo;
 import com.geek.association.model.FileChange;
 import com.geek.association.model.RepoSource;
+import com.geek.association.source.EmptySource;
 import com.geek.association.source.RepositoryPreparer;
 import com.geek.association.source.RevisionPair;
 import org.junit.jupiter.api.Test;
@@ -143,6 +144,45 @@ class SelectedCommitsTest {
         List<FileChange> files = new FileDiffCollector(pair.base, pair.head).collect();
         assertEquals(List.of("src/main/java/demo/Demo3.java"),
                 files.stream().map(f -> f.path).toList());
+    }
+
+    @Test
+    void theFirstCommitIsReviewedAgainstTheEmptyTree(@TempDir Path root) throws Exception {
+        repo(root);
+        // The root commit is the one commit a two-endpoint range can never express - its parent
+        // does not exist - but reviewing it is still a well-defined question: every file it
+        // contains is new. Refusing the run made the initial import of a repository unreviewable.
+        RevisionPair pair = prepare(root, sha(root, "master~4"));
+
+        assertEquals(1, pair.selectedCommits);
+        assertEquals(List.of("change 1"), subjectsOf(pair.commits));
+        assertEquals("", pair.baseCommit, "an empty base has no commit to name");
+        assertTrue(pair.base instanceof EmptySource, "the base must be the empty tree, not a commit");
+        assertTrue(pair.base.files().isEmpty(), "and it must expose no files");
+        assertEquals("", pair.baseRef);
+        List<FileChange> files = new FileDiffCollector(pair.base, pair.head).collect();
+        assertEquals(List.of("src/main/java/demo/Demo1.java"),
+                files.stream().map(f -> f.path).toList());
+        assertTrue(pair.head.read("src/main/java/demo/Demo1.java").contains("return 1;"),
+                "the head snapshot is the root commit's tree, not an empty one");
+        assertTrue(pair.rangeNote.contains("基线为空树"), pair.rangeNote);
+    }
+
+    @Test
+    void aSelectionThatStartsAtTheFirstCommitUsesTheEmptyTreeAsBase(@TempDir Path root) throws Exception {
+        repo(root);
+        // The root commit is the oldest pick, so the overlay starts from nothing and applies it
+        // first; the newer pick still contributes exactly its own file, not the ones in between.
+        RevisionPair pair = prepare(root, sha(root, "master~4"), sha(root, "master~1"));
+
+        assertEquals(2, pair.selectedCommits);
+        assertEquals(List.of("change 4", "change 1"), subjectsOf(pair.commits));
+        assertEquals("", pair.baseCommit);
+        assertTrue(pair.base instanceof EmptySource, "the oldest pick is the root commit");
+        assertTrue(pair.base.files().isEmpty());
+        List<String> paths = new FileDiffCollector(pair.base, pair.head).collect().stream()
+                .map(f -> f.path).sorted().toList();
+        assertEquals(List.of("src/main/java/demo/Demo1.java", "src/main/java/demo/Demo4.java"), paths);
     }
 
     @Test
