@@ -34,7 +34,7 @@ class CodeExcerptEndpointTest {
     void returnsTheLinesAroundTheCitedPosition(@TempDir Path temp) throws Exception {
         Fixture f = fixture(temp);
 
-        Map<String, Object> out = f.controller.code(f.analysisId, "A.java", 2, 1, null);
+        Map<String, Object> out = f.controller.code(f.analysisId, "A.java", 2, 1, "window", null);
 
         assertEquals("A.java", out.get("path"));
         assertEquals(2, out.get("line"));
@@ -48,12 +48,37 @@ class CodeExcerptEndpointTest {
     }
 
     @Test
+    void blockModeReturnsTheWholeMethodTheLineLivesIn(@TempDir Path temp) throws Exception {
+        Fixture f = fixture(temp);
+        Files.writeString(f.sourceRoot.resolve("A.java"), """
+                class A {
+                    void m() {
+                        call();
+                    }
+                }
+                """);
+
+        Map<String, Object> out = f.controller.code(f.analysisId, "A.java", 3, 3, "block", null);
+
+        assertEquals(true, out.get("block"));
+        assertEquals("方法", out.get("blockLabel"));
+        assertEquals(2, out.get("startLine"));
+        assertEquals(4, out.get("endLine"));
+        assertEquals(5, out.get("totalLines"));
+        assertEquals("方法 · 第 2–4 行", out.get("caption"));
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> lines = (List<Map<String, Object>>) out.get("lines");
+        assertEquals(3, lines.size());
+        assertEquals("        call();", lines.get(1).get("text"));
+    }
+
+    @Test
     void refusesFilesTheReportNeverCited(@TempDir Path temp) throws Exception {
         Fixture f = fixture(temp);
         Files.writeString(f.sourceRoot.resolve("B.java"), "secret");
 
         IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
-                () -> f.controller.code(f.analysisId, "B.java", 1, 1, null));
+                () -> f.controller.code(f.analysisId, "B.java", 1, 1, "window", null));
         assertTrue(e.getMessage().contains("没有"), e.getMessage());
     }
 
@@ -61,7 +86,7 @@ class CodeExcerptEndpointTest {
     void refusesPathsThatClimbOutOfTheSourceRoot(@TempDir Path temp) throws Exception {
         Fixture f = fixture(temp);
         IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
-                () -> f.controller.code(f.analysisId, "../outside", 1, 1, null));
+                () -> f.controller.code(f.analysisId, "../outside", 1, 1, "window", null));
         assertTrue(e.getMessage().contains("越出"), e.getMessage());
     }
 
@@ -69,7 +94,7 @@ class CodeExcerptEndpointTest {
     void refusesAPeerThatIsNotPartOfTheAnalysis(@TempDir Path temp) throws Exception {
         Fixture f = fixture(temp);
         IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
-                () -> f.controller.code(f.analysisId, "A.java", 1, 1, 99L));
+                () -> f.controller.code(f.analysisId, "A.java", 1, 1, "window", 99L));
         assertTrue(e.getMessage().contains("对比程序"), e.getMessage());
     }
 
@@ -117,7 +142,7 @@ class CodeExcerptEndpointTest {
 
         ApiController controller = new ApiController(store, null, new RepositoryPreparer(properties),
                 properties, null, null, null, null, null);
-        Map<String, Object> out = controller.code(analysis.id, "A.java", 2, 1, peer.id);
+        Map<String, Object> out = controller.code(analysis.id, "A.java", 2, 1, "window", peer.id);
 
         @SuppressWarnings("unchecked")
         List<Map<String, Object>> lines = (List<Map<String, Object>>) out.get("lines");

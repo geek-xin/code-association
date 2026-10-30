@@ -109,6 +109,22 @@ public class GitLabSettings {
     }
 
     /**
+     * The token as a plain map, for the workspace export.
+     *
+     * <p>Only the token lives in this snapshot, and it is omitted unless the caller asked for
+     * secrets: the export file is a shareable artifact by default, and a token that slipped in
+     * silently would be the first thing leaked when the file is sent to a teammate.
+     */
+    public Map<String, Object> exportMap(boolean includeSecrets) {
+        Map<String, Object> out = new LinkedHashMap<>();
+        String token = properties.getGitlab().getToken();
+        if (includeSecrets && !Texts.isBlank(token)) {
+            out.put("token", token);
+        }
+        return out;
+    }
+
+    /**
      * Validates and applies a settings update, then persists the snapshot.
      *
      * The body is optional and the current token is the fallback, so the form can send only what it

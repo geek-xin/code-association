@@ -466,6 +466,9 @@
               </div>
             </div>
           </div>
+          <!-- 报告按风险截断影响清单时，服务端用 report.impactsNote 给出说明；未截断时整块 .hidden。
+               文案与数字全部来自报告，骨架里只留一个空容器。 -->
+          <div id="rv-impacts-note" class="hidden"></div>
           <div class="list" id="rv-findings" style="margin-top:8px"></div>
         </div>
 
@@ -1069,6 +1072,39 @@
 
             <div class="ai-foot">配置保存在 <span class="mono" id="gl-settings-file">—</span></div>
           </div>
+        </div>
+        <!-- One file carries both halves of a machine's setup: the persisted settings and every
+             source. It sits between the GitLab card (whose token it can include) and the
+             sources-only transfer card below, so moving just the sources stays a separate, narrower
+             action. Everything here reuses existing components - no new class, no style.css edit. -->
+        <div class="card" id="card-config" style="grid-column:1/-1">
+          <div class="card-head">
+            <div>
+              <div class="card-title">配置导入导出</div>
+              <div class="card-sub">一个文件带走设置项（AI 审核、GitLab 令牌）与全部代码源；代码源按类型与位置合并，设置项按文件覆盖</div>
+            </div>
+            <div class="card-head-actions">
+              <button class="btn btn-sm" id="cfg-export" data-config-export type="button"
+                      title="下载设置项与全部代码源为 JSON" aria-label="下载设置项与全部代码源为 JSON">
+                <svg><use href="#i-download"/></svg>导出
+              </button>
+              <button class="btn btn-sm btn-primary" id="cfg-import" data-config-import type="button"
+                      title="从 JSON 文件导入设置项与代码源" aria-label="从 JSON 文件导入设置项与代码源">
+                <svg><use href="#i-upload"/></svg>导入
+              </button>
+              <input type="file" id="cfg-file" accept="application/json,.json" hidden/>
+            </div>
+          </div>
+
+          <!-- Never pre-checked: an export silently carrying plaintext secrets is the one mistake
+               this card must not make for the user. The hint states both directions of the rule. -->
+          <div class="stack" style="gap:10px">
+            <label class="checkbox"><input type="checkbox" id="cfg-secrets"/> 包含密钥（API Key / GitLab 令牌，明文）</label>
+            <div class="hint">不勾选时导出的文件里没有任何密钥；导入的文件不含密钥时，保留当前已保存的 Key 与令牌。</div>
+          </div>
+
+          <div class="kv-list" id="cfg-transfer-hint"></div>
+          <div id="cfg-result" style="margin-top:12px"></div>
         </div>
         <div class="card" id="card-transfer" style="grid-column:1/-1">
           <div class="card-head">

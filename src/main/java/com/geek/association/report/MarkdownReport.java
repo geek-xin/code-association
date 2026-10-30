@@ -131,6 +131,17 @@ public final class MarkdownReport {
         }
         if (report.impacts.isEmpty()) {
             sb.append("本次变更未发现对其他程序的影响。\n");
+        } else if (report.impactsTotal > Math.min(count, maxImpacts)) {
+            // The export has its own row limit (a PR comment cannot hold thousands of rows), and the
+            // stored report is capped too. State both numbers so the omitted rows are never read as
+            // "the analysis found nothing else".
+            int listed = Math.min(count, maxImpacts);
+            sb.append("> 共 ").append(report.impactsTotal).append(" 处影响，本段列出前 ").append(listed)
+                    .append(" 处（按风险排序）");
+            if (report.impactsTruncated > 0) {
+                sb.append("；报告清单只保留风险最高的 ").append(report.impactsShown).append(" 处");
+            }
+            sb.append("。\n");
         }
         sb.append('\n');
 

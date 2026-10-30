@@ -1442,8 +1442,10 @@ input[type="date"]::-webkit-calendar-picker-indicator { cursor: pointer; }
 .ev-main { color: var(--text); margin-top: 3px; word-break: break-word; }
 .ev-meta { color: var(--text-3); margin-top: 2px; font-family: var(--mono); font-size: 10.5px; word-break: break-word; }
 
-/* 证据行内联的源码窗口：引用行上下各 3 行，引用行高亮；横向滚动只发生在片段内部。 */
+/* 证据行内联的源码：默认是引用行所在的整个方法 / 类型 / XML 元素，引用行高亮；
+   片段上方一行小字说明范围（超长块会写成"共 N 行，展示第 a–b 行"）；横向滚动只发生在片段内部。 */
 .code-snippet-host:not(:empty) { margin-top: 7px; }
+.code-snippet-caption { margin-bottom: 4px; font-size: 10.5px; color: var(--text-3); }
 .code-snippet {
   margin: 0;
   padding: 5px 0;

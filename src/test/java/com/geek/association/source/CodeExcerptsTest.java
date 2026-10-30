@@ -9,6 +9,7 @@ import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -103,6 +104,108 @@ class CodeExcerptsTest {
         assertEquals("a/b/C.java", CodeExcerpts.normalizeRelativePath("a\\b\\C.java"));
         assertEquals("a/C.java", CodeExcerpts.normalizeRelativePath("./a/C.java"));
         assertFalse(CodeExcerpts.normalizeRelativePath("a/C.java").startsWith("/"));
+    }
+
+    // --------------------------------------------------------------- block mode
+
+    @Test
+    void blockModeReturnsTheWholeMethodWithACaption() {
+        String src = """
+                class A {
+                    void one() {
+                        int a = 1;
+                    }
+
+                    void two() {
+                        call();
+                    }
+                }
+                """;
+
+        CodeExcerpts.Excerpt ex = CodeExcerpts.blockFromText("A.java", src, 7, "abc12345");
+
+        assertTrue(ex.block());
+        assertEquals("方法", ex.blockLabel());
+        assertEquals(6, ex.startLine());
+        assertEquals(8, ex.endLine());
+        assertEquals(List.of(6, 7, 8), numbers(ex));
+        assertEquals("方法 · 第 6–8 行", ex.caption());
+        assertEquals(9, ex.totalLines());
+        assertEquals("abc12345", ex.revision());
+        assertNull(ex.note());
+    }
+
+    @Test
+    void aOneLineMethodIsNamedByItsSingleLine() {
+        String src = "class A {\n    void m() { call(); }\n}\n";
+
+        CodeExcerpts.Excerpt ex = CodeExcerpts.blockFromText("A.java", src, 2, null);
+
+        assertTrue(ex.block());
+        assertEquals("方法 · 第 2 行", ex.caption());
+    }
+
+    @Test
+    void blockModeReadsFromDiskWithTheSameRules(@TempDir Path dir) throws Exception {
+        Path file = dir.resolve("A.java");
+        Files.writeString(file, "class A {\n    void m() {\n        call();\n    }\n}\n");
+
+        CodeExcerpts.Excerpt ex = CodeExcerpts.blockFromFile(file, "A.java", 3);
+
+        assertTrue(ex.block());
+        assertEquals(2, ex.startLine());
+        assertEquals(4, ex.endLine());
+    }
+
+    @Test
+    void aSqlStatementIsReturnedAsOneBlock() {
+        String src = "create table t (\n  id int,\n  name varchar(8)\n);\n";
+
+        CodeExcerpts.Excerpt ex = CodeExcerpts.blockFromText("V1.sql", src, 2, null);
+
+        assertTrue(ex.block());
+        assertEquals(1, ex.startLine());
+        assertEquals(4, ex.endLine());
+        assertEquals("SQL 语句 · 第 1–4 行", ex.caption());
+    }
+
+    @Test
+    void blockModeFallsBackToAWindowWhenTheFileHasNoBlocks() {
+        CodeExcerpts.Excerpt ex = CodeExcerpts.blockFromText("app.properties", "a=1\nb=2\nc=3", 2, null);
+
+        assertFalse(ex.block());
+        assertEquals(1, ex.startLine());
+        assertEquals(3, ex.endLine());
+        assertEquals("引用行上下 " + CodeExcerpts.BLOCK_FALLBACK_CONTEXT + " 行", ex.caption());
+    }
+
+    @Test
+    void aBlockLongerThanTheCapIsCutAroundTheCitedLineAndSaysSo() {
+        StringBuilder sb = new StringBuilder("class Big {\n");
+        for (int i = 2; i <= 400; i++) {
+            sb.append("    // line ").append(i).append('\n');
+        }
+        sb.append("}\n");
+
+        CodeExcerpts.Excerpt ex = CodeExcerpts.blockFromText("Big.java", sb.toString(), 300, null);
+
+        assertTrue(ex.block());
+        assertEquals(CodeExcerpts.MAX_BLOCK_LINES, ex.lines().size());
+        assertTrue(ex.startLine() <= 300 && 300 <= ex.endLine());
+        assertEquals("类型 · 共 401 行，展示第 220–379 行", ex.caption());
+        assertEquals(401, ex.totalLines());
+    }
+
+    @Test
+    void blockModeStillReportsALinePastTheEnd() {
+        CodeExcerpts.Excerpt ex = CodeExcerpts.blockFromText("A.java", "class A {\n}", 9, null);
+
+        assertTrue(ex.lines().isEmpty());
+        assertTrue(ex.note().contains("2"), ex.note());
+    }
+
+    private static List<Integer> numbers(CodeExcerpts.Excerpt ex) {
+        return ex.lines().stream().map(CodeExcerpts.Line::number).toList();
     }
 
     private static String lines(int count) {

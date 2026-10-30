@@ -31,6 +31,27 @@ public class ImpactReport {
     public List<ModuleImpact> moduleImpacts = new ArrayList<>();
     public List<ChangeView> changes = new ArrayList<>();
     public List<ImpactView> impacts = new ArrayList<>();
+    /**
+     * How many impacts this run found, before the list was capped for storage.
+     *
+     * <p>Equal to {@link Summary#impactedSymbols}. Kept next to the list because a reader that only
+     * sees {@code impacts} cannot otherwise tell "the run found 5,000" from "the run found 412,000
+     * and this is the top of it" - and a review page silently showing a subset as if it were the
+     * whole result is the kind of omission the report exists to avoid.</p>
+     */
+    public int impactsTotal;
+    /** How many rows {@link #impacts} actually carries. */
+    public int impactsShown;
+    /** Found impacts absent from {@link #impacts} because of the cap; 0 when the list is complete. */
+    public int impactsTruncated;
+    /**
+     * One sentence explaining the cap, or null when the list is complete.
+     *
+     * <p>The wording lives here rather than in the page: the same sentence has to make sense in the
+     * JSON export, the Markdown report and the review screen, so there is one place to keep it
+     * accurate instead of three.</p>
+     */
+    public String impactsNote = null;
     public List<ModuleEdge> moduleGraph = new ArrayList<>();
     public Map<String, String> diffs = new LinkedHashMap<>();
     public List<String> notes = new ArrayList<>();

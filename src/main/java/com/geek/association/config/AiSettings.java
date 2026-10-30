@@ -179,6 +179,36 @@ public class AiSettings {
     }
 
     /**
+     * The editable settings as a plain map, for the workspace export.
+     *
+     * <p>Exactly the fields the settings page controls - the same set the snapshot file holds.
+     * Derived values ({@code budgetSeconds}) and machine state ({@code settingsFile},
+     * {@code configuredBy}) are deliberately absent: they describe this process, not a
+     * configuration someone could carry to another machine.
+     *
+     * <p>The key is included only when the caller asked for secrets. The settings page never does,
+     * and the export file is a shareable artifact by default, so a key that slipped in silently
+     * would be the first thing leaked when the file is sent to a teammate.
+     */
+    public Map<String, Object> exportMap(boolean includeSecrets) {
+        AppProperties.Ai ai = properties.getAi();
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("enabled", ai.isEnabled());
+        out.put("baseUrl", ai.getBaseUrl());
+        out.put("model", ai.getModel());
+        if (includeSecrets && !Texts.isBlank(ai.getApiKey())) {
+            out.put("apiKey", ai.getApiKey());
+        }
+        out.put("maxImpacts", ai.getMaxImpacts());
+        out.put("timeoutSeconds", ai.getTimeoutSeconds());
+        out.put("defaultForRuns", ai.isDefaultForRuns());
+        out.put("comments", ai.isComments());
+        out.put("maxComments", ai.getMaxComments());
+        out.put("reflection", ai.isReflection());
+        return out;
+    }
+
+    /**
      * Validates and applies a settings update, then persists the whole snapshot.
      *
      * Every field is optional, and the current value is the fallback for a missing one, so the form

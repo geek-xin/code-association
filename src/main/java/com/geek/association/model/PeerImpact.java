@@ -1,5 +1,7 @@
 package com.geek.association.model;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
+
 import java.util.ArrayList;
 import java.util.List;
 
@@ -27,6 +29,17 @@ public class PeerImpact {
     /** Set when the peer could not be indexed; the reason is shown instead of results. */
     public String note;
     public List<ContractMatch> matches = new ArrayList<>();
+    /**
+     * The impact rows behind this peer's counts.
+     *
+     * <p>Deliberately absent from the serialised report: {@code ImpactReport.impacts} already
+     * carries every one of these rows as the view the UI renders, and writing both copies meant a
+     * large report held the same several hundred megabytes twice - the second copy is what pushed
+     * it past Jackson's 2 GiB text-buffer limit. The list stays populated in memory while a run is
+     * being assembled, because the report builder reads it; a report read back from the database
+     * has it empty, and any reader must use {@code report.impacts} instead.</p>
+     */
+    @JsonIgnore
     public List<ImpactResult> impacts = new ArrayList<>();
     public int impactedSymbols;
     public int impactedModules;

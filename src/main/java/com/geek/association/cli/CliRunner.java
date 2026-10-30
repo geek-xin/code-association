@@ -154,7 +154,8 @@ public class CliRunner implements ApplicationRunner, ExitCodeGenerator {
             return;
         }
         List<PeerImpact> peers = peerImpacts(changes, headIndex, peerLocations);
-        ImpactReport report = new ReportBuilder().build(revisions, headIndex, baseIndex, changes,
+        ImpactReport report = new ReportBuilder(properties.getMaxReportImpacts())
+                .build(revisions, headIndex, baseIndex, changes,
                 List.of(), diffs, peers);
         report.peers = peers;
         report.peersNote = peers.isEmpty()

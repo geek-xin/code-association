@@ -3,12 +3,15 @@ package com.geek.association;
 import com.geek.association.config.AppProperties;
 import com.geek.association.model.Analysis;
 import com.geek.association.model.RepoSource;
+import com.geek.association.report.ImpactReport;
+import com.geek.association.service.AnalysisService;
 import com.geek.association.store.Store;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Path;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -84,6 +87,30 @@ class AnalysisReportReadTest {
         assertNull(store.analyses(30).get(0).reportJson, "the queue list must not read report_json");
         assertNull(store.analysesOfSource(analysis.sourceId).get(0).reportJson,
                 "the per-source list must not read report_json");
+    }
+
+    /**
+     * 老报告没有 impactsTotal / impactsShown / impactsTruncated 这三个字段。
+     *
+     * <p>反序列化后它们是 0，页头会把一份完整报告显示成「0 项影响」，而影响列表就在下面。
+     * 读取时用清单条数补齐：老报告从未截断，清单就是全部结果。</p>
+     */
+    @Test
+    void legacyReportWithoutCapFieldsIsBackfilledFromTheList(@TempDir Path tmp) {
+        AppProperties properties = new AppProperties();
+        properties.setDataDir(tmp.toString());
+        Store store = new Store(properties);
+        store.init();
+        Analysis analysis = finishedRun(store, Map.of("impacts",
+                List.of(Map.of("id", 1), Map.of("id", 2), Map.of("id", 3))));
+
+        ImpactReport report = new AnalysisService(store, properties, null, null).report(analysis.id);
+
+        assertNotNull(report);
+        assertEquals(3, report.impactsTotal);
+        assertEquals(3, report.impactsShown);
+        assertEquals(0, report.impactsTruncated);
+        assertNull(report.impactsNote, "没有截断就不该出现截断说明");
     }
 
     @Test

@@ -73,12 +73,14 @@ const UNTAGGED_GROUP = '未分类';
 const REVIEW_PAGE_SIZE = 50;
 
 /**
- * 证据行内联源码时，引用行上下各取几行。
+ * 证据行内联源码的取法。
  *
- * 3 行足够看清一个条件或调用的上下文，又不至于让证据面板变成文件阅读器；
- * 服务端还会把它夹在 0..10 之间。
+ * 以前取引用行上下各 3 行：够看清一个条件，却常常把方法签名和结尾切在窗口外，
+ * 读者仍然要回仓库确认"这是哪个方法"。现在固定向服务端要 `mode=block` ——
+ * 引用行所在的整个方法 / 类型 / XML 元素 / SQL 语句；超长块由服务端截到引用行附近并在
+ * caption 里说明，没有块边界的文件（properties / yml）退化为上下各 10 行。
  */
-const SNIPPET_CONTEXT = 3;
+const SNIPPET_MODE = 'block';
 
 function esc(v) {
   return String(v == null ? '' : v)
@@ -200,7 +202,7 @@ var state = {
    */
   impactCache: { analysisId: null, source: null, sorted: null, stats: null },
   /**
-   * 证据源码片段的渲染缓存，键为 分析 id|peerId|路径|行号。
+   * 证据源码片段的渲染缓存，键为 分析 id|取法|peerId|路径|行号。
    * 选中/复核会反复重建证据面板，同一段代码不应该每次都再请求一次。
    */
   codeCache: {},
@@ -983,6 +985,29 @@ function renderReviewPeerStrip(report) {
 }
 
 /**
+ * 报告把跨程序影响按风险截断后才落库（默认保留前 5000 条，见 code-association.max-report-impacts），
+ * 截断时服务端给一句 report.impactsNote 说明保留了多少、还有多少只计数没列出来。
+ *
+ * 这段说明必须跟着报告一起刷新：换到一份没有截断的报告时要把整块清掉，
+ * 否则上一条报告的"已截断"会留在新报告上方，把完整清单说成残缺的。
+ * 未截断时 impactsNote 是 null（老报告连字段都没有），此时整块退出布局，
+ * 不在列表上方留一条空的 callout。
+ */
+function renderReviewImpactsNote(report) {
+  var host = $('rv-impacts-note');
+  if (!host) return;
+  var note = report && report.impactsNote;
+  if (!note) {
+    host.className = 'hidden';
+    host.innerHTML = '';
+    return;
+  }
+  // 与 reviewContractHitsHtml 的"未比较"提示同款：警告色 callout + 圆圈感叹号。
+  host.className = 'callout warning';
+  host.innerHTML = icon('i-alert-circle') + '<div>' + esc(note) + '</div>';
+}
+
+/**
  * 未选中发现时证据面板的内容：本轮命中的契约与对方使用点。
  *
  * 这张表原来在独立的「对其他程序的影响」卡里，和发现列表把同一批影响列了两遍。
@@ -1546,7 +1571,11 @@ function renderReviewCounters(counts) {
     statsHost.innerHTML = [
       statTile('i-database', '对比程序', fmtNum((report && report.summary && report.summary.comparedPrograms) || 0), 'brand'),
       statTile('i-network', '命中契约', fmtNum((report && report.summary && report.summary.matchedContracts) || 0), 'brand'),
-      statTile('i-alert', '高风险影响', impactStats().highRisk, 'danger'),
+      // 用 summary 的全量计数，而不是 impactStats()（它只统计清单里的条目）：
+      // 清单被截断后，高风险影响的总数仍要完整，否则统计卡会比页头少一大截。
+      statTile('i-alert', '高风险影响',
+        fmtNum((report && report.summary && typeof report.summary.highRisk === 'number')
+          ? report.summary.highRisk : impactStats().highRisk), 'danger'),
       statTile('i-check-circle', '已确认', counts.confirmed, 'success')
     ].join('');
   }
@@ -1556,6 +1585,7 @@ function renderReview() {
   var report = state.report;
   var counts = reviewCounts();
   renderReviewPeerStrip(report);
+  renderReviewImpactsNote(report);
   var setText = function (id, v) { var el = $(id); if (el) el.textContent = v; };
 
   var pickedSource = currentSource();
@@ -1574,9 +1604,21 @@ function renderReview() {
       // 对比程序已经压成列表标题下的 pill，页头不再重复一遍；只有"本轮没做跨程序扫描"
       // 这条例外信息需要在这里说清楚，否则空列表会被读成"没有影响"。
       var noPeers = !((report.peers || []).length);
+      // 列表可能是截断后的子集，所以页头"发现了多少影响"用全量的 impactsTotal；
+      // counts.total 只是清单条数，继续留给标签计数与分页，两者不能互相替代。
+      // 老报告没有这些字段时回退到 counts.total，与改造前完全一致。
+      // > 0 而不是 !== undefined：老报告反序列化后字段是 0（int 默认值），直接用会把一份完整
+      // 报告显示成「0 项影响」。真的一份都没有时 counts.total 也是 0，回退不会说错。
+      var impactsTotal = (typeof report.impactsTotal === 'number' && report.impactsTotal > 0)
+        ? report.impactsTotal : counts.total;
+      var impactsShown = typeof report.impactsShown === 'number' ? report.impactsShown : counts.total;
+      var truncated = (report.impactsTruncated || 0) > 0;
       sub.innerHTML = esc(report.baseLabel || '') + ' → ' + esc(report.headLabel || '') +
         (noPeers ? ' <span class="sep">·</span> 本次未选择其他程序，未执行跨程序扫描' : '') +
-        ' <span class="sep">·</span> ' + counts.total + ' 项影响，' + counts.pending + ' 项待复核' +
+        ' <span class="sep">·</span> ' + fmtNum(impactsTotal) + ' 项影响' +
+        // 截断而不说，等于让用户以为影响只有列表里这么多。
+        (truncated ? '（列表只保留风险最高的 ' + fmtNum(impactsShown) + ' 项）' : '') +
+        '，' + counts.pending + ' 项待复核' +
         ' <span class="sep">·</span> 复核结果仅保存在本地浏览器';
     } else {
       var picked = currentSource();
@@ -1821,7 +1863,10 @@ function renderReviewEvidence() {
  */
 function codeSnippetPlaceholder(peerId, file, line) {
   if (!file || !line || state.analysisId == null) return '';
-  return '<div class="code-snippet-host" data-code-peer="' + esc(peerId == null ? '' : String(peerId)) +
+  // 报告里的 peerSourceId 是 long：本程序内部影响落库后是 0 而不是 null。把 0 当成对比程序 id
+  // 传下去，服务端会回答「这次分析里没有该对比程序」，整段证据链就只剩一行错误提示。
+  var peer = (peerId == null || peerId === '' || Number(peerId) === 0) ? '' : String(peerId);
+  return '<div class="code-snippet-host" data-code-peer="' + esc(peer) +
     '" data-code-path="' + esc(file) + '" data-code-line="' + Number(line) + '"></div>';
 }
 
@@ -1840,14 +1885,14 @@ function loadCodeSnippet(node) {
   var path = node.getAttribute('data-code-path');
   var line = Number(node.getAttribute('data-code-line')) || 0;
   var peer = node.getAttribute('data-code-peer') || '';
-  var key = state.analysisId + '|' + peer + '|' + path + '|' + line;
+  var key = state.analysisId + '|' + SNIPPET_MODE + '|' + peer + '|' + path + '|' + line;
   if (Object.prototype.hasOwnProperty.call(state.codeCache, key)) {
     node.innerHTML = state.codeCache[key];
     return;
   }
   node.setAttribute('data-code-loading', '1');
   var url = '/analyses/' + state.analysisId + '/code?path=' + encodeURIComponent(path) +
-    '&line=' + line + '&context=' + SNIPPET_CONTEXT +
+    '&line=' + line + '&mode=' + SNIPPET_MODE +
     (peer ? '&peerId=' + encodeURIComponent(peer) : '');
   api(url).then(function (res) {
     var html = codeSnippetHtml(res);
@@ -1875,7 +1920,9 @@ function codeSnippetHtml(res) {
       '<span class="code-n">' + l.number + '</span>' +
       '<span class="code-t">' + esc(l.text) + (l.truncated ? '…' : '') + '</span></span>';
   }).join('');
-  return '<pre class="code-snippet">' + rows + '</pre>' +
+  // caption 说明这段代码是什么（方法 / 类型 / 元素与行范围）；note 只留给"读不到分析版本"这类异常。
+  return (res.caption ? '<div class="code-snippet-caption">' + esc(res.caption) + '</div>' : '') +
+    '<pre class="code-snippet">' + rows + '</pre>' +
     (res.note ? '<div class="code-snippet-note">' + esc(res.note) + '</div>' : '');
 }
 
@@ -6100,6 +6147,162 @@ function renderTransferHint() {
   ].join('');
 }
 
+/* ------------------------------------------------- config import / export */
+/*
+ * The config file is the whole-machine unit: the persisted settings plus every source. It sits next
+ * to the sources-only transfer above because those are two different intentions - "move this
+ * install" versus "copy my sources over" - and the narrower one stays available on its own.
+ *
+ * Same mechanics as the sources pair: a plain GET for the download (the server already sets
+ * Content-Disposition) and a parsed-JSON POST for the upload, so a malformed file is rejected
+ * before it reaches the server and there is no multipart endpoint to secure.
+ */
+
+function exportConfig() {
+  // Read at click time, never cached: the checkbox is the only thing deciding whether plaintext
+  // secrets leave this machine, and a stale copy of that decision is not acceptable.
+  var secrets = $('cfg-secrets');
+  var withSecrets = !!(secrets && secrets.checked);
+  window.location = '/api/settings/export' + (withSecrets ? '?secrets=1' : '');
+  toast(withSecrets ? '已开始下载配置 JSON（含密钥明文）' : '已开始下载配置 JSON（不含密钥）');
+}
+
+/** Reads the chosen file, parses it, and hands it to the config import endpoint. */
+function onConfigFileChosen(input) {
+  var file = input && input.files ? input.files[0] : null;
+  if (!file) return;
+  var host = $('cfg-result');
+  if (file.size > 8 * 1024 * 1024) {
+    if (host) host.innerHTML = '<div class="callout danger"><svg><use href="#i-alert-circle"/></svg><div>文件超过 8 MB，配置文件不应该这么大，请确认选的是导出文件。</div></div>';
+    input.value = '';
+    return;
+  }
+  var reader = new FileReader();
+  reader.onload = function () {
+    var payload;
+    try {
+      payload = JSON.parse(String(reader.result || ''));
+    } catch (e) {
+      if (host) host.innerHTML = '<div class="callout danger"><svg><use href="#i-alert-circle"/></svg><div>不是合法的 JSON 文件，请选择由「导出」生成的 .json。</div></div>';
+      toast('不是合法的 JSON 文件', 'error');
+      input.value = '';
+      return;
+    }
+    importConfigPayload(payload);
+    input.value = '';
+  };
+  reader.onerror = function () {
+    if (host) host.innerHTML = '<div class="callout danger"><svg><use href="#i-alert-circle"/></svg><div>读取文件失败，请重试。</div></div>';
+    input.value = '';
+  };
+  reader.readAsText(file);
+}
+
+/**
+ * Sends a parsed config payload and renders the outcome.
+ *
+ * Partial success is the normal case - a section this build rejects, or a path that does not exist
+ * on this machine - so settings and sources are reported separately and never collapsed into
+ * "导入失败". A file exported from the sources-only card is accepted as well; its settings section
+ * is then simply empty.
+ */
+async function importConfigPayload(payload) {
+  var host = $('cfg-result');
+  if (host) host.innerHTML = '<div class="empty-hint">导入中…</div>';
+  try {
+    var result = await api('/settings/import', { method: 'POST', body: JSON.stringify(payload) });
+    renderConfigResult(result);
+    // The server has already written both halves, so every client cache describing them is now a
+    // statement about the file's previous state: drop it before anything re-renders, otherwise the
+    // AI / GitLab forms keep showing the pre-import values until the next page load.
+    state.ai.loaded = false;
+    state.ai.formFilled = false;
+    state.gitlab.loaded = false;
+    state.gitlab.formFilled = false;
+    state.health = null;
+    await renderSettings();
+    await refreshAll(false);
+    await loadTags();
+    renderNavSources();
+    renderSourcesPage();
+
+    var applied = (result.settings && result.settings.applied) || [];
+    var sources = result.sources || {};
+    var created = sources.created || 0;
+    var updated = sources.updated || 0;
+    var changed = !!(applied.length || created || updated);
+    var parts = [];
+    if (applied.length) parts.push(applied.map(configSectionLabel).join('、') + ' 已应用');
+    if (created || updated) parts.push('代码源 新建 ' + created + ' / 更新 ' + updated);
+    if (!parts.length) parts.push('文件里没有可导入的内容');
+    var failed = ((result.settings && result.settings.errors) || []).length +
+      (sources.errors || []).length;
+    toast(parts.join('；') + (failed ? '（' + failed + ' 项未导入，见下方原因）' : ''),
+      changed ? 'success' : 'error');
+  } catch (e) {
+    if (host) {
+      host.innerHTML = '<div class="callout danger"><svg><use href="#i-alert-circle"/></svg><div>' +
+        esc('导入失败：' + e.message) + '</div></div>';
+    }
+    toast('导入失败：' + e.message, 'error');
+  }
+}
+
+/** Chinese label for a settings section key; unknown keys fall back to the raw key. */
+function configSectionLabel(section) {
+  if (section === 'ai') return 'AI 审核';
+  if (section === 'gitlab') return 'GitLab 令牌';
+  return section || '设置项';
+}
+
+/**
+ * Renders the per-file summary: what was applied to the settings, the source counts, and one row
+ * per rejected item. Settings failures carry a section instead of an index, but they belong in the
+ * same list - one scrollable place for "what did not make it in".
+ */
+function renderConfigResult(result) {
+  var host = $('cfg-result');
+  if (!host || !result) return;
+  var settings = result.settings || {};
+  var sources = result.sources || {};
+  var applied = settings.applied || [];
+  var counts = [
+    kvRow('设置项', applied.length ? applied.map(configSectionLabel).join('、') : '文件里没有设置项'),
+    kvRow('密钥', settings.secretsImported ? '已随文件导入（明文）' : '未包含，保留当前值'),
+    kvRow('代码源 读取', (sources.total || 0) + ' 条'),
+    kvRow('新建', (sources.created || 0) + ' 条'),
+    kvRow('更新（已存在，合并标签）', (sources.updated || 0) + ' 条'),
+    kvRow('跳过', (sources.skipped || 0) + ' 条')
+  ].join('');
+  var errors = (settings.errors || []).map(function (e) {
+    return '<div class="import-error">' +
+      '<span class="idx">设置</span>' +
+      '<span class="nm">' + esc(configSectionLabel(e.section)) + '</span>' +
+      '<span class="why">' + esc(e.reason || '') + '</span></div>';
+  }).concat((sources.errors || []).map(function (e) {
+    return '<div class="import-error">' +
+      '<span class="idx">#' + esc(e.index == null ? '?' : e.index) + '</span>' +
+      '<span class="nm">' + esc(e.name || '（未命名）') + '</span>' +
+      '<span class="why">' + esc(e.reason || '') + '</span></div>';
+  })).join('');
+  host.innerHTML = '<div class="import-summary">' +
+    '<div class="import-counts">' + counts + '</div>' +
+    (errors ? '<div class="import-errors">' + errors + '</div>' : '') +
+    '</div>';
+}
+
+/** Static explanation under the config card's title; the secret rule is stated in both directions. */
+function renderConfigHint() {
+  var host = $('cfg-transfer-hint');
+  if (!host) return;
+  host.innerHTML = [
+    kvRow('导出内容', 'AI 审核设置、GitLab 令牌与全部代码源'),
+    kvRow('不导出', '本机 id、同步状态、时间戳（换机器后无意义）'),
+    kvRow('导入规则', '设置项按文件覆盖；代码源按类型 + 位置合并，标签取并集'),
+    kvRow('密钥规则', '默认不含；文件里没有密钥时保留已保存的 Key 与令牌')
+  ].join('');
+}
+
 /* ------------------------------------------------------- source edit mode */
 
 /**
@@ -6301,7 +6504,7 @@ function openDecision(kind, impactId) {
 
 function bindEvents() {
   document.addEventListener('click', function (ev) {
-    var el = ev.target.closest('[data-nav],[data-impact-id],[data-analysis-id],[data-source-id],[data-module],[data-change-id],[data-confirm-impact],[data-dismiss-impact],[data-open-impact],[data-clear-impact],[data-close],[data-open-run],[data-tab],[data-filter],[data-pick-dir],[data-pk-dir],[data-pk-root],[data-delete-source],[data-background-analysis],[data-update-check],[data-update-notes],[data-update-download],[data-update-apply],[data-update-rollback],[data-update-banner-view],[data-update-banner-skip],[data-update-banner-close],[data-update-history],[data-update-history-retry],[data-update-setting],[data-update-restart-retry],[data-edit-source],[data-tag-add],[data-tag-remove],[data-tag-group-toggle],[data-tag-filter],[data-tag-filter-clear],[data-export],[data-import-file],[data-review-page],[data-ai-save],[data-ai-test],[data-ai-clear-key],[data-ai-preset],[data-ai-generate],[data-gitlab-save],[data-gitlab-clear]');
+    var el = ev.target.closest('[data-nav],[data-impact-id],[data-analysis-id],[data-source-id],[data-module],[data-change-id],[data-confirm-impact],[data-dismiss-impact],[data-open-impact],[data-clear-impact],[data-close],[data-open-run],[data-tab],[data-filter],[data-pick-dir],[data-pk-dir],[data-pk-root],[data-delete-source],[data-background-analysis],[data-update-check],[data-update-notes],[data-update-download],[data-update-apply],[data-update-rollback],[data-update-banner-view],[data-update-banner-skip],[data-update-banner-close],[data-update-history],[data-update-history-retry],[data-update-setting],[data-update-restart-retry],[data-edit-source],[data-tag-add],[data-tag-remove],[data-tag-group-toggle],[data-tag-filter],[data-tag-filter-clear],[data-export],[data-import-file],[data-config-export],[data-config-import],[data-review-page],[data-ai-save],[data-ai-test],[data-ai-clear-key],[data-ai-preset],[data-ai-generate],[data-gitlab-save],[data-gitlab-clear]');
     if (!el) return;
 
     // AI actions. Each one owns its own busy state and re-renders only its own region, so a save
@@ -6371,6 +6574,9 @@ function bindEvents() {
 
     if (el.hasAttribute('data-export')) { exportSources(); return; }
     if (el.hasAttribute('data-import-file')) { $('xfer-file').click(); return; }
+    // The config pair is the wider file: settings plus every source (see exportConfig()).
+    if (el.hasAttribute('data-config-export')) { exportConfig(); return; }
+    if (el.hasAttribute('data-config-import')) { $('cfg-file').click(); return; }
 
     if (el.hasAttribute('data-delete-source')) {
       // The delete control sits inside a clickable row, so stop it from also selecting the source.
@@ -6602,6 +6808,7 @@ function bindEvents() {
   renderTagInput('src');
   renderTagInput('m');
   renderTransferHint();
+  renderConfigHint();
 
   var search = $('global-search');
   if (search) {
@@ -6642,6 +6849,8 @@ function bindEvents() {
   // The file input is opened by the 导入 button; the change fires once a file is picked.
   var xferFile = $('xfer-file');
   if (xferFile) xferFile.addEventListener('change', function () { onImportFileChosen(xferFile); });
+  var cfgFile = $('cfg-file');
+  if (cfgFile) cfgFile.addEventListener('change', function () { onConfigFileChosen(cfgFile); });
 
   // Tag fields: Enter or comma commits, Backspace on an empty field removes the last chip.
   // Bound per field rather than through the click delegate because these are keystrokes.

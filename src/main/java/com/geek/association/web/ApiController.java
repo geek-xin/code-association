@@ -735,8 +735,16 @@ public class ApiController {
     }
 
     /**
-     * A few source lines around one evidence position, so the review screen can show the code
-     * instead of only a file:line the reader has to open by hand.
+     * The source under one evidence position, so the review screen can show the code instead of
+     * only a file:line the reader has to open by hand.
+     *
+     * <p>{@code mode=block} (what the review screen sends) returns the whole code block the cited
+     * line lives in — a method body, a type body, an XML element — because three lines around a call
+     * site cut the signature away and leave the reader unable to tell which method the evidence is
+     * about. Files without block boundaries, and blocks longer than the cap, fall back to a window
+     * and say so in {@code caption} / {@code note}. {@code mode=window} is the explicit old
+     * behaviour: {@code context} lines above and below, {@code context} capped at
+     * {@link CodeExcerpts#MAX_CONTEXT}.</p>
      *
      * <p>The revision is the one the analysis actually read: the recorded head commit for this
      * program, the peer's recorded commit for a compared program. A plain directory has no
@@ -748,9 +756,11 @@ public class ApiController {
                                     @RequestParam("path") String path,
                                     @RequestParam(value = "line", defaultValue = "1") int line,
                                     @RequestParam(value = "context", defaultValue = "3") int context,
+                                    @RequestParam(value = "mode", defaultValue = "window") String mode,
                                     @RequestParam(value = "peerId", required = false) Long peerId) {
         CodeContext analysisContext = codeContext(id);
         ImpactReport report = analysisContext.report();
+        boolean block = "block".equalsIgnoreCase(mode);
         String rel = CodeExcerpts.normalizeRelativePath(path);
         // The endpoint reads files, so it reads only files this report already points at. A local
         // service must not become a general file browser for whoever can reach the port.
@@ -813,7 +823,10 @@ public class ApiController {
                 }
                 String text = tree.read(rel);
                 if (text != null) {
-                    return excerpt(CodeExcerpts.fromText(rel, text, line, context, shortCommit(commit)));
+                    String revision = shortCommit(commit);
+                    return excerpt(block
+                            ? CodeExcerpts.blockFromText(rel, text, line, revision)
+                            : CodeExcerpts.fromText(rel, text, line, context, revision));
                 }
                 fallbackNote = "分析版本里无法读取该文件，以下为当前工作区";
             } catch (IllegalArgumentException | IOException e) {
@@ -829,10 +842,11 @@ public class ApiController {
             if (!real.startsWith(root.toRealPath())) {
                 throw new IllegalArgumentException("路径越出了代码源目录");
             }
-            CodeExcerpts.Excerpt ex = CodeExcerpts.fromFile(real, rel, line, context);
+            CodeExcerpts.Excerpt ex = block
+                    ? CodeExcerpts.blockFromFile(real, rel, line)
+                    : CodeExcerpts.fromFile(real, rel, line, context);
             if (fallbackNote != null) {
-                ex = new CodeExcerpts.Excerpt(ex.path(), ex.line(), ex.startLine(), ex.endLine(),
-                        ex.lines(), "worktree", joinNote(fallbackNote, ex.note()));
+                ex = ex.relabel("worktree", joinNote(fallbackNote, ex.note()));
             }
             return excerpt(ex);
         } catch (IOException e) {
@@ -874,15 +888,9 @@ public class ApiController {
             for (PeerImpact.ContractMatch match : peer.matches) {
                 addCited(out, match.peerFile);
             }
-            for (var impact : peer.impacts) {
-                addCited(out, impact.targetFile);
-                for (var step : impact.path) {
-                    addCited(out, step.file);
-                }
-                for (var evidence : impact.evidence) {
-                    addCited(out, evidence.filePath);
-                }
-            }
+            // peer.impacts is not part of the stored report (it duplicated report.impacts and is
+            // excluded from JSON). Every file it used to cite is already collected from
+            // report.impacts earlier in this method, so nothing becomes unreachable here.
         }
         return out;
     }
@@ -936,6 +944,12 @@ public class ApiController {
         out.put("line", Math.max(1, line));
         out.put("startLine", 0);
         out.put("endLine", 0);
+        out.put("totalLines", 0);
+        out.put("block", false);
+        out.put("blockLabel", null);
+        out.put("blockStart", 0);
+        out.put("blockEnd", 0);
+        out.put("caption", null);
         out.put("lines", List.of());
         out.put("revision", null);
         out.put("note", note == null || note.isBlank() ? "没有可展示的源码行" : note);
@@ -948,6 +962,12 @@ public class ApiController {
         out.put("line", ex.line());
         out.put("startLine", ex.startLine());
         out.put("endLine", ex.endLine());
+        out.put("totalLines", ex.totalLines());
+        out.put("block", ex.block());
+        out.put("blockLabel", ex.blockLabel());
+        out.put("blockStart", ex.blockStart());
+        out.put("blockEnd", ex.blockEnd());
+        out.put("caption", ex.caption());
         List<Map<String, Object>> lines = new ArrayList<>();
         for (CodeExcerpts.Line l : ex.lines()) {
             Map<String, Object> row = new LinkedHashMap<>();

@@ -31,6 +31,12 @@ code-association:
   # the report instead of failing the run. Set to 0 to read every file regardless of size.
   max-file-mb: 20
   max-depth: 8
+  # 一份报告最多保留多少条跨程序影响清单（默认 5000，0 或负数表示不截断）。
+  # 一次大变更会让同一批契约在对方调用图里扩散成数十万条影响；整份报告以前一次性序列化成
+  # 一个字符串，超过 Jackson 的 2 GiB 文本上限时整次分析在最后一步失败、报告全丢。
+  # 现在清单按风险保留前 N 条（各对比程序公平分配），各程序的影响处数与风险计数仍按全量统计，
+  # 审核页会明确写出「共多少处、列表保留多少处」。
+  max-report-impacts: 5000
   # 私有 GitLab 仓库的个人访问令牌。设置页「GitLab 私有仓库」保存的快照写到数据目录的
   # gitlab-settings.json 并覆盖这里；无界面部署（CLI / 容器）直接给 GITLAB_TOKEN 环境变量即可。
   # 只用于来源类型为 GITLAB 的代码源；代码源自己填了凭据环境变量且该变量有值时，以环境变量为准。

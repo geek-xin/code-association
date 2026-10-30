@@ -5,6 +5,7 @@ import com.geek.association.model.CodeIndex;
 import com.geek.association.model.Edge;
 import com.geek.association.model.ImpactResult;
 import com.geek.association.model.ModuleInfo;
+import com.geek.association.model.PeerImpact;
 import com.geek.association.model.Sym;
 import com.geek.association.source.RevisionPair;
 
@@ -20,6 +21,30 @@ import java.util.Set;
 public class ReportBuilder {
 
     /**
+     * How many impact rows a report keeps when the caller does not say otherwise.
+     *
+     * <p>Five thousand is where the review list stops being a review list: the page shows risk
+     * order, and the tail of a six-figure list is never read. The number is also a storage bound -
+     * the report is one JSON blob, and it has to fit in a string (Jackson's ceiling is 2 GiB, and
+     * the whole run used to fail at the last step when it did not).</p>
+     */
+    public static final int DEFAULT_MAX_IMPACTS = 5000;
+
+    private final int maxImpacts;
+
+    public ReportBuilder() {
+        this(DEFAULT_MAX_IMPACTS);
+    }
+
+    /**
+     * @param maxImpacts rows kept in {@code report.impacts}; zero or negative means "keep all",
+     *                   which is only safe for small programs with few compared peers
+     */
+    public ReportBuilder(int maxImpacts) {
+        this.maxImpacts = maxImpacts <= 0 ? Integer.MAX_VALUE : maxImpacts;
+    }
+
+    /**
      * Builds one report.
      *
      * When peers are supplied, the summary and module sections describe only the impact on those
@@ -29,7 +54,7 @@ public class ReportBuilder {
     public ImpactReport build(RevisionPair revisions, CodeIndex headIndex, CodeIndex baseIndex,
                               List<ChangeRecord> changes, List<ImpactResult> impacts,
                               Map<String, String> diffs,
-                              List<com.geek.association.model.PeerImpact> peers) {
+                              List<PeerImpact> peers) {
         ImpactReport report = new ImpactReport();
         report.sourceName = revisions.note;
         report.mode = revisions.mode;
@@ -96,7 +121,7 @@ public class ReportBuilder {
         // modules, blind spots and notes. The caller passes peerScoped explicitly for that reason.
         boolean peerScoped = true;
         List<ImpactResult> peerImpacts = new ArrayList<>();
-        for (com.geek.association.model.PeerImpact peer : peers) {
+        for (PeerImpact peer : peers) {
             if (peer.note != null) {
                 report.summary.unavailablePrograms++;
             }
@@ -175,25 +200,37 @@ public class ReportBuilder {
         for (ChangeRecord c : changes) {
             byId.put(c.id, c);
         }
-        for (ImpactResult impact : scoped) {
+        // The summary above counts every row; only this list is capped. That split is deliberate:
+        // "412,497 处影响" is the fact a reader needs, while 412,497 rows in one JSON blob is what
+        // used to make the whole run fail at serialisation time. The list keeps the rows a
+        // reviewer would actually read, and impactsNote says what is missing from it.
+        report.impactsTotal = scoped.size();
+        List<ImpactResult> shown = capImpacts(peers, scoped);
+        report.impactsShown = shown.size();
+        report.impactsTruncated = report.impactsTotal - report.impactsShown;
+        if (report.impactsTruncated > 0) {
+            report.impactsNote = "本次共发现 " + report.impactsTotal + " 处跨程序影响，列表只保留风险最高的 "
+                    + report.impactsShown + " 处；未列出的部分仍计入各程序的影响处数与风险计数。";
+        }
+        for (ImpactResult impact : shown) {
             report.impacts.add(toView(impact, byId.get(impact.changeRecordId)));
         }
 
-        Set<String> seenEdges = new LinkedHashSet<>();
-        for (com.geek.association.model.PeerImpact peer : peers) {
-            for (ImpactResult impact : peer.impacts) {
-                String key = peer.peerSourceName + "|" + impact.targetQualifiedName;
-                if (!seenEdges.add(key)) {
-                    continue;
-                }
-                ImpactReport.ModuleEdge me = new ImpactReport.ModuleEdge();
-                me.from = report.sourceName;
-                me.to = peer.peerSourceName;
-                me.type = "CROSS_PROGRAM";
-                me.detail = impact.targetQualifiedName + " in "
-                        + (impact.peerModule == null ? impact.targetModule : impact.peerModule);
-                report.moduleGraph.add(me);
+        // The module graph's nodes are programs, so every symbol-level row between the same two
+        // programs is the same edge. One edge per impacted symbol meant hundreds of thousands of
+        // identical entries in the JSON - the renderer already collapsed them back to a single
+        // edge - which was pure payload and one more thing that could push a report past the
+        // serialisation ceiling. The count of symbols behind the edge moves into its detail.
+        for (PeerImpact peer : peers) {
+            if (peer.impacts.isEmpty() || peer.peerSourceName == null) {
+                continue;
             }
+            ImpactReport.ModuleEdge me = new ImpactReport.ModuleEdge();
+            me.from = report.sourceName;
+            me.to = peer.peerSourceName;
+            me.type = "CROSS_PROGRAM";
+            me.detail = peer.impacts.size() + " 个受影响符号";
+            report.moduleGraph.add(me);
         }
         // An empty peer list means "nothing was compared", which the UI must state explicitly
         // rather than leave looking like a clean run.
@@ -204,6 +241,65 @@ public class ReportBuilder {
         report.skippedFiles = skippedFiles(revisions);
         peerNotes(report, headIndex, peers);
         return report;
+    }
+
+    /**
+     * The rows the report keeps when the run found more than {@link #maxImpacts}.
+     *
+     * <p>Two rules, in that order: risk first, then a fair share per compared program. A flat
+     * top-N would let one noisy peer fill the whole list and silently hide a program the reviewer
+     * explicitly asked about - the report would still say "compared 3 programs" while showing rows
+     * from only one. Each peer's list is already sorted by risk score, so its share is a prefix;
+     * whatever the quota leaves unused is filled with the next-riskiest rows overall, so a quiet
+     * peer never wastes its share.</p>
+     */
+    private List<ImpactResult> capImpacts(List<PeerImpact> peers, List<ImpactResult> scoped) {
+        if (scoped.size() <= maxImpacts || peers.isEmpty()) {
+            return scoped;
+        }
+        int quota = Math.max(1, maxImpacts / peers.size());
+        List<ImpactResult> kept = new ArrayList<>(Math.min(maxImpacts, scoped.size()));
+        List<ImpactResult> overflow = new ArrayList<>();
+        for (PeerImpact peer : peers) {
+            List<ImpactResult> rows = riskOrdered(peer.impacts);
+            int take = Math.min(quota, rows.size());
+            kept.addAll(rows.subList(0, take));
+            if (rows.size() > take) {
+                overflow.addAll(rows.subList(take, rows.size()));
+            }
+        }
+        if (kept.size() < maxImpacts && !overflow.isEmpty()) {
+            overflow.sort(Comparator.comparingDouble((ImpactResult r) -> -r.riskScore));
+            kept.addAll(overflow.subList(0, Math.min(overflow.size(), maxImpacts - kept.size())));
+        }
+        // Global risk order, so the JSON, the review page and the Markdown export all start with
+        // the same row instead of "whatever peer happened to be indexed first".
+        kept.sort(Comparator.comparingDouble((ImpactResult r) -> -r.riskScore));
+        // A quota below one row per peer (a tiny cap) would otherwise exceed the budget.
+        if (kept.size() > maxImpacts) {
+            kept.subList(maxImpacts, kept.size()).clear();
+        }
+        return kept;
+    }
+
+    /**
+     * The same rows in risk order, copied only when they are not already.
+     *
+     * <p>The engine hands each peer over sorted by risk score, and the cap keeps a prefix per
+     * peer, so the order is load-bearing: an unsorted list would silently keep the least risky
+     * rows instead of the most risky ones. One O(n) pass proves the order; the copy never happens
+     * on the real path, and it is cheaper than trusting every future caller to preserve an
+     * invariant they cannot see from the signature.</p>
+     */
+    private static List<ImpactResult> riskOrdered(List<ImpactResult> rows) {
+        for (int i = 1; i < rows.size(); i++) {
+            if (rows.get(i - 1).riskScore < rows.get(i).riskScore) {
+                List<ImpactResult> copy = new ArrayList<>(rows);
+                copy.sort(Comparator.comparingDouble((ImpactResult r) -> -r.riskScore));
+                return copy;
+            }
+        }
+        return rows;
     }
 
     /**

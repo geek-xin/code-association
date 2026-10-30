@@ -45,7 +45,7 @@ public class AnalysisService {
     private final Store store;
     private final AppProperties properties;
     private final RepositoryPreparer preparer;
-    private final ReportBuilder reportBuilder = new ReportBuilder();
+    private final ReportBuilder reportBuilder;
     private final AiExplainer aiExplainer;
     private final ExecutorService executor;
     private final AtomicInteger running = new AtomicInteger();
@@ -55,6 +55,10 @@ public class AnalysisService {
         this.store = store;
         this.properties = properties;
         this.preparer = preparer;
+        // The cap is a property because the right number depends on the repository: a small
+        // program's whole report fits in a few hundred kilobytes, while a monorepo needs the
+        // list bounded to keep the stored JSON storable at all.
+        this.reportBuilder = new ReportBuilder(properties.getMaxReportImpacts());
         this.aiExplainer = aiExplainer;
         this.executor = Executors.newFixedThreadPool(2, r -> {
             Thread t = new Thread(r, "impact-analysis-" + running.incrementAndGet());
@@ -673,6 +677,15 @@ public class AnalysisService {
         }
         ImpactReport parsed = Json.read(analysis.reportJson, ImpactReport.class);
         if (parsed != null) {
+            // Reports stored before the impact cap existed have no impactsTotal/Shown/Truncated:
+            // deserialisation leaves them 0, and the page would read that as "this run found zero
+            // impacts" while showing the list right below. Backfill from the list that is actually
+            // there - those reports were never truncated, so the list is the whole result.
+            if (parsed.impactsTotal <= 0 && !parsed.impacts.isEmpty()) {
+                parsed.impactsTotal = parsed.impacts.size();
+                parsed.impactsShown = parsed.impacts.size();
+                parsed.impactsTruncated = 0;
+            }
             reportCache.put(analysisId, parsed);
         }
         return parsed;

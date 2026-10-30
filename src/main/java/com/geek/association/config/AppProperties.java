@@ -39,6 +39,19 @@ public class AppProperties {
     /** Maximum call graph traversal depth. */
     private int maxDepth = 8;
 
+    /**
+     * How many impact rows one report may carry.
+     *
+     * <p>A wide delta produces hundreds of thousands of cross-program rows: every changed contract
+     * propagates through the peer's call graph on its own, and the totals multiply by the number of
+     * compared programs. The report used to be serialised whole into one string, and past Jackson's
+     * 2 GiB text-buffer limit the run failed at the very last step - after minutes of analysis -
+     * losing the report entirely. The stored list is now a risk-ordered subset: the counts stay
+     * exact, the rows the reader sees are the ones worth reviewing, and the report says how many
+     * were left out. Zero or negative disables the cap, which is only sensible for tiny programs.</p>
+     */
+    private int maxReportImpacts = 5000;
+
     /** Optional LLM explanation. Disabled by default: every fact comes from static analysis. */
     private Ai ai = new Ai();
 
@@ -99,6 +112,14 @@ public class AppProperties {
 
     public void setMaxDepth(int maxDepth) {
         this.maxDepth = maxDepth;
+    }
+
+    public int getMaxReportImpacts() {
+        return maxReportImpacts;
+    }
+
+    public void setMaxReportImpacts(int maxReportImpacts) {
+        this.maxReportImpacts = maxReportImpacts;
     }
 
     public Ai getAi() {
